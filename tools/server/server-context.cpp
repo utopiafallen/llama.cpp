@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-ckpt-sidecar.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -2513,6 +2514,12 @@ private:
                         break;
                     }
 
+                    const size_t nsidecar = server_ckpt_sidecar_write(
+                        server_ckpt_sidecar_path(filepath), slot->prompt.checkpoints);
+
+                    SLT_TRC(*slot, "saved checkpoint sidecar: %zu checkpoints, %.3f MiB\n",
+                            slot->prompt.checkpoints.size(), nsidecar / (1024.0 * 1024.0));
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2522,7 +2529,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nsidecar;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2577,6 +2584,16 @@ private:
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    // Read checkpoints from sidecar before clear() deletes them
+                    std::list<common_prompt_checkpoint> sidecar_checkpoints;
+                    server_ckpt_sidecar_read(server_ckpt_sidecar_path(filepath), sidecar_checkpoints);
+
+                    slot->prompt.clear();
+                    slot->prompt.tokens = std::move(restored);
+                    slot->prompt.checkpoints = std::move(sidecar_checkpoints);
+
+                    SLT_TRC(*slot, "restored checkpoint sidecar: %zu checkpoints\n",
+                            slot->prompt.checkpoints.size());
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
