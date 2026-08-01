@@ -3692,6 +3692,123 @@ struct test_relu_sqr : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL (fused operation).
+// `layout` and `tail` also build graphs a backend must decline to fuse, so the cases cover
+// both the fused kernel and the fallback. Run the suite with fusion disabled as well: the
+// results must match, and only that proves the fused path is still being reached.
+struct test_unary_mul : public test_case {
+    const ggml_unary_op op;
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const bool swap;          // unary result is the second MUL operand
+    const std::string layout; // operand layout, see build_graph()
+    const std::string tail;   // extra consumer past the MUL, see build_graph()
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return std::string(ggml_unary_op_name(op)) + "_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // A backend that fuses elides the F16 rounding of the unary result that the unfused
+        // CPU reference performs; modelling both chains puts the drift at ~2e-7 over the
+        // default U(-1,1) initialisation, so the 1e-7 default is exceeded by the median and
+        // 1e-6 leaves ~5x. It is range- rather than shape-dependent: test_unary's wide range
+        // would hide the drift instead of bounding it. F32 keeps the default.
+        return type == GGML_TYPE_F16 ? 1e-6 : 1e-7;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, swap, layout, tail);
+    }
+
+    test_unary_mul(ggml_unary_op op,
+            ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {128, 2, 2, 2},
+            bool swap = false,
+            std::string layout = "packed",
+            std::string tail = "")
+        : op(op), type(type), ne(ne), swap(swap), layout(std::move(layout)), tail(std::move(tail)) {}
+
+    // a tensor of shape `ne` viewed out of a wider one, so its rows stay contiguous but the
+    // row stride no longer equals the row width
+    ggml_tensor * padded(ggml_context * ctx, const char * name, int64_t mul0, int64_t off0) {
+        std::array<int64_t, 4> ne_w = ne;
+        ne_w[0] *= mul0;
+        ggml_tensor * base = ggml_new_tensor(ctx, type, 4, ne_w.data());
+        ggml_set_name(base, name);
+        return ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3],
+                            base->nb[1], base->nb[2], base->nb[3], off0 * base->nb[0]);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = nullptr; // unary source
+        ggml_tensor * b = nullptr; // other MUL operand
+
+        if (layout == "packed") {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+        } else if (layout == "pad_unary") {
+            a = padded(ctx, "a", 3, 0);
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+        } else if (layout == "pad_other") {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            b = padded(ctx, "b", 3, 0);
+        } else if (layout == "halves") {
+            // the shape the Conformer audio encoders build: one tensor split in two, the
+            // gate half carrying a non-zero view offset
+            std::array<int64_t, 4> ne_w = ne;
+            ne_w[0] *= 2;
+            ggml_tensor * base = ggml_new_tensor(ctx, type, 4, ne_w.data());
+            ggml_set_name(base, "base");
+            b = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3], base->nb[1], base->nb[2], base->nb[3], 0);
+            a = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3], base->nb[1], base->nb[2], base->nb[3],
+                             ne[0] * base->nb[0]);
+        } else if (layout == "strided_dim1") {
+            // rows are packed but dim 1 is not: contiguous rows, NOT ggml_is_contiguous_1,
+            // so a row stride taken from nb[1] would address the wrong elements past ne[1]
+            std::array<int64_t, 4> ne_w = ne;
+            ne_w[1] *= 3;
+            ggml_tensor * base = ggml_new_tensor(ctx, type, 4, ne_w.data());
+            ggml_set_name(base, "a");
+            a = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3], base->nb[1], base->nb[2], base->nb[3], 0);
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+        } else if (layout == "bcast") {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            b = ggml_new_tensor_4d(ctx, type, ne[0], 1, 1, 1);
+        } else {
+            GGML_ABORT("unknown layout %s", layout.c_str());
+        }
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * u = ggml_unary(ctx, a, op);
+        ggml_set_name(u, "unary");
+
+        // a broadcasting operand can only be the second one
+        const bool second = swap && layout != "bcast";
+        ggml_tensor * out = second ? ggml_mul(ctx, b, u) : ggml_mul(ctx, u, b);
+
+        if (tail == "reuse") {
+            // reading the unary result a second time must block the fusion; a backend that
+            // fuses anyway never writes it, so this adds the harness's random initialisation
+            ggml_set_name(out, "mul");
+            out = ggml_add(ctx, out, u);
+        } else if (tail == "consumer") {
+            // fusion still applies; catches a dispatcher that skips one node too many
+            ggml_set_name(out, "mul");
+            out = ggml_add(ctx, out, b);
+        } else if (!tail.empty()) {
+            GGML_ABORT("unknown tail %s", tail.c_str());
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -8051,6 +8168,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
+    }
+
+    // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
+    for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
+        for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+            for (bool swap : { false, true }) {
+                test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, swap));
+            }
+            test_cases.emplace_back(new test_unary_mul(op, type, { 5, 7, 11, 13 }));
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "pad_unary"));
+            // an operand view only stays out from between the UNARY and the MUL when the
+            // unary result is the second MUL operand
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, true, "pad_other"));
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, true, "halves"));
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "consumer"));
+            // must not fuse: a dim-1-strided operand, a broadcasting operand, and a unary
+            // result that is read a second time
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "strided_dim1"));
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "bcast"));
+            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "reuse"));
+        }
     }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
