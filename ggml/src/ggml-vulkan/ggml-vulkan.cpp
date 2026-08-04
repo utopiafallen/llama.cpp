@@ -16373,8 +16373,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             submit_info.commandBufferCount = 1;
             submit_info.pCommandBuffers = &cmd_bufs[0];
 
-            std::lock_guard<std::mutex> guard(queue_mutex);
-            ctx->device->compute_queue.queue.submit({ submit_info }, ctx->fence);
+            ctx->device->compute_queue->handle->submit({ submit_info }, ctx->fence);
 
             ggml_vk_wait_for_fence(ctx);
 
