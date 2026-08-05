@@ -174,6 +174,7 @@ struct rpc_server_params {
     int                      port        = 50052;
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+    int                      heartbeat   = 0;
     std::vector<std::string> devices;
 };
 
@@ -186,6 +187,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  --gpu-heartbeat SECONDS          submit GPU heartbeat every N seconds to prevent driver eviction (default: %d)\n", params.heartbeat);
     fprintf(stderr, "\n");
 }
 
@@ -233,6 +235,15 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--gpu-heartbeat") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.heartbeat = std::stoi(argv[i]);
+            if (params.heartbeat < 0) {
+                fprintf(stderr, "error: --gpu-heartbeat must be >= 0\n");
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -331,12 +342,12 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    auto start_server_fn = (decltype(ggml_backend_rpc_start_server)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto start_server_fn = (int(*)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(), params.heartbeat);
     return 0;
 }
