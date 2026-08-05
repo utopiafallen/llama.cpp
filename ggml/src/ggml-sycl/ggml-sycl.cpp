@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <float.h>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdint.h>
 #include <stdio.h>
@@ -86,6 +87,7 @@
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
+int g_ggml_sycl_profile = 0;
 int g_ggml_sycl_enable_optimize = 1;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
@@ -295,6 +297,7 @@ static void ggml_check_sycl() try {
 
     if (!initialized) {
         g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
+        g_ggml_sycl_profile = ggml_sycl_get_env("GGML_SYCL_PROFILE", 0);
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
@@ -5573,6 +5576,8 @@ catch (sycl::exception const &exc) {
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+    std::map<std::string, int64_t> op_times;
+    int64_t t_graph_start = ggml_time_us();
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -5583,8 +5588,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        int64_t t_fuse_start = ggml_time_us();
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
+            std::string opname = std::string("fuse_") + ggml_op_name(node->op);
+            op_times[opname] += ggml_time_us() - t_fuse_start;
             i += nodes_to_skip;
             continue;
         }
@@ -5596,24 +5604,50 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        int64_t t_op_start = ggml_time_us();
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            op_times["rms_norm_fused"] += ggml_time_us() - t_op_start;
             i++;
             continue;
         }
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            op_times["unary_mul_fused"] += ggml_time_us() - t_op_start;
             i++;
             continue;
         }
 
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        op_times[ggml_op_name(node->op)] += ggml_time_us() - t_op_start;
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    int64_t t_graph_end = ggml_time_us();
+    if (g_ggml_sycl_profile) {
+        std::vector<std::pair<std::string, int64_t>> sorted_ops(op_times.begin(), op_times.end());
+        std::sort(sorted_ops.begin(), sorted_ops.end(),
+                  [](const auto & a, const auto & b) { return a.second > b.second; });
+        double total_ms = (t_graph_end - t_graph_start) / 1000.0;
+        GGML_SYCL_PROFILE("[SYCL-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
+                          sycl_ctx->device, cgraph->n_nodes, total_ms);
+        int shown = 0;
+        for (auto & [op, us] : sorted_ops) {
+            if (shown >= 15) {
+                break;
+            }
+            double ms = us / 1000.0;
+            double pct = total_ms > 0 ? (ms / total_ms) * 100.0 : 0.0;
+            if (pct < 0.1 && shown >= 5) {
+                continue;
+            }
+            GGML_SYCL_PROFILE("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
+            shown++;
+        }
     }
 }
 
