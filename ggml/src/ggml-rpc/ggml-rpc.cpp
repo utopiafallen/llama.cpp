@@ -24,9 +24,13 @@
 #include <algorithm>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+static const char * RPC_PROFILE = std::getenv("GGML_RPC_PROFILE");
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+
+#define LOG_PROF(...) \
+    do { if (RPC_PROFILE) GGML_LOG_INFO(__VA_ARGS__); } while (0)
 
 
 namespace fs = std::filesystem;
@@ -629,12 +633,18 @@ private:
     }
 
     void execute(rpc_queue_cmd & cmd) {
+        int64_t t_start = ggml_time_us();
         switch (cmd.type) {
             case RPC_QCMD_GRAPH_COMPUTE:
             case RPC_QCMD_GRAPH_RECOMPUTE: {
                 bool status = send_rpc_cmd(sock_, cmd.rpc_command,
                                            cmd.send_data.data(), cmd.send_data.size());
                 RPC_STATUS_ASSERT(status);
+                int64_t t_end = ggml_time_us();
+                LOG_PROF("[RPC-PROFILE] client graph_%s ep=%s data=%zuB send=%.2fms\n",
+                         cmd.rpc_command == RPC_CMD_GRAPH_COMPUTE ? "compute" : "recompute",
+                         endpoint_.c_str(), cmd.send_data.size(),
+                         (t_end - t_start)/1000.0);
                 break;
             }
             case RPC_QCMD_SET_TENSOR: {
@@ -642,6 +652,10 @@ private:
                 bool status = send_rpc_cmd(sock_, cmd.rpc_command,
                                            cmd.send_data.data(), cmd.send_data.size());
                 RPC_STATUS_ASSERT(status);
+                int64_t t_end = ggml_time_us();
+                LOG_PROF("[RPC-PROFILE] client set_tensor ep=%s data=%zuB send=%.2fms\n",
+                         endpoint_.c_str(), cmd.send_data.size(),
+                         (t_end - t_start)/1000.0);
                 break;
             }
             case RPC_QCMD_GET_TENSOR:
@@ -651,6 +665,10 @@ private:
                                            cmd.send_data.data(), cmd.send_data.size(),
                                            cmd.dest, cmd.dest_size);
                 RPC_STATUS_ASSERT(status);
+                int64_t t_end = ggml_time_us();
+                LOG_PROF("[RPC-PROFILE] client get_tensor ep=%s req=%zuB rsp=%zuB rtt=%.2fms\n",
+                         endpoint_.c_str(), cmd.send_data.size(), cmd.dest_size,
+                         (t_end - t_start)/1000.0);
                 if (cmd.type == RPC_QCMD_GET_TENSOR) {
                     pending_async_gets_.fetch_sub(1, std::memory_order_release);
                 }
@@ -663,6 +681,9 @@ private:
                 // Send SYNCHRONIZE and wait for empty response - this is the pipeline fence.
                 bool status = send_rpc_cmd(sock_, RPC_CMD_SYNCHRONIZE, nullptr, 0, nullptr, 0);
                 RPC_STATUS_ASSERT(status);
+                int64_t t_end = ggml_time_us();
+                LOG_PROF("[RPC-PROFILE] client sync ep=%s rtt=%.2fms\n",
+                         endpoint_.c_str(), (t_end - t_start)/1000.0);
                 if (cmd.completion) {
                     cmd.completion->signal();
                 }
@@ -675,6 +696,10 @@ private:
                                            cmd.send_data.data(), cmd.send_data.size(),
                                            pending->data.data(), pending->data.size());
                 RPC_STATUS_ASSERT(status);
+                int64_t t_end = ggml_time_us();
+                LOG_PROF("[RPC-PROFILE] client cpy_get ep=%s rsp=%zuB rtt=%.2fms\n",
+                         endpoint_.c_str(), pending->data.size(),
+                         (t_end - t_start)/1000.0);
                 pending->signal();
                 break;
             }
@@ -695,6 +720,10 @@ private:
                 bool status = send_rpc_cmd(sock_, RPC_CMD_SET_TENSOR,
                                            payload.data(), payload.size());
                 RPC_STATUS_ASSERT(status);
+                int64_t t_end = ggml_time_us();
+                LOG_PROF("[RPC-PROFILE] client cpy_set ep=%s data=%zuB send=%.2fms\n",
+                         endpoint_.c_str(), pending->data.size(),
+                         (t_end - t_start)/1000.0);
                 break;
             }
         }
@@ -1839,6 +1868,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    int64_t t_total_start = ggml_time_us();
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t)) {
@@ -1868,6 +1898,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     const rpc_tensor * tensors = (const rpc_tensor *)src;
     LOG_DBG("[%s] device: %u, n_nodes: %u, n_tensors: %u\n", __func__, device, n_nodes, n_tensors);
 
+    int64_t t_parse_end = ggml_time_us();
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
     if (stored_graphs[device].buffer.size() < buf_size) {
         stored_graphs[device].buffer.resize(buf_size);
@@ -1882,11 +1913,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_context * ctx = ctx_ptr.get();
     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
     graph->n_nodes = n_nodes;
+    int64_t t_init_end = ggml_time_us();
     std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
     tensor_ptrs.reserve(n_tensors);
     for (uint32_t i = 0; i < n_tensors; i++) {
         tensor_ptrs.emplace(tensors[i].id, &tensors[i]);
     }
+    int64_t t_map_end = ggml_time_us();
     std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
     tensor_map.reserve(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
@@ -1902,9 +1935,20 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
+    int64_t t_nodes_end = ggml_time_us();
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    int64_t t_compute_end = ggml_time_us();
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
+    int64_t t_total_end = ggml_time_us();
+    LOG_PROF("[RPC-PROFILE] graph_compute dev=%u nodes=%u tensors=%u input=%zuB parse=%.2fms init=%.2fms map=%.2fms nodes=%.2fms compute=%.2fms total=%.2fms\n",
+             device, n_nodes, n_tensors, input.size(),
+             (t_parse_end - t_total_start)/1000.0,
+             (t_init_end - t_parse_end)/1000.0,
+             (t_map_end - t_init_end)/1000.0,
+             (t_nodes_end - t_map_end)/1000.0,
+             (t_compute_end - t_nodes_end)/1000.0,
+             (t_total_end - t_total_start)/1000.0);
     return true;
 }
 
@@ -1918,8 +1962,12 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
+    int64_t t_compute_start = ggml_time_us();
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    int64_t t_compute_end = ggml_time_us();
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    LOG_PROF("[RPC-PROFILE] graph_recompute dev=%u compute=%.2fms\n",
+             device, (t_compute_end - t_compute_start)/1000.0);
     return true;
 }
 
