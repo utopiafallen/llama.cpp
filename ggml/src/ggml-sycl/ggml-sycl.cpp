@@ -2444,6 +2444,144 @@ static void top_k_f32_sycl(
     });
 }
 
+static void top_k_f32_sycl_large(
+    const float * src,
+    int32_t * dst_indices,
+    const int64_t ncols,
+    const int64_t nrows,
+    const int k,
+    dpct::queue_ptr main_stream
+) {
+    const int block_size = 128;
+    const int local_k = 32;
+
+    const sycl::range<1> block_dims(block_size);
+    const sycl::range<1> grid_dims(nrows);
+
+    main_stream->submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(block_size * local_k), cgh);
+        sycl::local_accessor<int, 1> shared_idx(sycl::range<1>(block_size * local_k), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(grid_dims * block_dims, block_dims),
+            [=](sycl::nd_item<1> item_ct1) {
+                const int row = item_ct1.get_group(0);
+                const int tid = item_ct1.get_local_id(0);
+
+                if (row >= nrows) return;
+
+                const float * src_row = src + row * ncols;
+                int32_t * dst_idx_row = dst_indices + row * k;
+
+                float local_vals[32];
+                int local_idx[32];
+
+                for (int i = 0; i < local_k; i++) {
+                    local_vals[i] = -FLT_MAX;
+                    local_idx[i] = -1;
+                }
+
+                for (int col = tid; col < ncols; col += block_size) {
+                    float val = src_row[col];
+
+                    if (val > local_vals[local_k-1]) {
+                        int pos = local_k - 1;
+                        while (pos > 0 && val > local_vals[pos - 1]) {
+                            pos--;
+                        }
+
+                        for (int i = local_k - 1; i > pos; i--) {
+                            local_vals[i] = local_vals[i - 1];
+                            local_idx[i] = local_idx[i - 1];
+                        }
+                        local_vals[pos] = val;
+                        local_idx[pos] = col;
+                    }
+                }
+
+                for (int i = 0; i < local_k; i++) {
+                    shared_vals[tid * local_k + i] = local_vals[i];
+                    shared_idx[tid * local_k + i] = local_idx[i];
+                }
+                item_ct1.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = 0; i < local_k; i++) {
+                    local_vals[i] = -FLT_MAX;
+                    local_idx[i] = -1;
+                }
+
+                for (int c = 0; c < block_size * local_k; c++) {
+                    float val = shared_vals[c];
+                    int idx = shared_idx[c];
+
+                    if (val > local_vals[local_k-1]) {
+                        int pos = local_k - 1;
+                        while (pos > 0 && val > local_vals[pos - 1]) {
+                            pos--;
+                        }
+
+                        for (int i = local_k - 1; i > pos; i--) {
+                            local_vals[i] = local_vals[i - 1];
+                            local_idx[i] = local_idx[i - 1];
+                        }
+                        local_vals[pos] = val;
+                        local_idx[pos] = idx;
+                    }
+                }
+
+                for (int i = 0; i < local_k; i++) {
+                    shared_vals[tid * local_k + i] = local_vals[i];
+                    shared_idx[tid * local_k + i] = local_idx[i];
+                }
+                item_ct1.barrier(sycl::access::fence_space::local_space);
+
+                int nchunks = (k + local_k - 1) / local_k;
+                for (int chunk = tid; chunk < nchunks; chunk += block_size) {
+                    float chunk_vals[32];
+                    int chunk_idx[32];
+
+                    int chunk_start = chunk * local_k;
+                    int chunk_end   = std::min(chunk_start + local_k, k);
+                    int chunk_k     = chunk_end - chunk_start;
+
+                    for (int i = 0; i < chunk_k; i++) {
+                        chunk_vals[i] = -FLT_MAX;
+                        chunk_idx[i] = -1;
+                    }
+
+                    for (int c = 0; c < block_size * local_k; c++) {
+                        float val = shared_vals[c];
+                        int idx = shared_idx[c];
+
+                        if (val > chunk_vals[chunk_k-1]) {
+                            int pos = chunk_k - 1;
+                            while (pos > 0 && val > chunk_vals[pos - 1]) {
+                                pos--;
+                            }
+
+                            for (int i = chunk_k - 1; i > pos; i--) {
+                                chunk_vals[i] = chunk_vals[i - 1];
+                                chunk_idx[i] = chunk_idx[i - 1];
+                            }
+                            chunk_vals[pos] = val;
+                            chunk_idx[pos] = idx;
+                        }
+                    }
+
+                    for (int i = 0; i < chunk_k; i++) {
+                        dst_idx_row[chunk_start + i] = chunk_idx[i];
+                    }
+                }
+
+                if (tid == 0 && k > 1) {
+                    int32_t temp = dst_idx_row[0];
+                    dst_idx_row[0] = dst_idx_row[1];
+                    dst_idx_row[1] = temp;
+                }
+            });
+    });
+}
+
 static void argmax_f32_i32_sycl(const float *x, int *dst, const int ncols,
                                const int nrows, queue_ptr stream) {
     const sycl::range<3> block_dims(1, 1, SYCL_ARGMAX_BLOCK_SIZE);
@@ -2843,10 +2981,14 @@ static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const int64_t ncols = src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
 
-    GGML_ASSERT(k > 0 && k <= 32);
+    GGML_ASSERT(k > 0 && k <= 512);
     GGML_ASSERT(k <= ncols);
 
-    top_k_f32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    if (k <= 32) {
+        top_k_f32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    } else {
+        top_k_f32_sycl_large(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    }
 }
 
 inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -6063,7 +6205,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 op->type == GGML_TYPE_I32 &&
                 src0->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(src0) &&
-                k > 0 && k <= 32;
+                k > 0 && k <= 512;
         }
         case GGML_OP_POOL_2D:
         case GGML_OP_POOL_1D:
