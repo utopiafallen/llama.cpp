@@ -59,6 +59,7 @@ void ggml_sycl_host_free(void* ptr);
 
 
 extern int g_ggml_sycl_debug;
+extern int g_ggml_sycl_profile;
 extern int g_ggml_sycl_enable_optimize;
 extern int g_ggml_sycl_enable_fusion;
 extern int g_ggml_sycl_enable_esimd;
@@ -82,6 +83,12 @@ extern int g_ggml_sycl_fa_onednn_max_kv;
     do {                                  \
         if (UNLIKELY(g_ggml_sycl_debug))  \
             fprintf(stderr, __VA_ARGS__); \
+    } while (0)
+
+#define GGML_SYCL_PROFILE(...)            \
+    do {                                  \
+        if (UNLIKELY(g_ggml_sycl_profile)) \
+            GGML_LOG_INFO(__VA_ARGS__);   \
     } while (0)
 
 #define CHECK_TRY_ERROR(expr)                                            \
