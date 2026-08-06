@@ -91,6 +91,11 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+static bool ggml_cuda_profile() {
+    static bool profile = getenv("GGML_CUDA_PROFILE") != nullptr && std::atoi(getenv("GGML_CUDA_PROFILE"));
+    return profile;
+}
+
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
@@ -4103,6 +4108,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            std::map<std::string, int64_t> op_times;
+            int64_t t_graph_start = ggml_time_us();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4145,9 +4152,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                int64_t t_fuse_start = ggml_time_us();
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    std::string opname = std::string("fuse_") + ggml_op_name(node->op);
+                    op_times[opname] += ggml_time_us() - t_fuse_start;
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4174,7 +4184,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                int64_t t_op_start = ggml_time_us();
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                op_times[ggml_op_name(node->op)] += ggml_time_us() - t_op_start;
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4183,6 +4195,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            int64_t t_graph_end = ggml_time_us();
+            if (ggml_cuda_profile()) {
+                std::vector<std::pair<std::string, int64_t>> sorted_ops(op_times.begin(), op_times.end());
+                std::sort(sorted_ops.begin(), sorted_ops.end(),
+                          [](const auto & a, const auto & b) { return a.second > b.second; });
+                double total_ms = (t_graph_end - t_graph_start) / 1000.0;
+                GGML_LOG_INFO("[CUDA-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
+                              cuda_ctx->device, cgraph->n_nodes, total_ms);
+                int shown = 0;
+                for (auto & [op, us] : sorted_ops) {
+                    if (shown >= 15) {
+                        break;
+                    }
+                    double ms = us / 1000.0;
+                    double pct = total_ms > 0 ? (ms / total_ms) * 100.0 : 0.0;
+                    if (pct < 0.1 && shown >= 5) {
+                        continue;
+                    }
+                    GGML_LOG_INFO("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
+                    shown++;
+                }
             }
         }
 
