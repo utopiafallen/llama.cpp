@@ -83,7 +83,8 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false)
+        : fname(fname) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -94,7 +95,7 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -179,6 +180,8 @@ struct llama_file::impl {
             std::fclose(fp);
         }
     }
+
+    std::string fname;
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
@@ -407,6 +410,30 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+
+std::string llama_file::path() const { return pimpl->fname; }
+
+uint64_t llama_file::mtime() const {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA attrs;
+    if (!GetFileAttributesExW(
+            std::wstring(pimpl->fname.begin(), pimpl->fname.end()),
+            GetFileExInfoStandard, &attrs)) {
+        return 0;
+    }
+    FILETIME ft = attrs.ftLastWriteTime;
+    ULARGE_INTEGER ui;
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
+    return ui.QuadPart / 10000000ULL - 11644473600ULL;
+#else
+    struct stat st;
+    if (stat(pimpl->fname.c_str(), &st) != 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(st.st_mtime);
+#endif
+}
 
 int llama_file::file_id() const {
 #ifdef _WIN32
