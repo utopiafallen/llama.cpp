@@ -1,18 +1,26 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-rpc.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama-mmap.h"
 #include "llama.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <map>
+#include <mutex>
 #include <regex>
+#include <unordered_set>
+#include <vector>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1056,6 +1064,16 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     return op_supported;
 }
 
+static bool ggml_buffer_is_rpc(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    const char * name = buft ? ggml_backend_buft_name(buft) : nullptr;
+    return name != nullptr && std::strncmp(name, "RPC", 3) == 0;
+}
+
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
@@ -1598,6 +1616,71 @@ bool llama_model_loader::load_all_data(
     }
 
     std::vector<ggml_tensor *> tensors;
+    std::unordered_set<ggml_tensor *> rpc_preloaded;
+
+    // Batch pre-check: ask RPC server which tensors are cached, server loads from cache on hit.
+    // Works with or without mmap - no stable source pointers needed.
+    if (!check_tensors) {
+        // group RPC tensors by (buffer, file)
+        struct rpc_precheck_group {
+            ggml_backend_buffer_t buffer;
+            std::string           file_basename;
+            uint64_t              file_mtime;
+            std::vector<ggml_tensor *> tensors;
+        };
+        std::map<std::pair<ggml_backend_buffer_t, size_t>, rpc_precheck_group> groups;
+
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+             tensor != nullptr;
+             tensor = ggml_get_next_tensor(ctx, tensor)) {
+            const auto * weight = get_weight(ggml_get_name(tensor));
+            if (weight == nullptr || tensor->data == nullptr || !ggml_buffer_is_rpc(tensor->buffer)) {
+                continue;
+            }
+            size_t file_idx = weight->idx;
+            auto key = std::make_pair(tensor->buffer, file_idx);
+            auto & group = groups[key];
+            if (group.buffer == nullptr) {
+                group.buffer = tensor->buffer;
+                group.file_basename = files[file_idx]->path();
+                size_t pos = group.file_basename.find('/');
+                if (pos != std::string::npos) group.file_basename.erase(0, pos + 1);
+                pos = group.file_basename.find('\\');
+                if (pos != std::string::npos) group.file_basename.erase(0, pos + 1);
+                group.file_mtime = files[file_idx]->mtime();
+            }
+            group.tensors.push_back(tensor);
+        }
+
+        for (auto & [key, group] : groups) {
+            const auto & rpc_buf = group.buffer;
+            const auto & rpc_tensors = group.tensors;
+            const uint32_t n_tensors = rpc_tensors.size();
+
+            LLAMA_LOG_INFO("%s: RPC batch pre-check %u tensors from '%s' on buffer %p\n",
+                    __func__, n_tensors, group.file_basename.c_str(), (void *)rpc_buf);
+
+            const auto precheck_start = std::chrono::steady_clock::now();
+            std::vector<uint8_t> bitmap = ggml_backend_rpc_batch_precheck(
+                    rpc_buf, group.file_basename.c_str(), group.file_mtime,
+                    rpc_tensors.data(), n_tensors);
+            const double precheck_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - precheck_start).count();
+
+            uint32_t n_loaded = 0;
+            size_t bytes_loaded = 0;
+            for (uint32_t i = 0; i < n_tensors; i++) {
+                if (bitmap[i]) {
+                    rpc_preloaded.insert(rpc_tensors[i]);
+                    n_loaded++;
+                    bytes_loaded += ggml_nbytes(rpc_tensors[i]);
+                }
+            }
+            LLAMA_LOG_INFO("%s: RPC batch pre-check loaded %u/%u tensors (%.2f GiB) in %.2f s\n",
+                    __func__, n_loaded, n_tensors, bytes_loaded / (double) GiB, precheck_seconds);
+        }
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
     }
@@ -1629,6 +1712,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (rpc_preloaded.find(cur) != rpc_preloaded.end()) {
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
