@@ -222,7 +222,6 @@ struct rpc_msg_batch_precheck_rsp {
 #pragma pack(pop)
 
 // RPC data structures
- (rpc: batch pre-check for cached tensor loading)
 static ggml_guid_t ggml_backend_rpc_guid() {
     static ggml_guid guid = {0x99, 0x68, 0x5b, 0x6c, 0xd2, 0x83, 0x3d, 0x24, 0x25, 0x36, 0x72, 0xe1, 0x5b, 0x0e, 0x14, 0x03};
     return &guid;
