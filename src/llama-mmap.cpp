@@ -416,9 +416,7 @@ std::string llama_file::path() const { return pimpl->fname; }
 uint64_t llama_file::mtime() const {
 #ifdef _WIN32
     WIN32_FILE_ATTRIBUTE_DATA attrs;
-    if (!GetFileAttributesExW(
-            std::wstring(pimpl->fname.begin(), pimpl->fname.end()),
-            GetFileExInfoStandard, &attrs)) {
+    if (!GetFileAttributesExA(pimpl->fname.c_str(), GetFileExInfoStandard, &attrs)) {
         return 0;
     }
     FILETIME ft = attrs.ftLastWriteTime;
