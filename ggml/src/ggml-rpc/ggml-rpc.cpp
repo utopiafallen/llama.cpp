@@ -229,8 +229,43 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
 static bool ggml_backend_buffer_is_rpc(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
 }
+static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared_ptr<rpc_command_queue> & cmd_queue_ref = nullptr);
 
-static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared_ptr<rpc_command_queue> & cmd_queue_ref = nullptr) {
+static ggml_guid_t ggml_backend_rpc_guid() {
+    static ggml_guid guid = {0x99, 0x68, 0x5b, 0x6c, 0xd2, 0x83, 0x3d, 0x24, 0x25, 0x36, 0x72, 0xe1, 0x5b, 0x0e, 0x14, 0x03};
+    return &guid;
+}
+
+struct ggml_backend_rpc_device_context {
+    std::string endpoint;
+    uint32_t    device;
+    std::string name;
+    std::string description;
+    uint64_t    last_graph_uid;
+};
+
+struct ggml_backend_rpc_buffer_type_context {
+    std::string endpoint;
+    uint32_t    device;
+    std::string name;
+    size_t      alignment;
+    size_t      max_size;
+};
+
+struct ggml_backend_rpc_context {
+    std::string endpoint;
+    uint32_t    device;
+    std::string name;
+    std::shared_ptr<rpc_command_queue> cmd_queue;
+};
+
+struct ggml_backend_rpc_buffer_context {
+    std::shared_ptr<rpc_command_queue> cmd_queue;
+    void * base_ptr;
+    uint64_t remote_ptr;
+};
+
+static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared_ptr<rpc_command_queue> & cmd_queue_ref) {
     rpc_tensor result;
     if (!tensor) {
         memset(&result, 0, sizeof(result));
@@ -275,40 +310,6 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const std::shared
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
 }
-
-static ggml_guid_t ggml_backend_rpc_guid() {
-    static ggml_guid guid = {0x99, 0x68, 0x5b, 0x6c, 0xd2, 0x83, 0x3d, 0x24, 0x25, 0x36, 0x72, 0xe1, 0x5b, 0x0e, 0x14, 0x03};
-    return &guid;
-}
-
-struct ggml_backend_rpc_device_context {
-    std::string endpoint;
-    uint32_t    device;
-    std::string name;
-    std::string description;
-    uint64_t    last_graph_uid;
-};
-
-struct ggml_backend_rpc_buffer_type_context {
-    std::string endpoint;
-    uint32_t    device;
-    std::string name;
-    size_t      alignment;
-    size_t      max_size;
-};
-
-struct ggml_backend_rpc_context {
-    std::string endpoint;
-    uint32_t    device;
-    std::string name;
-    std::shared_ptr<rpc_command_queue> cmd_queue;
-};
-
-struct ggml_backend_rpc_buffer_context {
-    std::shared_ptr<rpc_command_queue> cmd_queue;
-    void * base_ptr;
-    uint64_t remote_ptr;
-};
 
 // RPC helper functions
 
