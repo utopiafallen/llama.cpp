@@ -224,6 +224,7 @@ struct rpc_msg_batch_precheck_rsp {
 
 // Forward declarations
 class rpc_command_queue;
+struct ggml_backend_rpc_buffer_context;
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
 static bool ggml_backend_buffer_is_rpc(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
