@@ -2613,7 +2613,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
-                    res->n_tokens = token_count;
+                    res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite + nsidecar;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
@@ -2664,23 +2664,19 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // Read checkpoints from sidecar
+                        std::list<common_prompt_checkpoint> sidecar_checkpoints;
+                        server_ckpt_sidecar_read(server_ckpt_sidecar_path(filepath), sidecar_checkpoints);
+                        slot->prompt.checkpoints = std::move(sidecar_checkpoints);
+
+                        SLT_TRC(*slot, "restored checkpoint sidecar: %zu checkpoints\n",
+                                slot->prompt.checkpoints.size());
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    tokens.resize(token_count);
-
-                    // Read checkpoints from sidecar before clear() deletes them
-                    std::list<common_prompt_checkpoint> sidecar_checkpoints;
-                    server_ckpt_sidecar_read(server_ckpt_sidecar_path(filepath), sidecar_checkpoints);
-
-                    slot->prompt.clear();
-                    slot->prompt.tokens.insert(tokens);
-                    slot->prompt.checkpoints = std::move(sidecar_checkpoints);
-
-                    SLT_TRC(*slot, "restored checkpoint sidecar: %zu checkpoints\n",
-                            slot->prompt.checkpoints.size());
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
