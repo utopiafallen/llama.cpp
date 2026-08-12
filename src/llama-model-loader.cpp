@@ -2,7 +2,9 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#ifdef GGML_RPC
 #include "ggml-rpc.h"
+#endif
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1551,6 +1553,7 @@ bool llama_model_loader::load_all_data(
 
     // Batch pre-check: ask RPC server which tensors are cached, server loads from cache on hit.
     // Works with or without mmap - no stable source pointers needed.
+#ifdef GGML_RPC
     if (!check_tensors) {
         // group RPC tensors by (buffer, file)
         struct rpc_precheck_group {
@@ -1611,6 +1614,7 @@ bool llama_model_loader::load_all_data(
                     __func__, n_loaded, n_tensors, bytes_loaded / (double) GiB, precheck_seconds);
         }
     }
+#endif
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
