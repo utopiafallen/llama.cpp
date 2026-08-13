@@ -14,6 +14,8 @@
 #define GGML_SYCL_COMMON_HPP
 
 #include <cstddef>
+#include <cstdarg>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -90,6 +92,30 @@ extern int g_ggml_sycl_fa_onednn_max_kv;
         if (UNLIKELY(g_ggml_sycl_profile)) \
             GGML_LOG_INFO(__VA_ARGS__);   \
     } while (0)
+
+// Profiling output to file -- avoids stdout interference with model output
+extern std::ofstream g_sycl_profile_file;
+
+inline void ggml_sycl_profile_init() {
+    static bool initialized = false;
+    if (initialized) return;
+    initialized = true;
+    const char * path = std::getenv("GGML_SYCL_PROFILE_FILE");
+    if (!path || path[0] == '\0') path = "sycl-profile.log";
+    g_sycl_profile_file.open(path, std::ios::out);
+}
+
+inline void ggml_sycl_profile_write(const char * fmt, ...) {
+    if (UNLIKELY(!g_ggml_sycl_profile)) return;
+    ggml_sycl_profile_init();
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[1024];
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    g_sycl_profile_file << "[" << ggml_time_us() << "] " << buf;
+    g_sycl_profile_file.flush();
+    va_end(ap);
+}
 
 #define CHECK_TRY_ERROR(expr)                                            \
   [&]() {                                                                \
