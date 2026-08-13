@@ -96,6 +96,8 @@ static bool ggml_cuda_profile() {
     return profile;
 }
 
+std::ofstream g_cuda_profile_file;
+
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 

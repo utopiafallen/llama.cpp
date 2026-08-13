@@ -6,6 +6,8 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstdarg>
+#include <fstream>
 #include <memory>
 #include <mutex>
 
@@ -1665,5 +1667,32 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Profiling output to file -- avoids stdout interference with model output
+extern std::ofstream g_cuda_profile_file;
+
+// Forward-declared in ggml-cuda.cu
+bool ggml_cuda_profile();
+
+inline void ggml_cuda_profile_init() {
+    static bool initialized = false;
+    if (initialized) return;
+    initialized = true;
+    const char * path = std::getenv("GGML_CUDA_PROFILE_FILE");
+    if (!path || path[0] == '\0') path = "cuda-profile.log";
+    g_cuda_profile_file.open(path, std::ios::out);
+}
+
+inline void ggml_cuda_profile_write(const char * fmt, ...) {
+    if (!ggml_cuda_profile()) return;
+    ggml_cuda_profile_init();
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[1024];
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    g_cuda_profile_file << "[" << ggml_time_us() << "] " << buf;
+    g_cuda_profile_file.flush();
+    va_end(ap);
 }
 
