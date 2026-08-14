@@ -87,12 +87,6 @@ extern int g_ggml_sycl_fa_onednn_max_kv;
             fprintf(stderr, __VA_ARGS__); \
     } while (0)
 
-#define GGML_SYCL_PROFILE(...)            \
-    do {                                  \
-        if (UNLIKELY(g_ggml_sycl_profile)) \
-            GGML_LOG_INFO(__VA_ARGS__);   \
-    } while (0)
-
 // Profiling output to file -- avoids stdout interference with model output
 extern std::ofstream g_sycl_profile_file;
 
