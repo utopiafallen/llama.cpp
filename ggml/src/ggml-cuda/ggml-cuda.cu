@@ -92,7 +92,7 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
-static bool ggml_cuda_profile() {
+bool ggml_cuda_profile() {
     static bool profile = getenv("GGML_CUDA_PROFILE") != nullptr && std::atoi(getenv("GGML_CUDA_PROFILE"));
     return profile;
 }
@@ -4217,8 +4217,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 std::sort(sorted_ops.begin(), sorted_ops.end(),
                           [](const auto & a, const auto & b) { return a.second > b.second; });
                 double total_ms = (t_graph_end - t_graph_start) / 1000.0;
-                GGML_LOG_INFO("[CUDA-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
-                              cuda_ctx->device, cgraph->n_nodes, total_ms);
+                ggml_cuda_profile_write("[CUDA-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
+                                        cuda_ctx->device, cgraph->n_nodes, total_ms);
                 int shown = 0;
                 for (auto & [op, us] : sorted_ops) {
                     if (shown >= 15) {
@@ -4229,7 +4229,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (pct < 0.1 && shown >= 5) {
                         continue;
                     }
-                    GGML_LOG_INFO("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
+                    ggml_cuda_profile_write("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
                     shown++;
                 }
             }
