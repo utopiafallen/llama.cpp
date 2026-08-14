@@ -5685,8 +5685,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         std::sort(sorted_ops.begin(), sorted_ops.end(),
                   [](const auto & a, const auto & b) { return a.second > b.second; });
         double total_ms = (t_graph_end - t_graph_start) / 1000.0;
-        GGML_SYCL_PROFILE("[SYCL-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
-                          sycl_ctx->device, cgraph->n_nodes, total_ms);
+        ggml_sycl_profile_write("[SYCL-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
+                                sycl_ctx->device, cgraph->n_nodes, total_ms);
         int shown = 0;
         for (auto & [op, us] : sorted_ops) {
             if (shown >= 15) {
@@ -5697,7 +5697,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (pct < 0.1 && shown >= 5) {
                 continue;
             }
-            GGML_SYCL_PROFILE("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
+            ggml_sycl_profile_write("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
             shown++;
         }
     }
