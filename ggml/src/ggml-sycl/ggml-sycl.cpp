@@ -5683,7 +5683,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
+                int64_t t_gdn_start = ggml_time_us();
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                op_times["gated_delta_net_fused_cache"] += ggml_time_us() - t_gdn_start;
                 i += gdn_nodes_to_skip;
                 continue;
             }
@@ -5705,6 +5707,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+            op_times["mul_mat_glu_fused"] += ggml_time_us() - t_op_start;
             i += 2;
             continue;
         }
