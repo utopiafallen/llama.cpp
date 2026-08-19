@@ -29,8 +29,13 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
         return false;
     }
 
-    // only q4_K has a fused reorder GEMV so far, and it walks whole super-blocks
-    if (wu->type != GGML_TYPE_Q4_K || wu->ne[0] % QK_K != 0) {
+    if (wu->ne[0] % QK_K != 0) {
+        return false;
+    }
+
+    // q4_K is fused through the q8_1 mat-vec below; q6_K through the f32-activation ESIMD
+    // DMMV path selected in ggml_sycl_mul_mat_glu_mmvq_fused()
+    if (wu->type != GGML_TYPE_Q4_K && !(wu->type == GGML_TYPE_Q6_K && g_ggml_sycl_fuse_mm_glu)) {
         return false;
     }
 
@@ -94,6 +99,11 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return false;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_ADD) {
+        // weight type, mat-vec shape and DMMV reorder gates live in ggml_sycl_mul_mat_add_fused()
+        return true;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
@@ -154,6 +164,55 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         // shaped; the destination is written flat, so it must be fully contiguous
         if (!ggml_is_contiguous_1(unary->src[0]) || !ggml_is_contiguous_1(other) ||
             !ggml_are_same_shape(other, unary) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+
+        // the 32-bit fastdiv is inexact past 2^31; decline, the unfused path handles it
+        if (ggml_nelements(mul) >= ((int64_t) 1 << 31)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY &&
+        ops.begin()[2] == GGML_OP_MUL && unary_ops.size() == 1) {
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
+
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
+            return false;
+        }
+
+        // out = a * unary(x + dt) with dt and a per-row constants broadcast over the tokens;
+        // the inference loader sets no PARAM flags, so tell the operands apart by the
+        // COMPUTE flag: x is the computed chain input, dt and a are graph leaves
+        const bool x_compute  = (add->src[0]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        const bool dt_compute = (add->src[1]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        if (x_compute == dt_compute) {
+            return false;
+        }
+        const ggml_tensor * x  = x_compute ? add->src[0] : add->src[1];
+        const ggml_tensor * dt = x_compute ? add->src[1] : add->src[0];
+        const ggml_tensor * a  = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        if ((a->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            return false;
+        }
+
+        if (add->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || dt->type != GGML_TYPE_F32 ||
+            a->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // x keeps the chain shape; dt and a span one value per row
+        if (!ggml_are_same_shape(x, add) || dt->ne[0] != add->ne[0] || a->ne[0] != add->ne[0] ||
+            ggml_nelements(dt) != dt->ne[0] || ggml_nelements(a) != a->ne[0]) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous_1(x) || !ggml_is_contiguous(dt) || !ggml_is_contiguous(a) ||
+            !ggml_is_contiguous(mul)) {
             return false;
         }
 
