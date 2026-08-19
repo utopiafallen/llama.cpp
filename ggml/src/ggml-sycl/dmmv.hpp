@@ -24,4 +24,12 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// ESIMD q6_K DMMV variants with a store epilogue for graph fusion; f32 activation
+void ggml_sycl_q6_k_dmmv_reorder_esimd_add(const void * vx, const float * y, const float * res, float * dst,
+                                           const int ncols, const int nrows, dpct::queue_ptr stream);
+
+bool ggml_sycl_q6_k_dmmv_reorder_esimd_glu(const void * vx_up, const void * vx_gate, const float * y, float * dst,
+                                           const enum ggml_glu_op glu_op, const int ncols, const int nrows,
+                                           dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_DMMV_HPP
