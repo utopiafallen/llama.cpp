@@ -1041,6 +1041,51 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     }
 }
 
+// out = a * softplus(x + dt): the {add, softplus, mul} chain of the gated delta-net dt
+// projection in one launch. dt and a are parameter vectors broadcast over the rows; math
+// is f32, as the unfused ops do.
+static void add_softplus_mul_sycl(const float * x, const float * dt, const float * a, float * dst, const int64_t k,
+                                  const int64_t n, const int64_t o1, dpct::queue_ptr stream) {
+    const size_t            num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
+    const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+
+    // 32-bit fastdiv, exact only below 2^31; ggml_sycl_can_fuse() already declined past that
+    GGML_ASSERT(k < ((int64_t) 1 << 31));
+    const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
+    stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
+            const sycl::uint2 rc = fast_div_modulo((uint32_t) i, n_fd);
+            dst[i] = (float) op_softplus((float) x[(int64_t) rc.x() * o1 + rc.y()] + (float) dt[rc.y()]) * (float) a[rc.y()];
+        }
+    });
+}
+
+void ggml_sycl_op_add_softplus_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add_node, ggml_tensor * mul_node) {
+    scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
+
+    // same operand identification as ggml_sycl_can_fuse(): x is the computed chain input,
+    // dt and a are graph leaves (the inference loader sets no PARAM flags)
+    const bool x_compute  = (add_node->src[0]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    const bool dt_compute = (add_node->src[1]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    GGML_ASSERT(x_compute != dt_compute);
+    const ggml_tensor * x  = x_compute ? add_node->src[0] : add_node->src[1];
+    const ggml_tensor * dt = x_compute ? add_node->src[1] : add_node->src[0];
+    const ggml_tensor * a  = (mul_node->src[0]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ? mul_node->src[0] : mul_node->src[1];
+
+    GGML_ASSERT(dt->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 &&
+                mul_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(x, mul_node) && dt->ne[0] == mul_node->ne[0] && a->ne[0] == mul_node->ne[0]);
+    GGML_ASSERT(ggml_is_contiguous_1(x) && ggml_is_contiguous(dt) && ggml_is_contiguous(a) &&
+                ggml_is_contiguous(mul_node));
+
+    queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    add_softplus_mul_sycl((const float *) x->data, (const float *) dt->data, (const float *) a->data,
+                          (float *) mul_node->data, ggml_nelements(mul_node), mul_node->ne[0],
+                          x->nb[1] / sizeof(float), main_stream);
+}
+
 __dpct_inline__ float ggml_sycl_op_swiglu_oai_single(float x, float g, float alpha = 1.702f, float limit = 7.0f) {
     x = sycl::fmin(x, limit);
     g = sycl::fmax(sycl::fmin(g, limit), -limit);
