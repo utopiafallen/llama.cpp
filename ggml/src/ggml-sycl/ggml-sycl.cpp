@@ -34,7 +34,6 @@
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
-#include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 #include <level_zero/ze_api.h>
 #endif
@@ -91,7 +90,6 @@
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
-int g_ggml_sycl_profile = 0;
 int g_ggml_sycl_enable_optimize = 1;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
@@ -112,7 +110,6 @@ int g_ggml_sycl_enable_flash_attention = 1;
 int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
-std::ofstream g_sycl_profile_file;
 
 static ggml_sycl_device_info ggml_sycl_init() {
     ggml_sycl_device_info info = {};
@@ -314,7 +311,6 @@ static void ggml_check_sycl() try {
 
     if (!initialized) {
         g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
-        g_ggml_sycl_profile = ggml_sycl_get_env("GGML_SYCL_PROFILE", 0);
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
@@ -4625,8 +4621,10 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
     if (wu->type == GGML_TYPE_Q6_K) {
         // f32-activation ESIMD DMMV path with the GLU written by the store epilogue;
         // SWIGLU only, as the ESIMD epilogue cannot call the GEGLU tanh
+        // mat-vec only: the epilogue writes the first output column, so a multi-token
+        // call would leave the rest stale
         if (!g_ggml_sycl_fuse_mm_glu || !g_ggml_sycl_enable_esimd || g_ggml_sycl_q6k_gemv_row ||
-            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+            act->ne[1] != 1 || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
             return false;
         }
 
@@ -5729,40 +5727,9 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
-// GPU-side per-op time: profiling tag event pair bracketing the op dispatch on the stream
-struct sycl_op_ev {
-    std::string op;
-    sycl::event ev[2];
-};
-
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
-    std::map<std::string, int64_t> op_times;
-    int64_t t_graph_start = ggml_time_us();
-
-    const bool prof = g_ggml_sycl_profile;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    // GPU-side per-op time requires queue profiling tag support on the device
-    const bool prof_tags = prof && stream->get_device().has(sycl::aspect::ext_oneapi_queue_profiling_tag);
-    std::vector<sycl_op_ev> op_events;
-    if (prof_tags) {
-        op_events.reserve(cgraph->n_nodes);
-    } else if (prof) {
-        static bool prof_tags_warned = false;
-        if (!prof_tags_warned) {
-            prof_tags_warned = true;
-            ggml_sycl_profile_write("[SYCL-PROFILE] queue profiling tags unavailable: per-op times are host enqueue wall time\n");
-        }
-    }
-    auto prof_begin = [&](const char * op) {
-        if (!prof_tags) return;
-        op_events.push_back({op, {}});
-        op_events.back().ev[0] = sycl::ext::oneapi::experimental::submit_profiling_tag(*stream);
-    };
-    auto prof_end = [&]() {
-        if (!prof_tags) return;
-        op_events.back().ev[1] = sycl::ext::oneapi::experimental::submit_profiling_tag(*stream);
-    };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -5773,23 +5740,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
-        sycl_op_ev ev_fuse;
-        int64_t t_fuse_start = ggml_time_us();
-        if (prof_tags) {
-            ev_fuse.ev[0] = sycl::ext::oneapi::experimental::submit_profiling_tag(*stream);
-        }
         // dispatches internally when a pattern matches
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
-            std::string opname = std::string("fuse_") + ggml_op_name(node->op);
-            if (g_ggml_sycl_profile) {
-                op_times[opname] += ggml_time_us() - t_fuse_start;
-            }
-            if (prof_tags) {
-                ev_fuse.op = opname;
-                op_events.push_back(std::move(ev_fuse));
-                prof_end();
-            }
             i += nodes_to_skip;
             continue;
         }
@@ -5806,133 +5759,50 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
-                int64_t t_gdn_start = ggml_time_us();
-                prof_begin("gated_delta_net_fused_cache");
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
-                prof_end();
-                if (g_ggml_sycl_profile) {
-                    op_times["gated_delta_net_fused_cache"] += ggml_time_us() - t_gdn_start;
-                }
                 i += gdn_nodes_to_skip;
                 continue;
             }
         }
 
-        int64_t t_op_start = ggml_time_us();
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-            prof_begin("rms_norm_fused");
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
-            prof_end();
-            if (g_ggml_sycl_profile) {
-                op_times["rms_norm_fused"] += ggml_time_us() - t_op_start;
-            }
             i++;
             continue;
         }
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
-            prof_begin("unary_mul_fused");
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
-            prof_end();
-            if (g_ggml_sycl_profile) {
-                op_times["unary_mul_fused"] += ggml_time_us() - t_op_start;
-            }
             i++;
             continue;
         }
 
         if (node->op == GGML_OP_ADD && g_ggml_sycl_fuse_gdn_dt &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-            prof_begin("add_softplus_mul_fused");
             ggml_sycl_op_add_softplus_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 2]);
-            prof_end();
-            if (g_ggml_sycl_profile) {
-                op_times["add_softplus_mul_fused"] += ggml_time_us() - t_op_start;
-            }
             i += 2;
             continue;
         }
 
         if (node->op == GGML_OP_MUL_MAT) {
-            sycl_op_ev ev_glu;
-            if (prof_tags) {
-                ev_glu.ev[0] = sycl::ext::oneapi::experimental::submit_profiling_tag(*stream);
-            }
             // dispatches internally when the pattern matches
             if (ggml_sycl_mul_mat_add_fused(*sycl_ctx, cgraph, i)) {
-                if (g_ggml_sycl_profile) {
-                    op_times["mul_mat_add_fused"] += ggml_time_us() - t_op_start;
-                }
-                if (prof_tags) {
-                    ev_glu.op = "mul_mat_add_fused";
-                    op_events.push_back(std::move(ev_glu));
-                    prof_end();
-                }
                 i += 1;
                 continue;
             }
             // dispatches internally when the pattern matches
             if (ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
-                if (g_ggml_sycl_profile) {
-                    op_times["mul_mat_glu_fused"] += ggml_time_us() - t_op_start;
-                }
-                if (prof_tags) {
-                    ev_glu.op = "mul_mat_glu_fused";
-                    op_events.push_back(std::move(ev_glu));
-                    prof_end();
-                }
                 i += 2;
                 continue;
             }
         }
 
-        prof_begin(ggml_op_name(node->op));
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
-        prof_end();
-        if (g_ggml_sycl_profile) {
-            op_times[ggml_op_name(node->op)] += ggml_time_us() - t_op_start;
-        }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
-    }
-    if (prof_tags) {
-        // resolve GPU-side per-op times, supplanting the enqueue wall times above
-        try {
-            std::map<std::string, int64_t> gpu_times;
-            for (auto & e : op_events) {
-                const uint64_t t0 = e.ev[0].get_profiling_info<sycl::info::event_profiling::command_start>();
-                const uint64_t t1 = e.ev[1].get_profiling_info<sycl::info::event_profiling::command_end>();
-                gpu_times[e.op] += (int64_t) ((t1 - t0) / 1000); // ns -> us
-            }
-            op_times.swap(gpu_times);
-        } catch (const sycl::exception & exc) {
-            GGML_SYCL_DEBUG("[SYCL] profile: event timing unavailable (%s), keeping enqueue times\n", exc.what());
-        }
-    }
-    int64_t t_graph_end = ggml_time_us();
-    if (g_ggml_sycl_profile) {
-        std::vector<std::pair<std::string, int64_t>> sorted_ops(op_times.begin(), op_times.end());
-        std::sort(sorted_ops.begin(), sorted_ops.end(),
-                  [](const auto & a, const auto & b) { return a.second > b.second; });
-        double total_ms = (t_graph_end - t_graph_start) / 1000.0;
-        ggml_sycl_profile_write("[SYCL-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
-                                sycl_ctx->device, cgraph->n_nodes, total_ms);
-        int shown = 0;
-        for (auto & [op, us] : sorted_ops) {
-            if (shown >= 15) {
-                break;
-            }
-            double ms = us / 1000.0;
-            double pct = total_ms > 0 ? (ms / total_ms) * 100.0 : 0.0;
-            if (pct < 0.1 && shown >= 5) {
-                continue;
-            }
-            ggml_sycl_profile_write("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
-            shown++;
-        }
     }
 }
 
