@@ -90,6 +90,7 @@
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
+int g_ggml_sycl_profile = 0;
 int g_ggml_sycl_enable_optimize = 1;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
@@ -110,6 +111,7 @@ int g_ggml_sycl_enable_flash_attention = 1;
 int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
+std::ofstream g_sycl_profile_file;
 
 static ggml_sycl_device_info ggml_sycl_init() {
     ggml_sycl_device_info info = {};
@@ -311,6 +313,7 @@ static void ggml_check_sycl() try {
 
     if (!initialized) {
         g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
+        g_ggml_sycl_profile = ggml_sycl_get_env("GGML_SYCL_PROFILE", 0);
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
@@ -5737,6 +5740,9 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+    std::map<std::string, int64_t> op_times;
+    int64_t t_graph_start = ggml_time_us();
+
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -5748,9 +5754,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        int64_t t_fuse_start = ggml_time_us();
         // dispatches internally when a pattern matches
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
+            if (g_ggml_sycl_profile) {
+                op_times[std::string("fuse_") + ggml_op_name(node->op)] += ggml_time_us() - t_fuse_start;
+            }
             i += nodes_to_skip;
             continue;
         }
@@ -5767,21 +5777,32 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
+                int64_t t_gdn_start = ggml_time_us();
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                if (g_ggml_sycl_profile) {
+                    op_times["gated_delta_net_fused_cache"] += ggml_time_us() - t_gdn_start;
+                }
                 i += gdn_nodes_to_skip;
                 continue;
             }
         }
 
+        int64_t t_op_start = ggml_time_us();
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            if (g_ggml_sycl_profile) {
+                op_times["rms_norm_fused"] += ggml_time_us() - t_op_start;
+            }
             i++;
             continue;
         }
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            if (g_ggml_sycl_profile) {
+                op_times["unary_mul_fused"] += ggml_time_us() - t_op_start;
+            }
             i++;
             continue;
         }
@@ -5789,6 +5810,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_ADD && g_ggml_sycl_fuse_gdn_dt &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
             ggml_sycl_op_add_softplus_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 2]);
+            if (g_ggml_sycl_profile) {
+                op_times["add_softplus_mul_fused"] += ggml_time_us() - t_op_start;
+            }
             i += 2;
             continue;
         }
@@ -5796,21 +5820,52 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_MUL_MAT) {
             // dispatches internally when the pattern matches
             if (ggml_sycl_mul_mat_add_fused(*sycl_ctx, cgraph, i)) {
+                if (g_ggml_sycl_profile) {
+                    op_times["mul_mat_add_fused"] += ggml_time_us() - t_op_start;
+                }
                 i += 1;
                 continue;
             }
             // dispatches internally when the pattern matches
             if (ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+                if (g_ggml_sycl_profile) {
+                    op_times["mul_mat_glu_fused"] += ggml_time_us() - t_op_start;
+                }
                 i += 2;
                 continue;
             }
         }
 
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        if (g_ggml_sycl_profile) {
+            op_times[ggml_op_name(node->op)] += ggml_time_us() - t_op_start;
+        }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    int64_t t_graph_end = ggml_time_us();
+    if (g_ggml_sycl_profile) {
+        std::vector<std::pair<std::string, int64_t>> sorted_ops(op_times.begin(), op_times.end());
+        std::sort(sorted_ops.begin(), sorted_ops.end(),
+                  [](const auto & a, const auto & b) { return a.second > b.second; });
+        double total_ms = (t_graph_end - t_graph_start) / 1000.0;
+        ggml_sycl_profile_write("[SYCL-PROFILE] graph_compute dev=%d nodes=%d total=%.2fms | top ops:\n",
+                                sycl_ctx->device, cgraph->n_nodes, total_ms);
+        int shown = 0;
+        for (auto & [op, us] : sorted_ops) {
+            if (shown >= 15) {
+                break;
+            }
+            double ms = us / 1000.0;
+            double pct = total_ms > 0 ? (ms / total_ms) * 100.0 : 0.0;
+            if (pct < 0.1 && shown >= 5) {
+                continue;
+            }
+            ggml_sycl_profile_write("  %s: %.2fms (%.1f%%)\n", op.c_str(), ms, pct);
+            shown++;
+        }
     }
 }
 
