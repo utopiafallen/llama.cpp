@@ -33,9 +33,11 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
         return false;
     }
 
-    // q4_K is fused through the q8_1 mat-vec below; q6_K through the f32-activation ESIMD
-    // DMMV path selected in ggml_sycl_mul_mat_glu_mmvq_fused()
-    if (wu->type != GGML_TYPE_Q4_K && !(wu->type == GGML_TYPE_Q6_K && g_ggml_sycl_fuse_mm_glu)) {
+    // q4_K is fused through the q8_1 mat-vec below; q6_K and q5_K through the f32-activation
+    // ESIMD DMMV path selected in ggml_sycl_mul_mat_glu_mmvq_fused()
+    if (wu->type != GGML_TYPE_Q4_K &&
+        !(wu->type == GGML_TYPE_Q6_K && g_ggml_sycl_fuse_mm_glu) &&
+        !(wu->type == GGML_TYPE_Q5_K && g_ggml_sycl_fuse_mm_glu)) {
         return false;
     }
 

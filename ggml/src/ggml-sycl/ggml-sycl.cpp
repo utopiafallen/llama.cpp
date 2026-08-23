@@ -101,6 +101,7 @@ int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_q6k_gemv_row = 0;
+int g_ggml_sycl_q80_gemv_esimd = 1;
 int g_ggml_sycl_fuse_mm_add = 1;
 int g_ggml_sycl_fuse_mm_glu = 1;
 int g_ggml_sycl_fuse_gdn_dt = 1;
@@ -324,6 +325,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_q6k_gemv_row = ggml_sycl_get_env("GGML_SYCL_Q6K_GEMV_ROW", 0);
+        g_ggml_sycl_q80_gemv_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_GEMV_ESIMD", 1);
         g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
         g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
         g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
@@ -432,6 +434,7 @@ static void ggml_check_sycl() try {
 
 #if defined(__INTEL_LLVM_COMPILER)
         GGML_LOG_INFO("  GGML_SYCL_Q6K_GEMV_ROW: %d\n", g_ggml_sycl_q6k_gemv_row);
+        GGML_LOG_INFO("  GGML_SYCL_Q80_GEMV_ESIMD: %d\n", g_ggml_sycl_q80_gemv_esimd);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_ADD: %d\n", g_ggml_sycl_fuse_mm_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_GLU: %d\n", g_ggml_sycl_fuse_mm_glu);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_GDN_DT: %d\n", g_ggml_sycl_fuse_gdn_dt);
@@ -3835,6 +3838,8 @@ static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
             return true;
+        case GGML_TYPE_Q8_0:
+            return g_ggml_sycl_q80_gemv_esimd;
         default:
             return false;
     }
@@ -4631,12 +4636,13 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
         return false;
     }
 
-    if (wu->type == GGML_TYPE_Q6_K) {
+    if (wu->type == GGML_TYPE_Q6_K || wu->type == GGML_TYPE_Q5_K) {
         // f32-activation ESIMD DMMV path with the GLU written by the store epilogue;
         // SWIGLU only, as the ESIMD epilogue cannot call the GEGLU tanh
         // mat-vec only: the epilogue writes the first output column, so a multi-token
         // call would leave the rest stale
-        if (!g_ggml_sycl_fuse_mm_glu || !g_ggml_sycl_enable_esimd || g_ggml_sycl_q6k_gemv_row ||
+        if (!g_ggml_sycl_fuse_mm_glu || !g_ggml_sycl_enable_esimd ||
+            (wu->type == GGML_TYPE_Q6_K && g_ggml_sycl_q6k_gemv_row) ||
             act->ne[1] != 1 || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
             return false;
         }
@@ -4652,8 +4658,8 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
 
         scope_op_debug_print scope_dbg_print(__func__, up, /*num_src=*/2, " : fused with gate + GLU, ESIMD DMMV");
 
-        return ggml_sycl_q6_k_dmmv_reorder_esimd_glu(wu->data, wg->data, (const float *) act->data, (float *) glu->data,
-                                                      ggml_get_glu_op(glu), (int) wu->ne[0], (int) wu->ne[1], ctx.stream());
+        return ggml_sycl_dmmv_reorder_esimd_glu(wu->data, wg->data, (const float *) act->data, (float *) glu->data,
+                                                 ggml_get_glu_op(glu), wu->type, (int) wu->ne[0], (int) wu->ne[1], ctx.stream());
     }
 
     // with DMMV prioritised the unfused path would not have gone through mmvq at all
