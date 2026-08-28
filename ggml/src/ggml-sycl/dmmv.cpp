@@ -1940,8 +1940,8 @@ static void dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(const void *vx, const
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q2_K>(
-                    vx, y, dst, ncols, nrows, lmem, it);
+                dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q2_K, /*ADD_RES=*/false>(
+                    vx, y, nullptr, dst, ncols, nrows, lmem, it);
             });
     });
 }
