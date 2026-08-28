@@ -252,6 +252,8 @@ option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL bac
 option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
 option(GGML_SYCL_SUPPORT_LEVEL_ZERO_API     "ggml: use Level Zero API in SYCL backend"  ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
+option(GGML_SYCL_Q6K_GEMV_LLMSCALER         "ggml: Q6_K row GEMV with llm-scaler qh pre-shuffle (in-place SoA)" OFF)
+option(GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16    "ggml: Q6_K llm-scaler also fp16 pre-combined scale (larger repack buffer)" OFF)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING

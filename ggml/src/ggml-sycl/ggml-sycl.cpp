@@ -645,6 +645,11 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+static bool reorder_qw_q6_k_llmscaler(uint8_t * data_device, size_t size, size_t offset,
+                                      dpct::queue_ptr stream, ggml_tensor_extra_gpu * extra, int device);
+#endif
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -665,6 +670,21 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     free(host_buf);
 #else
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+#endif
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+    // repack 2D Q6_K weights once at upload time, before any compute kernel runs.
+    // MoE (ne[2]>1) and K % 512 != 0 keep the original layout.
+    if (g_ggml_sycl_enable_optimize && ggml_sycl_info().devices[ctx->device].opt_feature.reorder &&
+        tensor->type == GGML_TYPE_Q6_K && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        tensor->ne[0] % 512 == 0 && offset == 0 && size == (size_t) ggml_nbytes(tensor)) {
+        ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) tensor->extra;
+        if (extra && !extra->optimized_feature.reorder) {
+            if (reorder_qw_q6_k_llmscaler((uint8_t *) tensor->data, size, 0, stream, extra, ctx->device)) {
+                extra->optimized_feature.reorder = true;
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+            }
+        }
+    }
 #endif
 }
 catch (sycl::exception const &exc) {
@@ -4393,11 +4413,141 @@ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
     return true;
 }
 
-static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+// llm-scaler q6_K repack: reference 512-element tile layout. ql is pair packed (tile
+// byte B holds element 2B low and 2B+1 high), scales are raw copies, qh is pre-shuffled:
+// byte t2 (0..127) field p (0..3) holds the high 2 bits of tile element p*128+t2, so the
+// kernel loads one 128-byte qh chunk per 512 tile and the
+// 4 field planes are stride-1 (crosses the two 256-element blocks of the tile).
+// base gate: in-place, scale = int8 sc + half d. _FP16: separate larger buffer,
+// scale = fp16 (d*sc) pre-combined.
+static bool reorder_qw_q6_k_llmscaler(uint8_t * data_device, size_t size, size_t offset,
+                                      dpct::queue_ptr stream, ggml_tensor_extra_gpu * extra, int device) {
+    GGML_ASSERT(size % sizeof(block_q6_K) == 0);
+    GGML_ASSERT(offset % sizeof(block_q6_K) == 0);
+    const int nblocks = size / sizeof(block_q6_K);
+    GGML_ASSERT(nblocks % 2 == 0);  // K % 512 == 0
+
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+    const size_t out_size = (size_t) nblocks * (QK_K/2 + QK_K/4 + QK_K/8);
+    void * out_buf = sycl_ext_malloc_device(stream, out_size);
+    if (!out_buf) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for llm-scaler repack, skipping\n", __func__, out_size);
+        return false;
+    }
+    if (extra) {
+        extra->repacked_data   = out_buf;
+        extra->repacked_device = device;
+    }
+    uint8_t * out = (uint8_t *) out_buf;
+#else
+    // in-place: repack into the original weight buffer at upload time, before any
+    // compute kernel runs.
+    uint8_t * out = data_device;
+#endif
+
+    sycl_reorder_temp_buffer tmp(stream, size);
+    if (!tmp) {
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+        if (extra && extra->repacked_data) {
+            sycl_ext_free(stream, extra->repacked_data);
+            extra->repacked_data = nullptr;
+        }
+#endif
+        return false;
+    }
+    uint8_t * tmp_buf = (uint8_t *) tmp.ptr;
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    const size_t ql_off = 0;
+    const size_t qh_off = (size_t) nblocks * (QK_K/2);
+    const size_t sc_off = qh_off + (size_t) nblocks * (QK_K/4);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+    const size_t sc_block = QK_K/8;   // 16 fp16 combined scales per block
+#else
+    const size_t sc_block = QK_K/16;  // 16 int8 scales per block
+    const size_t d_off  = sc_off + (size_t) nblocks * sc_block;
+#endif
+    auto reorder_event = stream->parallel_for(nblocks/2, [=](auto t) {
+        const int      tile = (int) t;
+        const int      ib0  = 2*tile;
+        const auto   * blks = ((const block_q6_K *) tmp_buf) + ib0;
+        // ql: pair pack - tile byte B holds element 2B (low nibble) and 2B+1 (high),
+        // which the kernel reads back with a stride-2 interleave
+        uint8_t * out_ql = out + ql_off + (size_t) ib0 * (QK_K/2);
+        for (int B = 0; B < QK_K; ++B) {
+            uint8_t v = 0;
+            for (int f = 0; f < 2; ++f) {
+                const int e    = 2*B + f;
+                const int ob   = e / QK_K;
+                const int oe   = e % QK_K;
+                const int ig   = (oe % 128) / 32;
+                const int il   = oe % 32;
+                const int byte = 64*(oe/128) + il + 32*(ig & 1);
+                const uint8_t b = blks[ob].ql[byte];
+                const uint8_t val = ((oe % 128) >= 64) ? (b >> 4) : (b & 0x0F);
+                v |= (uint8_t) (val << (4*f));
+            }
+            out_ql[B] = v;
+        }
+        // qh: reference shuffle. tile byte t2 (0..127) field p (0..3) holds the high
+        // 2 bits of tile element p*(QK_K/2)+t2, crossing the two blocks of the tile
+        uint8_t * out_qh = out + qh_off + (size_t) ib0 * (QK_K/4);
+        for (int t2 = 0; t2 < QK_K/2; ++t2) {
+            uint8_t v = 0;
+            for (int p = 0; p < 4; ++p) {
+                const int e    = p*(QK_K/2) + t2;
+                const int ob   = e / QK_K;
+                const int oe   = e % QK_K;
+                const int byte = 32*(oe/128) + (oe%32);
+                const int fld  = 2*((oe%128)/32);
+                const uint8_t bits = (blks[ob].qh[byte] >> fld) & 3;
+                v |= (uint8_t) (bits << (2*p));
+            }
+            out_qh[t2] = v;
+        }
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+        // scale: fp16 (d*sc) pre-combined, 16 per block
+        sycl::half * out_scale = (sycl::half *) (out + sc_off + (size_t) ib0 * sc_block);
+        for (int b = 0; b < 2; ++b) {
+            const float d_f = (float) blks[b].d;
+            for (int g = 0; g < QK_K/16; ++g) {
+                out_scale[b*sc_block + g] = (sycl::half) (d_f * (float) blks[b].scales[g]);
+            }
+        }
+#else
+        // scale: raw int8 16-byte copy of both blocks + 2 halves
+        uint8_t * out_sc = out + sc_off + (size_t) ib0 * sc_block;
+        for (int g = 0; g < QK_K/16; ++g) {
+            out_sc[g]            = blks[0].scales[g];
+            out_sc[sc_block + g] = blks[1].scales[g];
+        }
+        sycl::half * out_d = (sycl::half *) (out + d_off + (size_t) ib0*2);
+        out_d[0] = (sycl::half) (float) blks[0].d;
+        out_d[1] = (sycl::half) (float) blks[1].d;
+#endif
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+#endif // GGML_SYCL_Q6K_GEMV_LLMSCALER
+
+static bool reorder_qw(const ggml_tensor * src0, int device, dpct::queue_ptr stream) {
     uint8_t * data_device = (uint8_t *) src0->data;
     size_t ncols = src0->ne[0];
     size_t nrows = src0->ne[1];
     size_t size = ggml_nbytes(src0);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+    ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) src0->extra;
+#else
+    (void) device;
+#endif
 
     // MoE expert weights are addressed per expert via nb[2], so each slice must
     // remain self-contained after reorder.
@@ -4429,7 +4579,11 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
         case GGML_TYPE_Q5_K:
             return reorder_qw_q5_k(data_device, size, 0, stream);
         case GGML_TYPE_Q6_K:
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+            return reorder_qw_q6_k_llmscaler(data_device, size, 0, stream, extra, device);
+#else
             return reorder_qw_q6_k(data_device, size, 0, stream);
+#endif
         default:
             return false;
     }
@@ -4449,6 +4603,13 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     if (!should_reorder_tensor(*ctx, dst)) {
         return;
     }
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+    // Q6_K weights are repacked to the reference 512-tile layout once at upload time
+    // (buffer_set_tensor); the dispatch keys off the reorder flag, so no lazy repack.
+    if (src0->type == GGML_TYPE_Q6_K) {
+        return;
+    }
+#endif
 
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.reorder) {
@@ -4473,7 +4634,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
             break;
     }
 
-    if (reorder_qw(src0, ctx->stream())) {
+    if (reorder_qw(src0, ctx->device, ctx->stream())) {
         extra->optimized_feature.reorder = true;  // Used to decode/dequan in next steps and avoid re-reordering
     }
 }
@@ -4486,11 +4647,18 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
         return;
     }
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+    // Q6_K MoE experts stay in the original layout; the reference-layout kernels
+    // only read 2D weights repacked at upload time.
+    if (src0->type == GGML_TYPE_Q6_K) {
+        return;
+    }
+#endif
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.reorder) {
         return;
     }
-    if (reorder_qw(src0, ctx->stream())) {
+    if (reorder_qw(src0, ctx->device, ctx->stream())) {
         extra->optimized_feature.reorder = true;
     }
 }
@@ -4641,6 +4809,9 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
         // call would leave the rest stale
         if (!g_ggml_sycl_fuse_mm_glu || !g_ggml_sycl_enable_esimd ||
             (wu->type == GGML_TYPE_Q6_K && g_ggml_sycl_q6k_gemv_row) ||
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+            (wu->type == GGML_TYPE_Q6_K) ||  // repacked layout is not SoA; ffn_gate/up use the row DMMV
+#endif
             act->ne[1] != 1 || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
             return false;
         }
@@ -4727,6 +4898,10 @@ static bool ggml_sycl_mul_mat_add_fused(ggml_backend_sycl_context & ctx, ggml_cg
         res->type != GGML_TYPE_F32) {
         return false;
     }
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+    // repacked layout is not SoA; the eSIMD 2-row+ADD kernel cannot read it
+    return false;
+#endif
     // mat-vec only, one residual value per output row
     if (src1->ne[1] != 1 || mm->ne[1] != 1 || !ggml_is_contiguous(res) || ggml_nelements(res) != mm->ne[0]) {
         return false;
@@ -5749,8 +5924,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     std::map<std::string, int64_t> op_times;
     int64_t t_graph_start = ggml_time_us();
 
-    const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -5759,7 +5932,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
-
         int64_t t_fuse_start = ggml_time_us();
         // dispatches internally when a pattern matches
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);

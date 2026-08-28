@@ -11,6 +11,7 @@
 //
 
 #include "mmq.hpp"
+#include "dmmv.hpp"
 #include "vecdotq.hpp"
 
 typedef void (*allocate_tiles_sycl_t)(
@@ -3013,6 +3014,22 @@ void ggml_sycl_op_mul_mat_q(
             ggml_mul_mat_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q6_K:
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+            {
+                // views (tied lm_head) carry no extra of their own
+                const ggml_tensor_extra_gpu * src0_extra =
+                    (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
+                if (!src0_extra && dst->src[0]->view_src) {
+                    src0_extra = (const ggml_tensor_extra_gpu *) dst->src[0]->view_src->extra;
+                }
+                if (src0_extra && src0_extra->optimized_feature.reorder) {
+                    GGML_SYCL_DEBUG("Calling dequantize_mul_mat_vec_q6_K_llmscaler_mt ncols=%d\n", (int) src1_ncols);
+                    dequantize_mul_mat_vec_q6_K_llmscaler_mt(src0_dd_i, src1_ddf_i, dst_dd_i, (int) ne00,
+                                                             (int) row_diff, (int) nrows_dst, (int) src1_ncols, stream);
+                    break;
+                }
+            }
+#endif
             ggml_mul_mat_q6_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         default:

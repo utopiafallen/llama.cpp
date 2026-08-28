@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "common.hpp"
+#include "dmmv.hpp"
 #include "element_wise.hpp"
 #include "quants.hpp"
 #include "vecdotq.hpp"
@@ -2394,6 +2395,22 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 }
                 break;
             case GGML_TYPE_Q6_K:
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+                {
+                    // views (tied lm_head) carry no extra of their own
+                    const ggml_tensor_extra_gpu * src0_extra =
+                        (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
+                    if (!src0_extra && dst->src[0]->view_src) {
+                        src0_extra = (const ggml_tensor_extra_gpu *) dst->src[0]->view_src->extra;
+                    }
+                    if (src0_extra && src0_extra->optimized_feature.reorder) {
+                        GGML_SYCL_DEBUG("Calling dequantize_mul_mat_vec_q6_K_llmscaler_mt ncols=%d\n", (int) src1_ncols);
+                        dequantize_mul_mat_vec_q6_K_llmscaler_mt(src0_dd_i, src1_ddf_i, dst_dd_i, (int) ne00,
+                                                                 (int) row_diff, (int) dst->ne[0], (int) src1_ncols, stream);
+                        return;
+                    }
+                }
+#endif
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {

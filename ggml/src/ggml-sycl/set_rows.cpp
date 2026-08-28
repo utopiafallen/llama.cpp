@@ -314,6 +314,15 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+    // the reference layout is not a row-contiguous block layout, so an AoS row write
+    // would corrupt it; Q6_K weights are not written in the graph
+    if (dst->type == GGML_TYPE_Q6_K && dst->extra &&
+        ((ggml_tensor_extra_gpu *) dst->extra)->optimized_feature.reorder) {
+        GGML_ABORT("q6_K reference-layout weight hit the set_rows path");
+    }
+#endif
+
     dpct::queue_ptr stream = ctx.stream();
     switch (dst->type) {
         case GGML_TYPE_F32:

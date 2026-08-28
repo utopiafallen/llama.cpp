@@ -192,6 +192,15 @@ if (GGML_SYCL_HOST_MEM_FALLBACK)
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)
 endif()
 
+if (GGML_SYCL_Q6K_GEMV_LLMSCALER)
+    message(STATUS "find GGML_SYCL_Q6K_GEMV_LLMSCALER")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_Q6K_GEMV_LLMSCALER)
+    if (GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16)
+        message(STATUS "find GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16")
+        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16)
+    endif()
+endif()
+
 if (GGML_SYCL_DEVICE_ARCH)
     message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} (AOT via spir64_gen)")
     target_compile_options(

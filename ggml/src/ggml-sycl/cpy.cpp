@@ -1381,6 +1381,14 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     } else if (src0->type == GGML_TYPE_Q5_K && src1->type == GGML_TYPE_Q5_K) {
         ggml_cpy_q5_K_q5_K(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_Q6_K) {
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+        // the reference layout is not a row-contiguous block layout, so a block-wise
+        // AoS copy would corrupt the data; Q6_K weights are not copied in the graph
+        if (src0->extra &&
+            ((ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder) {
+            GGML_ABORT("q6_K reference-layout weight hit the cpy path");
+        }
+#endif
         ggml_cpy_q6_K_q6_K(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_IQ2_XXS && src1->type == GGML_TYPE_IQ2_XXS) {
         ggml_cpy_iq2_xxs_iq2_xxs(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);

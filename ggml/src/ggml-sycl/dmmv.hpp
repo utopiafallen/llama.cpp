@@ -32,4 +32,13 @@ bool ggml_sycl_dmmv_reorder_esimd_glu(const void * vx_up, const void * vx_gate, 
                                       const enum ggml_glu_op glu_op, ggml_type wtype, const int ncols, const int nrows,
                                       dpct::queue_ptr stream);
 
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+// reference-layout q6_K GEMV for any M: y [K, M] f32 column-major, dst [N, M] f32
+// column-major with dst_stride elements per column
+void dequantize_mul_mat_vec_q6_K_llmscaler_mt(const void *vx, const float *y,
+                                              float *dst, const int ncols,
+                                              const int nrows, const int dst_stride,
+                                              const int nvec, dpct::queue_ptr stream);
+#endif
+
 #endif // GGML_SYCL_DMMV_HPP

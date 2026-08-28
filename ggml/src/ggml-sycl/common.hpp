@@ -356,10 +356,15 @@ struct ggml_sycl_pool_alloc {
 
 struct ggml_tensor_extra_gpu {
   void* data_device[GGML_SYCL_MAX_DEVICES]; // 1 pointer for each device for split
-                                       // tensors
+                                        // tensors
   dpct::event_ptr events[GGML_SYCL_MAX_DEVICES]
-                        [GGML_SYCL_MAX_STREAMS]; // events for synchronizing multiple GPUs
+                         [GGML_SYCL_MAX_STREAMS]; // events for synchronizing multiple GPUs
   optimize_feature optimized_feature;
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+  // _FP16 repack lives in a separate device buffer owned here; base gate repacks in-place
+  void * repacked_data  = nullptr;
+  int    repacked_device = -1;
+#endif
 };
 
 extern int g_ggml_sycl_use_level_zero_api;

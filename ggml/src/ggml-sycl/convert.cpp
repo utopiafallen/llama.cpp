@@ -325,6 +325,51 @@ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const i
         [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
 }
 
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+// reference-layout q6_K row dequant (see reorder_qw_q6_k_llmscaler); needed by the
+// f16/f32 convert fallback used for batches larger than MMVQ_MAX_BATCH_SIZE
+template <typename dst_t>
+static void dequantize_row_q6_K_llmscaler_reorder(const void * vx, dst_t * y, const int64_t k,
+                                                  dpct::queue_ptr stream) {
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    const size_t ntiles = (size_t) (k / 512);
+    const size_t ql_sz  = ntiles * (QK_K);
+    const size_t qh_sz  = ntiles * (QK_K/2);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+    const size_t sc_sz  = ntiles * (QK_K/4);
+#else
+    const size_t sc_sz  = ntiles * (QK_K/8);
+#endif
+    const uint8_t * ql_b = (const uint8_t *) vx;
+    const uint8_t * qh_b = ql_b + ql_sz;
+    const int8_t  * sc_b = (const int8_t *) (qh_b + qh_sz);
+    const sycl::half * d_b = (const sycl::half *) (sc_b + sc_sz);
+
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, k/64) * sycl::range<3>(1, 1, 16), sycl::range<3>(1, 1, 16)),
+        [=](sycl::nd_item<3> item_ct1) {
+            const int e0 = (int) item_ct1.get_global_id(2) * 4;
+            for (int j = 0; j < 4; ++j) {
+                const int e = e0 + j;
+                const int E = e % 512;
+                const size_t t = (size_t) (e / 512);
+                const uint8_t qb  = ql_b[t * QK_K + E/2];
+                const int qlv = (E & 1) ? (qb >> 4) : (qb & 0x0F);
+                const uint8_t qhb = qh_b[t * (QK_K/2) + (E % 128)];
+                const int qhv = (qhb >> (2 * (E / 128))) & 3;
+                const int sb  = E / 16;
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                const float s = (float) ((const sycl::half *) sc_b)[t * (QK_K/8) + sb];
+#else
+                const float s = (float) sc_b[t * (QK_K/8) + sb] * (float) d_b[t * 2 + sb / 16];
+#endif
+                y[e] = (dst_t) (((float) (qlv | (qhv << 4)) - 32.0f) * s);
+            }
+        });
+}
+#endif // GGML_SYCL_Q6K_GEMV_LLMSCALER
+
 template <typename dst_t>
 static void dequantize_row_iq1_s_sycl(const void *vx, dst_t *y, const int64_t k,
                                         dpct::queue_ptr stream) {
@@ -687,11 +732,20 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
                 return dequantize_row_q5_K_sycl;
             }
         case GGML_TYPE_Q6_K:
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+            // reference layout is not readable by the generic row dequant kernels
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_q6_K_llmscaler_reorder;
+            }
+            return dequantize_row_q6_K_sycl;
+#else
             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                 return dequantize_row_q6_K_sycl_reorder;
             } else {
                 return dequantize_row_q6_K_sycl;
             }
+#endif
         case GGML_TYPE_IQ1_S:
             return dequantize_row_iq1_s_sycl;
         case GGML_TYPE_IQ1_M:
@@ -774,11 +828,20 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
                 return dequantize_row_q5_K_sycl;
             }
         case GGML_TYPE_Q6_K:
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+            // reference layout is not readable by the generic row dequant kernels
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_q6_K_llmscaler_reorder;
+            }
+            return dequantize_row_q6_K_sycl;
+#else
             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                 return dequantize_row_q6_K_sycl_reorder;
             } else {
                 return dequantize_row_q6_K_sycl;
             }
+#endif
         case GGML_TYPE_IQ1_S:
             return dequantize_row_iq1_s_sycl;
         case GGML_TYPE_IQ1_M:

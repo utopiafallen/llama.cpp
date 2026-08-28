@@ -149,5 +149,12 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(extra->data_device[i], *(streams[i]))));
         }
     }
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+    if (extra->repacked_data != nullptr && extra->repacked_device >= 0 &&
+        extra->repacked_device < (int) streams.size()) {
+        ggml_sycl_set_device(extra->repacked_device);
+        ggml_sycl_free_device(extra->repacked_data, *streams[extra->repacked_device]);
+    }
+#endif
     delete extra;
 }

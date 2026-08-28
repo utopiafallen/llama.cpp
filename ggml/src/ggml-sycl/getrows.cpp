@@ -173,6 +173,104 @@ static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *sr
     GGML_UNUSED(ctx);
 }
 
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+// reference-layout q6_K element dequant; same 512-tile mapping as the eSIMD kernel
+// (see reorder_qw_q6_k_llmscaler). e is the element index within the row.
+static float q6k_llmscaler_dequant_elem(const uint8_t * ql_b, const uint8_t * qh_b,
+                                        const int8_t * sc_b, const sycl::half * d_b,
+                                        const size_t ntiles, const int r, const int e) {
+    const int      E = e % 512;
+    const size_t   t = (size_t) r * ntiles + (size_t) (e / 512);
+    const uint8_t  qb  = ql_b[t * (QK_K) + E/2];
+    const int      qlv = (E & 1) ? (qb >> 4) : (qb & 0x0F);
+    const uint8_t  qhb = qh_b[t * (QK_K/2) + (E % 128)];
+    const int      qhv = (qhb >> (2 * (E / 128))) & 3;
+    const int      sb  = E / 16;
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+    const float s = (float) ((const sycl::half *) sc_b)[t * (QK_K/8) + sb];
+#else
+    const float s = (float) sc_b[t * (QK_K/8) + sb] * (float) d_b[t * 2 + sb / 16];
+#endif
+    return ((float) (qlv | (qhv << 4)) - 32.0f) * s;
+}
+
+static void k_get_rows_q6_K_llmscaler(
+        const void * src0, const int32_t * src1, float * dst,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne12,
+        size_t s1, size_t s2, size_t s3,
+        size_t s10, size_t s11, size_t s12,
+        const sycl::nd_item<3> & item_ct1) {
+
+    const int i00 = (item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                     item_ct1.get_local_id(2)) *
+                    2;
+    const int i10 = item_ct1.get_local_range(1) * item_ct1.get_group(1) +
+                    item_ct1.get_local_id(1);
+    const int i11 = (item_ct1.get_group(0) * item_ct1.get_local_range(0) +
+                     item_ct1.get_local_id(0)) /
+                    ne12;
+    const int i12 = (item_ct1.get_group(0) * item_ct1.get_local_range(0) +
+                     item_ct1.get_local_id(0)) %
+                    ne12;
+
+    if (i00 >= ne00) {
+        return;
+    }
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const int r   = i01 + i11*(int) ne01 + i12*(int) (ne01 * ne02);
+
+    const size_t ntiles  = (size_t) ne00 / 512;
+    const size_t ql_sz   = (size_t) ne01 * ntiles * (QK_K);
+    const size_t qh_sz   = (size_t) ne01 * ntiles * (QK_K/2);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+    const size_t sc_sz   = (size_t) ne01 * ntiles * (QK_K/4);  // 32 combined halves per tile
+#else
+    const size_t sc_sz   = (size_t) ne01 * ntiles * (QK_K/8);  // 32 raw int8 scales per tile
+#endif
+    const uint8_t * ql_b = (const uint8_t *) src0;
+    const uint8_t * qh_b = ql_b + ql_sz;
+    const int8_t  * sc_b = (const int8_t *) (qh_b + qh_sz);
+    const sycl::half * d_b = (const sycl::half *) (sc_b + sc_sz);
+
+    float * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+    dst_row[i00]     = q6k_llmscaler_dequant_elem(ql_b, qh_b, sc_b, d_b, ntiles, r, i00);
+    dst_row[i00 + 1] = q6k_llmscaler_dequant_elem(ql_b, qh_b, sc_b, d_b, ntiles, r, i00 + 1);
+}
+
+static void get_rows_q6_K_llmscaler(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
+                                    const ggml_tensor *src1, ggml_tensor *dst,
+                                    const void *src0_dd, const int32_t *src1_dd,
+                                    float *dst_dd, queue_ptr stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const sycl::range<3> block_dims(1, 1, SYCL_GET_ROWS_BLOCK_SIZE);
+    const int block_num_x = (ne00 + 2*SYCL_GET_ROWS_BLOCK_SIZE - 1) / (2*SYCL_GET_ROWS_BLOCK_SIZE);
+    const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);
+
+    const size_t s1 = nb1 / ggml_element_size(dst);
+    const size_t s2 = nb2 / ggml_element_size(dst);
+    const size_t s3 = nb3 / ggml_element_size(dst);
+
+    const size_t s10 = nb10 / ggml_element_size(src1);
+    const size_t s11 = nb11 / ggml_element_size(src1);
+    const size_t s12 = nb12 / ggml_element_size(src1);
+
+    GGML_ASSERT(ne00 % 2 == 0);
+
+    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             k_get_rows_q6_K_llmscaler(
+                                 src0_dd, src1_dd, dst_dd, ne00, ne01, ne02, ne12, s1, s2,
+                                 s3, s10, s11, s12, item_ct1);
+                         });
+
+    GGML_UNUSED(dst);
+    GGML_UNUSED(ctx);
+}
+#endif // GGML_SYCL_Q6K_GEMV_LLMSCALER
+
 template <int qk, int qr, dequantize_kernel_f32_t dq>
 static void get_rows_sycl_f32(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
                               ggml_tensor *dst, const void *src0_dd,
@@ -353,6 +451,21 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             src1_i32, (float *)dst->data, ctx.stream());
             break;
         case GGML_TYPE_Q6_K:
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+            {
+                // views (tied lm_head) carry no extra of their own
+                const ggml_tensor_extra_gpu * src0_extra =
+                    (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
+                if (!src0_extra && dst->src[0]->view_src) {
+                    src0_extra = (const ggml_tensor_extra_gpu *) dst->src[0]->view_src->extra;
+                }
+                if (src0_extra && src0_extra->optimized_feature.reorder) {
+                    get_rows_q6_K_llmscaler(ctx, dst->src[0], dst->src[1], dst,
+                        (const void *) dst->src[0]->data, src1_i32, (float *)dst->data, ctx.stream());
+                    break;
+                }
+            }
+#endif
             get_rows_sycl<QK_K, 1, dequantize_q6_K>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
@@ -362,7 +475,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             break;
         default:
             // TODO: k-quants
-            GGML_LOG_ERROR("%s: unsupported type: %s\n", __func__, ggml_type_name(dst->src[0]->type));
+            GGML_LOG_ERROR("%s: unsupported type: %s\n", ggml_type_name(dst->src[0]->type));
             GGML_ABORT("fatal error");
     }
 }

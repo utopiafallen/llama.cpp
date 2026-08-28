@@ -2217,6 +2217,235 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_row(const void *vx, const f
     });
 }
 
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+// llm-scaler reference row GEMV for the 512-tile q6_K layout (pair-packed ql,
+// pre-shuffled qh): 4 lanes/WG, 1 row/lane, one 256B ql + 128B qh + scale load per
+// 512 tile, 8 rotating partial sums. base gate: fp32 activation, scale = int8 sc +
+// half d combined on GPU; _FP16 gate: pre-combined fp16 scale.
+static void dequantize_mul_mat_vec_q6_K_llmscaler(const void *vx, const float *y,
+                                                  float *dst, const int ncols,
+                                                  const int nrows,
+                                                  dpct::queue_ptr stream) {
+    using namespace sycl::ext::intel::esimd;
+    GGML_ASSERT(ncols % 512 == 0);
+    const int ntile = ncols / 512;
+    const int workgroups = (nrows + 3) / 4;
+    stream->submit([&](sycl::handler &h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * 4), sycl::range<1>(4)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                const int row = it.get_group(0) * 4 + it.get_local_id(0);
+                if (row >= nrows) {
+                    return;
+                }
+                const uint8_t * vx_b = (const uint8_t *) vx;
+                const size_t    nb   = (size_t) nrows * (2 * ntile);
+                const uint8_t * qh_b = vx_b + nb * (QK_K/2);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                const sycl::half * sc_b = (const sycl::half *) (qh_b + nb * (QK_K/4));
+#else
+                const int8_t *     sc_b = (const int8_t *) (qh_b + nb * (QK_K/4));
+                const sycl::half * d_b  = (const sycl::half *) (sc_b + nb * (QK_K/16));
+#endif
+                const uint8_t *    ql_i = vx_b + (size_t) row * (2 * ntile) * (QK_K/2);
+                const uint8_t *    qh_i = qh_b + (size_t) row * (2 * ntile) * (QK_K/4);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                const sycl::half * sc_i = sc_b + (size_t) row * (2 * ntile) * (QK_K/16);
+#else
+                const int8_t *     sc_i = sc_b + (size_t) row * (2 * ntile) * (QK_K/16);
+                const sycl::half * d_i  = d_b + (size_t) row * (2 * ntile);
+#endif
+
+                simd<float, 8> acc(0.0f);
+                int ai = 0;
+                for (int it = 0; it < ntile; ++it) {
+                    const int k = it * 512;
+                    simd<float, 512> act_f = block_load<float, 512>(y + k);
+
+                    simd<uint8_t, 256> ql_data = block_load<uint8_t, 256>(ql_i + k/2);
+                    simd<uint8_t, 128> qh_data = block_load<uint8_t, 128>(qh_i + k/4);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                    simd<sycl::half, 32> sc_h = block_load<sycl::half, 32>(sc_i + k/16);
+                    simd<float, 32>       sc_f = sc_h;
+#else
+                    simd<int8_t, 32> sc_i8 = block_load<int8_t, 32>(sc_i + k/16);
+                    simd<float, 32>  sc_f  = convert<float>(sc_i8);
+                    const float d0 = (float) d_i[2*it];
+                    const float d1 = (float) d_i[2*it + 1];
+#endif
+
+                    // ql pair unpack: tile byte B holds elements 2B (low) and 2B+1 (high)
+                    simd<float, 512> weight_f;
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        auto p = ql_data.template select<64, 1>(c * 64);
+                        simd<float, 64> lo = convert<float>(p & 0x0F);
+                        simd<float, 64> hi = convert<float>((p >> 4) & 0x0F);
+                        weight_f.template select<64, 2>(c * 128)     = lo;
+                        weight_f.template select<64, 2>(c * 128 + 1) = hi;
+                    }
+                    // high 2 bits, stride-1 contiguous (pre-shuffled)
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        simd<uint8_t, 128> ext = (qh_data >> (2 * p)) & 3;
+                        simd<float, 128>    ef  = convert<float>(ext);
+                        weight_f.template select<128, 1>(p * 128) += ef * 16.0f;
+                    }
+                    // symmetric dequant w = scale * (v6 - 32), per 16-element group
+                    #pragma unroll
+                    for (int sb = 0; sb < 32; ++sb) {
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                        const float s = sc_f[sb];
+#else
+                        const float s = sc_f[sb] * (sb < 16 ? d0 : d1);
+#endif
+                        weight_f.template select<16, 1>(sb * 16) =
+                            (weight_f.template select<16, 1>(sb * 16) - 32.0f) * s;
+                    }
+
+                    simd<float, 512> prod = weight_f * act_f;
+                    acc[ai] += reduce<float>(prod, std::plus<>());
+                    ai = (ai + 1) & 7;
+                }
+                dst[row] = reduce<float>(acc, std::plus<>());
+            });
+    });
+}
+#endif // GGML_SYCL_Q6K_GEMV_LLMSCALER
+
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+// M-tile reference GEMV: the weight tile is loaded and dequantized once, then
+// reused across M activation rows. y is [K, M] column-major (act[m*K + k]), dst
+// is [N, M] column-major with dst_stride elements per column.
+template <int M>
+static void dequantize_mul_mat_vec_q6_K_llmscaler_m(const void *vx, const float *y,
+                                                    float *dst, const int ncols,
+                                                    const int nrows, const int dst_stride,
+                                                    dpct::queue_ptr stream) {
+    using namespace sycl::ext::intel::esimd;
+    GGML_ASSERT(ncols % 512 == 0);
+    const int ntile = ncols / 512;
+    const int workgroups = (nrows + 3) / 4;
+    stream->submit([&](sycl::handler &h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * 4), sycl::range<1>(4)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                const int row = it.get_group(0) * 4 + it.get_local_id(0);
+                if (row >= nrows) {
+                    return;
+                }
+                const uint8_t * vx_b = (const uint8_t *) vx;
+                const size_t    nb   = (size_t) nrows * (2 * ntile);
+                const uint8_t * qh_b = vx_b + nb * (QK_K/2);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                const sycl::half * sc_b = (const sycl::half *) (qh_b + nb * (QK_K/4));
+#else
+                const int8_t *     sc_b = (const int8_t *) (qh_b + nb * (QK_K/4));
+                const sycl::half * d_b  = (const sycl::half *) (sc_b + nb * (QK_K/16));
+#endif
+                const uint8_t *    ql_i = vx_b + (size_t) row * (2 * ntile) * (QK_K/2);
+                const uint8_t *    qh_i = qh_b + (size_t) row * (2 * ntile) * (QK_K/4);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                const sycl::half * sc_i = sc_b + (size_t) row * (2 * ntile) * (QK_K/16);
+#else
+                const int8_t *     sc_i = sc_b + (size_t) row * (2 * ntile) * (QK_K/16);
+                const sycl::half * d_i  = d_b + (size_t) row * (2 * ntile);
+#endif
+
+                simd<float, 8> acc[M];
+                #pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    acc[m] = 0.0f;
+                }
+                int ai = 0;
+                for (int it = 0; it < ntile; ++it) {
+                    const int k = it * 512;
+
+                    simd<uint8_t, 256> ql_data = block_load<uint8_t, 256>(ql_i + k/2);
+                    simd<uint8_t, 128> qh_data = block_load<uint8_t, 128>(qh_i + k/4);
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                    simd<sycl::half, 32> sc_h = block_load<sycl::half, 32>(sc_i + k/16);
+                    simd<float, 32>       sc_f = sc_h;
+#else
+                    simd<int8_t, 32> sc_i8 = block_load<int8_t, 32>(sc_i + k/16);
+                    simd<float, 32>  sc_f  = convert<float>(sc_i8);
+                    const float d0 = (float) d_i[2*it];
+                    const float d1 = (float) d_i[2*it + 1];
+#endif
+
+                    simd<float, 512> weight_f;
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        auto p = ql_data.template select<64, 1>(c * 64);
+                        simd<float, 64> lo = convert<float>(p & 0x0F);
+                        simd<float, 64> hi = convert<float>((p >> 4) & 0x0F);
+                        weight_f.template select<64, 2>(c * 128)     = lo;
+                        weight_f.template select<64, 2>(c * 128 + 1) = hi;
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        simd<uint8_t, 128> ext = (qh_data >> (2 * p)) & 3;
+                        simd<float, 128>    ef  = convert<float>(ext);
+                        weight_f.template select<128, 1>(p * 128) += ef * 16.0f;
+                    }
+                    #pragma unroll
+                    for (int sb = 0; sb < 32; ++sb) {
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER_FP16
+                        const float s = sc_f[sb];
+#else
+                        const float s = sc_f[sb] * (sb < 16 ? d0 : d1);
+#endif
+                        weight_f.template select<16, 1>(sb * 16) =
+                            (weight_f.template select<16, 1>(sb * 16) - 32.0f) * s;
+                    }
+
+                    #pragma unroll
+                    for (int m = 0; m < M; ++m) {
+                        simd<float, 512> act_f = block_load<float, 512>(y + (size_t) m * ncols + k);
+                        simd<float, 512> prod  = weight_f * act_f;
+                        acc[m][ai] += reduce<float>(prod, std::plus<>());
+                    }
+                    ai = (ai + 1) & 7;
+                }
+                #pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    dst[(size_t) m * dst_stride + row] = reduce<float>(acc[m], std::plus<>());
+                }
+            });
+    });
+}
+
+// dispatch arbitrary M onto the fixed-M kernels in chunks of 8/4/2/1
+void dequantize_mul_mat_vec_q6_K_llmscaler_mt(const void *vx, const float *y,
+                                              float *dst, const int ncols,
+                                              const int nrows, const int dst_stride,
+                                              const int nvec, dpct::queue_ptr stream) {
+    if (nvec == 1) {
+        dequantize_mul_mat_vec_q6_K_llmscaler(vx, y, dst, ncols, nrows, stream);
+        return;
+    }
+    int m0 = 0;
+    while (m0 < nvec) {
+        const int     r  = nvec - m0;
+        const float * ym = y + (size_t) m0 * ncols;
+        float *       dm = dst + (size_t) m0 * dst_stride;
+        if (r >= 8) {
+            dequantize_mul_mat_vec_q6_K_llmscaler_m<8>(vx, ym, dm, ncols, nrows, dst_stride, stream);
+            m0 += 8;
+        } else if (r >= 4) {
+            dequantize_mul_mat_vec_q6_K_llmscaler_m<4>(vx, ym, dm, ncols, nrows, dst_stride, stream);
+            m0 += 4;
+        } else if (r >= 2) {
+            dequantize_mul_mat_vec_q6_K_llmscaler_m<2>(vx, ym, dm, ncols, nrows, dst_stride, stream);
+            m0 += 2;
+        } else {
+            dequantize_mul_mat_vec_q6_K_llmscaler_m<1>(vx, ym, dm, ncols, nrows, dst_stride, stream);
+            m0 += 1;
+        }
+    }
+}
+#endif // GGML_SYCL_Q6K_GEMV_LLMSCALER
+
 #else // GGML_SYCL_DMMV_HAS_ESIMD
 // fused variants exist only for ESIMD builds; the entry points decline otherwise
 void ggml_sycl_q6_k_dmmv_reorder_esimd_add(const void *, const float *, const float *, float *,
@@ -2410,22 +2639,36 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             }
             break;
         case GGML_TYPE_Q6_K:
+#ifdef GGML_SYCL_Q6K_GEMV_LLMSCALER
+            {
+                // views (tied lm_head) carry no extra of their own
+                const ggml_tensor_extra_gpu * src0_extra =
+                    (const ggml_tensor_extra_gpu *) dst->src[0]->extra;
+                if (!src0_extra && dst->src[0]->view_src) {
+                    src0_extra = (const ggml_tensor_extra_gpu *) dst->src[0]->view_src->extra;
+                }
+                if (src0_extra && src0_extra->optimized_feature.reorder) {
+                    dequantize_mul_mat_vec_q6_K_llmscaler(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+                } else {
+                    dequantize_mul_mat_vec_q6_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+                }
+            }
+#else
             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-#ifdef GGML_SYCL_DMMV_HAS_ESIMD
                 if (g_ggml_sycl_q6k_gemv_row) {
                     dequantize_mul_mat_vec_q6_K_sycl_reorder_row(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
                 } else if (g_ggml_sycl_enable_esimd) {
                     dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
                 }
                 else
-#endif
                 {
                     dequantize_mul_mat_vec_q6_K_sycl_reorder(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
                 }
-            } else {
+            }             else {
                 dequantize_mul_mat_vec_q6_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             }
+#endif
             break;
         case GGML_TYPE_F16:
             convert_mul_mat_vec_f16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
