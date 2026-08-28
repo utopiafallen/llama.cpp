@@ -102,6 +102,10 @@ int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_q6k_gemv_row = 0;
 int g_ggml_sycl_q80_gemv_esimd = 1;
+int g_ggml_sycl_interleaved = 0;
+int g_ggml_sycl_interleaved_q6k = -1;
+int g_ggml_sycl_interleaved_q5k = -1;
+int g_ggml_sycl_interleaved_q80 = -1;
 int g_ggml_sycl_fuse_mm_add = 1;
 int g_ggml_sycl_fuse_mm_glu = 1;
 int g_ggml_sycl_fuse_gdn_dt = 1;
@@ -326,6 +330,14 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_q6k_gemv_row = ggml_sycl_get_env("GGML_SYCL_Q6K_GEMV_ROW", 0);
         g_ggml_sycl_q80_gemv_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_GEMV_ESIMD", 1);
+        g_ggml_sycl_interleaved = ggml_sycl_get_env("GGML_SYCL_INTERLEAVED", 0);
+        g_ggml_sycl_interleaved_q6k = ggml_sycl_get_env("GGML_SYCL_INTERLEAVED_Q6K", -1);
+        g_ggml_sycl_interleaved_q5k = ggml_sycl_get_env("GGML_SYCL_INTERLEAVED_Q5K", -1);
+        g_ggml_sycl_interleaved_q80 = ggml_sycl_get_env("GGML_SYCL_INTERLEAVED_Q80", -1);
+        // only the eSIMD DMMV/GLU readers understand the interleaved layout
+        if (g_ggml_sycl_interleaved && !g_ggml_sycl_enable_esimd) {
+            g_ggml_sycl_interleaved = 0;
+        }
         g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
         g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
         g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
@@ -435,6 +447,10 @@ static void ggml_check_sycl() try {
 #if defined(__INTEL_LLVM_COMPILER)
         GGML_LOG_INFO("  GGML_SYCL_Q6K_GEMV_ROW: %d\n", g_ggml_sycl_q6k_gemv_row);
         GGML_LOG_INFO("  GGML_SYCL_Q80_GEMV_ESIMD: %d\n", g_ggml_sycl_q80_gemv_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_INTERLEAVED: %d\n", g_ggml_sycl_interleaved);
+        GGML_LOG_INFO("  GGML_SYCL_INTERLEAVED_Q6K: %d\n", g_ggml_sycl_interleaved_q6k);
+        GGML_LOG_INFO("  GGML_SYCL_INTERLEAVED_Q5K: %d\n", g_ggml_sycl_interleaved_q5k);
+        GGML_LOG_INFO("  GGML_SYCL_INTERLEAVED_Q80: %d\n", g_ggml_sycl_interleaved_q80);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_ADD: %d\n", g_ggml_sycl_fuse_mm_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_GLU: %d\n", g_ggml_sycl_fuse_mm_glu);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_GDN_DT: %d\n", g_ggml_sycl_fuse_gdn_dt);
@@ -3999,6 +4015,33 @@ static bool reorder_qw_q8_0(uint8_t * data_device, const int ncols, const int nr
     auto qs_ptr = data_device + offset_blks * QK8_0;
     auto d_ptr = (sycl::half*)(qs_ptr + ncols * nrows) + offset_blks;
 
+    if (ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q80)) {
+        // interleaved layout: each 256 element chunk packed as [qs 256][d 8x half],
+        // one contiguous stream for DMMV
+        constexpr int    NSUB = QK_K / QK8_0;
+        constexpr size_t tile = QK_K + NSUB * sizeof(sycl::half);
+        auto reorder_event = stream->parallel_for(
+            size / sizeof(block_q8_0),
+                [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const block_q8_0* x = (const block_q8_0*)tmp_buf;
+                const int ib = i;
+                uint8_t * t = data_device + (ib / NSUB) * tile + (ib % NSUB) * QK8_0;
+
+                for (int j = 0; j < QK8_0; j++)
+                {
+                    t[j] = x[ib].qs[j];
+                }
+                const uint8_t * d = (const uint8_t *) &x[ib].d;
+                uint8_t * dt = data_device + (ib / NSUB) * tile + QK_K + (ib % NSUB) * sizeof(sycl::half);
+                dt[0] = d[0];
+                dt[1] = d[1];
+            });
+        if (!g_ggml_sycl_use_async_mem_op) {
+            reorder_event.wait_and_throw();
+        }
+        return true;
+    }
+
     auto reorder_event = stream->parallel_for(
         size / sizeof(block_q8_0),
             [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -4313,6 +4356,36 @@ static bool reorder_qw_q5_k(uint8_t * data_device, size_t size, size_t offset, d
         copy_event.wait();
     }
 
+    if (ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q5k)) {
+        // interleaved layout: each 256 block packed as [qs][qh][scales][dm],
+        // one contiguous stream for DMMV
+        constexpr size_t tile = sizeof(block_q5_K);
+        auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+            const block_q5_K * x = (const block_q5_K *) tmp_buf;
+            const int          ib = i;
+            uint8_t *          t  = data_device + (size_t) ib * tile;
+
+            for (int j = 0; j < QK_K / 2; ++j) {
+                t[j] = x[ib].qs[j];
+            }
+            for (int j = 0; j < QK_K / 8; ++j) {
+                t[QK_K / 2 + j] = x[ib].qh[j];
+            }
+            for (int j = 0; j < K_SCALE_SIZE; ++j) {
+                t[QK_K / 2 + QK_K / 8 + j] = x[ib].scales[j];
+            }
+            const uint8_t * dm = (const uint8_t *) &x[ib].dm;
+            t[tile - 4] = dm[0];
+            t[tile - 3] = dm[1];
+            t[tile - 2] = dm[2];
+            t[tile - 1] = dm[3];
+        });
+        if (!g_ggml_sycl_use_async_mem_op) {
+            reorder_event.wait_and_throw();
+        }
+        return true;
+    }
+
     auto * qs_ptr     = data_device;
     auto * qh_ptr     = qs_ptr + (QK_K / 2) * nblocks;
     auto * scales_ptr = qh_ptr + (QK_K / 8) * nblocks;
@@ -4359,6 +4432,34 @@ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
     SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
     if (!g_ggml_sycl_use_async_mem_op) {
         copy_event.wait();
+    }
+
+    if (ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q6k)) {
+        // interleaved layout: each 256 block packed as [ql][qh][scales][d],
+        // one contiguous stream for DMMV
+        constexpr size_t tile = sizeof(block_q6_K);
+        auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+            const block_q6_K * x = (const block_q6_K *) tmp_buf;
+            const int          ib = i;
+            uint8_t *          t  = data_device + (size_t) ib * tile;
+
+            for (int j = 0; j < QK_K / 2; ++j) {
+                t[j] = x[ib].ql[j];
+            }
+            for (int j = 0; j < QK_K / 4; ++j) {
+                t[QK_K / 2 + j] = x[ib].qh[j];
+            }
+            for (int j = 0; j < QK_K / 16; ++j) {
+                t[QK_K / 2 + QK_K / 4 + j] = (uint8_t) x[ib].scales[j];
+            }
+            const uint8_t * d = (const uint8_t *) &x[ib].d;
+            t[tile - 2] = d[0];
+            t[tile - 1] = d[1];
+        });
+        if (!g_ggml_sycl_use_async_mem_op) {
+            reorder_event.wait_and_throw();
+        }
+        return true;
     }
 
     auto *       ql_ptr     = data_device;
@@ -4643,7 +4744,9 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
         // call would leave the rest stale
         if (!g_ggml_sycl_fuse_mm_glu || !g_ggml_sycl_enable_esimd ||
             (wu->type == GGML_TYPE_Q6_K && g_ggml_sycl_q6k_gemv_row) ||
-            act->ne[1] != 1 || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+            act->ne[1] != 1 || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+            // the fused kernel reads both weights with one layout
+            wu->type != wg->type) {
             return false;
         }
 

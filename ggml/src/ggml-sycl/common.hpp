@@ -68,6 +68,15 @@ extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_q6k_gemv_row;
 extern int g_ggml_sycl_q80_gemv_esimd;
+extern int g_ggml_sycl_interleaved;
+extern int g_ggml_sycl_interleaved_q6k;
+extern int g_ggml_sycl_interleaved_q5k;
+extern int g_ggml_sycl_interleaved_q80;
+
+// effective interleaved gate for one quant type: the per-type override wins when set
+static inline int ggml_sycl_interleaved_eff(int override_val) {
+    return override_val >= 0 ? override_val : g_ggml_sycl_interleaved;
+}
 extern int g_ggml_sycl_fuse_mm_add;
 extern int g_ggml_sycl_fuse_mm_glu;
 extern int g_ggml_sycl_fuse_gdn_dt;
