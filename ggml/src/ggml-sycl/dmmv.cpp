@@ -1878,13 +1878,14 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
         const void * vx, const float * y, const float * res, float * dst,
         const int ncols, const int nrows,
         sycl::local_accessor<float, 1> lmem,
-        const sycl::nd_item<1> & it) {
+        const sycl::nd_item<1> & it,
+        int interleaved) {
     using namespace sycl::ext::intel::esimd;
     using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
 
     const int    num_blocks_per_row = ncols / QK_K;
     const size_t nb = (size_t) nrows * num_blocks_per_row;
-    const auto   ps = traits::make_ptrs(vx, nb);
+    const auto   ps = traits::make_ptrs(vx, nb, interleaved);
 
     const int  tid      = it.get_local_id(0);
     const int  row_pair = it.get_group(0);
@@ -1935,13 +1936,14 @@ static void dequantize_mul_mat_vec_q2_K_sycl_reorder_esimd(const void *vx, const
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
+    const int interleaved = g_ggml_sycl_interleaved;
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q2_K, /*ADD_RES=*/false>(
-                    vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    vx, y, nullptr, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -1952,13 +1954,14 @@ static void dequantize_mul_mat_vec_q3_K_sycl_reorder_esimd(const void *vx, const
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
+    const int interleaved = g_ggml_sycl_interleaved;
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q3_K, /*ADD_RES=*/false>(
-                    vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    vx, y, nullptr, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -1969,13 +1972,14 @@ static void dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(const void *vx, const
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
+    const int interleaved = g_ggml_sycl_interleaved;
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q4_K, /*ADD_RES=*/false>(
-                    vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    vx, y, nullptr, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -1986,13 +1990,14 @@ static void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(const void *vx, const
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
+    const int interleaved = ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q5k);
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q5_K, /*ADD_RES=*/false>(
-                    vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    vx, y, nullptr, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -2003,13 +2008,14 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
+    const int interleaved = ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q6k);
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q6_K, /*ADD_RES=*/false>(
-                    vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    vx, y, nullptr, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -2020,13 +2026,14 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_add(const void * vx, 
                                                                dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
+    const int interleaved = ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q6k);
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q6_K, /*ADD_RES=*/true>(
-                    vx, y, res, dst, ncols, nrows, lmem, it);
+                    vx, y, res, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -2037,13 +2044,14 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
+    const int interleaved = ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q80);
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q8_0, /*ADD_RES=*/false>(
-                    vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    vx, y, nullptr, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -2056,14 +2064,15 @@ ESIMD_INLINE void dequantize_mul_mat_vec_glu_reorder_esimd(
         const void * vx_gate, const void * vx_up, const float * y, float * dst,
         const int ncols, const int nrows,
         sycl::local_accessor<float, 1> lmem,
-        const sycl::nd_item<1> & it) {
+        const sycl::nd_item<1> & it,
+        int interleaved) {
     using namespace sycl::ext::intel::esimd;
     using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
 
     const int    num_blocks_per_row = ncols / QK_K;
     const size_t nb = (size_t) nrows * num_blocks_per_row;
-    const auto   ps_gate = traits::make_ptrs(vx_gate, nb);
-    const auto   ps_up   = traits::make_ptrs(vx_up, nb);
+    const auto   ps_gate = traits::make_ptrs(vx_gate, nb, interleaved);
+    const auto   ps_up   = traits::make_ptrs(vx_up, nb, interleaved);
 
     const int  tid      = it.get_local_id(0);
     const int  row_pair = it.get_group(0);
@@ -2109,7 +2118,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_glu_reorder_esimd(
 template <ggml_type T>
 static void dequantize_mul_mat_vec_reorder_esimd_glu(const void * vx_up, const void * vx_gate, const float * y,
                                                      float * dst,
-                                                     const int ncols, const int nrows,
+                                                     const int ncols, const int nrows, int interleaved,
                                                      dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int workgroups = (nrows + 1) / 2;
@@ -2118,7 +2127,7 @@ static void dequantize_mul_mat_vec_reorder_esimd_glu(const void * vx_up, const v
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_glu_reorder_esimd<T>(vx_gate, vx_up, y, dst, ncols, nrows, lmem, it);
+                dequantize_mul_mat_vec_glu_reorder_esimd<T>(vx_gate, vx_up, y, dst, ncols, nrows, lmem, it, interleaved);
             });
     });
 }
@@ -2137,10 +2146,14 @@ bool ggml_sycl_dmmv_reorder_esimd_glu(const void * vx_up, const void * vx_gate, 
     }
     switch (wtype) {
         case GGML_TYPE_Q6_K:
-            dequantize_mul_mat_vec_reorder_esimd_glu<GGML_TYPE_Q6_K>(vx_up, vx_gate, y, dst, ncols, nrows, stream);
+            dequantize_mul_mat_vec_reorder_esimd_glu<GGML_TYPE_Q6_K>(vx_up, vx_gate, y, dst, ncols, nrows,
+                                                                     ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q6k),
+                                                                     stream);
             break;
         case GGML_TYPE_Q5_K:
-            dequantize_mul_mat_vec_reorder_esimd_glu<GGML_TYPE_Q5_K>(vx_up, vx_gate, y, dst, ncols, nrows, stream);
+            dequantize_mul_mat_vec_reorder_esimd_glu<GGML_TYPE_Q5_K>(vx_up, vx_gate, y, dst, ncols, nrows,
+                                                                     ggml_sycl_interleaved_eff(g_ggml_sycl_interleaved_q5k),
+                                                                     stream);
             break;
         default:
             return false;

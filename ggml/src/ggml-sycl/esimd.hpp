@@ -78,7 +78,7 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
         const sycl::half * dm;
     };
 
-    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb, int /* interleaved */) {
         const uint8_t * qs     = (const uint8_t *) vx;
         const uint8_t * scales = qs + nb * (QK_K / 4);
         const sycl::half * dm  = (const sycl::half *) (scales + nb * (QK_K / 16));
@@ -172,7 +172,7 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
         const sycl::half * d;
     };
 
-    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb, int /* interleaved */) {
         const uint8_t * qs     = (const uint8_t *) vx;
         const uint8_t * hmask  = qs + nb * (QK_K / 4);
         const uint8_t * scales = hmask + nb * (QK_K / 8);
@@ -289,7 +289,7 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
         const sycl::half * dm;
     };
 
-    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb, int /* interleaved */) {
         const uint8_t * qs     = (const uint8_t *) vx;
         const uint8_t * scales = qs + nb * (QK_K / 2);
         const sycl::half * dm  = (const sycl::half *) (scales + nb * K_SCALE_SIZE);
@@ -372,19 +372,34 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
 // the same 32 bytes for every chunk (matches dequantize_row_q5_K).
 // ---------------------------------------------------------------------------
 template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
+    // per-stream byte strides: SoA uses the stream widths, the interleaved
+    // layout uses the 176 byte tile for all streams
     struct ptrs {
         const uint8_t *    qs;
         const uint8_t *    qh;
         const uint8_t *    scales;
         const sycl::half * dm;
+        size_t             qs_stride;
+        size_t             qh_stride;
+        size_t             scales_stride;
+        size_t             dm_stride;
     };
 
-    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
-        const uint8_t * qs     = (const uint8_t *) vx;
-        const uint8_t * qh     = qs + nb * (QK_K / 2);
-        const uint8_t * scales = qh + nb * (QK_K / 8);
-        const sycl::half * dm  = (const sycl::half *) (scales + nb * K_SCALE_SIZE);
-        return { qs, qh, scales, dm };
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb, int interleaved) {
+        const uint8_t * base = (const uint8_t *) vx;
+        if (interleaved) {
+            const size_t tile = QK_K / 2 + QK_K / 8 + K_SCALE_SIZE + 2 * sizeof(sycl::half);
+            return { base,
+                     base + QK_K / 2,
+                     base + QK_K / 2 + QK_K / 8,
+                     (const sycl::half *) (base + QK_K / 2 + QK_K / 8 + K_SCALE_SIZE),
+                     tile, tile, tile, tile / (2 * sizeof(sycl::half)) };
+        }
+        const uint8_t *    qs     = base;
+        const uint8_t *    qh     = qs + nb * (QK_K / 2);
+        const uint8_t *    scales = qh + nb * (QK_K / 8);
+        const sycl::half * dm     = (const sycl::half *) (scales + nb * K_SCALE_SIZE);
+        return { qs, qh, scales, dm, QK_K / 2, QK_K / 8, K_SCALE_SIZE, 2 };
     }
 
     // extract bit `bit` (0..7) of each lane and move it to bit position 4,
@@ -412,23 +427,23 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 128> qs_a     = block_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
+        simd<uint8_t, 128> qs_a     = block_load<uint8_t, 128>(pa.qs + bia * pa.qs_stride);
         simd<uint8_t, 128> qs_b     = 0;
-        simd<uint8_t, 32>  qh_a     = block_load<uint8_t, 32>(pa.qh + bia * (QK_K / 8));
+        simd<uint8_t, 32>  qh_a     = block_load<uint8_t, 32>(pa.qh + bia * pa.qh_stride);
         simd<uint8_t, 32>  qh_b     = 0;
-        simd<uint8_t, 12>  scales_a = block_load<uint8_t, 12>(pa.scales + bia * K_SCALE_SIZE);
+        simd<uint8_t, 12>  scales_a = block_load<uint8_t, 12>(pa.scales + bia * pa.scales_stride);
         simd<uint8_t, 12>  scales_b = 0;
 
-        const float dall_a = (float) pa.dm[bia * 2 + 0];
-        const float dmin_a = (float) pa.dm[bia * 2 + 1];
+        const float dall_a = (float) pa.dm[bia * pa.dm_stride + 0];
+        const float dmin_a = (float) pa.dm[bia * pa.dm_stride + 1];
         float dall_b = 0.0f;
         float dmin_b = 0.0f;
         if (has_b) {
-            qs_b     = block_load<uint8_t, 128>(pb.qs + bib * (QK_K / 2));
-            qh_b     = block_load<uint8_t, 32>(pb.qh + bib * (QK_K / 8));
-            scales_b = block_load<uint8_t, 12>(pb.scales + bib * K_SCALE_SIZE);
-            dall_b = (float) pb.dm[bib * 2 + 0];
-            dmin_b = (float) pb.dm[bib * 2 + 1];
+            qs_b     = block_load<uint8_t, 128>(pb.qs + bib * pb.qs_stride);
+            qh_b     = block_load<uint8_t, 32>(pb.qh + bib * pb.qh_stride);
+            scales_b = block_load<uint8_t, 12>(pb.scales + bib * pb.scales_stride);
+            dall_b = (float) pb.dm[bib * pb.dm_stride + 0];
+            dmin_b = (float) pb.dm[bib * pb.dm_stride + 1];
         }
 
         simd<float, 8> scale_f_a, min_f_a, scale_f_b, min_f_b;
@@ -489,19 +504,34 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
 //   [ql: nb*(QK_K/2)] [qh: nb*(QK_K/4)] [scales(int8): nb*(QK_K/16)] [d: nb*half]
 // ---------------------------------------------------------------------------
 template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
+    // per-stream byte strides: SoA uses the stream widths, the interleaved
+    // layout uses the 210 byte tile for all streams
     struct ptrs {
         const uint8_t *    ql;
         const uint8_t *    qh;
         const int8_t *     scales;
         const sycl::half * d;
+        size_t             ql_stride;
+        size_t             qh_stride;
+        size_t             scales_stride;
+        size_t             d_stride;
     };
 
-    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
-        const uint8_t *    ql     = (const uint8_t *) vx;
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb, int interleaved) {
+        const uint8_t * base = (const uint8_t *) vx;
+        if (interleaved) {
+            const size_t tile = QK_K / 2 + QK_K / 4 + QK_K / 16 + sizeof(sycl::half);
+            return { base,
+                     base + QK_K / 2,
+                     (const int8_t *) (base + QK_K / 2 + QK_K / 4),
+                     (const sycl::half *) (base + QK_K / 2 + QK_K / 4 + QK_K / 16),
+                     tile, tile, tile, tile / sizeof(sycl::half) };
+        }
+        const uint8_t *    ql     = base;
         const uint8_t *    qh     = ql + nb * (QK_K / 2);
         const int8_t *     scales = (const int8_t *) (qh + nb * (QK_K / 4));
         const sycl::half * d      = (const sycl::half *) (scales + nb * (QK_K / 16));
-        return { ql, qh, scales, d };
+        return { ql, qh, scales, d, QK_K / 2, QK_K / 4, QK_K / 16, 1 };
     }
 
     static ESIMD_INLINE void mac_pair(
@@ -512,20 +542,20 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 128> ql_a     = block_load<uint8_t, 128>(pa.ql + bia * (QK_K / 2));
+        simd<uint8_t, 128> ql_a     = block_load<uint8_t, 128>(pa.ql + bia * pa.ql_stride);
         simd<uint8_t, 128> ql_b     = 0;
-        simd<uint8_t, 64>  qh_a     = block_load<uint8_t, 64>(pa.qh + bia * (QK_K / 4));
+        simd<uint8_t, 64>  qh_a     = block_load<uint8_t, 64>(pa.qh + bia * pa.qh_stride);
         simd<uint8_t, 64>  qh_b     = 0;
-        simd<int8_t, 16>   scales_a = block_load<int8_t, 16>(pa.scales + bia * (QK_K / 16));
+        simd<int8_t, 16>   scales_a = block_load<int8_t, 16>(pa.scales + bia * pa.scales_stride);
         simd<int8_t, 16>   scales_b = 0;
 
-        const float d_a = (float) pa.d[bia];
+        const float d_a = (float) pa.d[bia * pa.d_stride];
         float d_b = 0.0f;
         if (has_b) {
-            ql_b     = block_load<uint8_t, 128>(pb.ql + bib * (QK_K / 2));
-            qh_b     = block_load<uint8_t, 64>(pb.qh + bib * (QK_K / 4));
-            scales_b = block_load<int8_t, 16>(pb.scales + bib * (QK_K / 16));
-            d_b = (float) pb.d[bib];
+            ql_b     = block_load<uint8_t, 128>(pb.ql + bib * pb.ql_stride);
+            qh_b     = block_load<uint8_t, 64>(pb.qh + bib * pb.qh_stride);
+            scales_b = block_load<int8_t, 16>(pb.scales + bib * pb.scales_stride);
+            d_b = (float) pb.d[bib * pb.d_stride];
         }
 
         simd<float, 16> sc_a = convert<float>(scales_a);
@@ -590,15 +620,24 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
 // one mac_pair call handles a 256-element chunk == QK_K/QK8_0 Q8_0 blocks
 // ---------------------------------------------------------------------------
 template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
+    // per-stream byte strides: SoA uses the stream widths, the interleaved
+    // layout uses the 272 byte tile for all streams
     struct ptrs {
         const int8_t *     qs;
         const sycl::half * d;
+        size_t             qs_stride;
+        size_t             d_stride;
     };
 
-    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
-        const int8_t *     qs = (const int8_t *) vx;
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb, int interleaved) {
+        const int8_t * base = (const int8_t *) vx;
+        if (interleaved) {
+            const size_t tile = QK_K + (QK_K / QK8_0) * sizeof(sycl::half);
+            return { base, (const sycl::half *) (base + QK_K), tile, tile / sizeof(sycl::half) };
+        }
+        const int8_t *     qs = base;
         const sycl::half * d  = (const sycl::half *) (qs + nb * QK_K);
-        return { qs, d };
+        return { qs, d, QK_K, QK_K / QK8_0 };
     }
 
     static ESIMD_INLINE void mac_pair(
@@ -611,20 +650,20 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
 
         constexpr int NSUB = QK_K / QK8_0; // 8 sub-blocks of 32
 
-        simd<int8_t, 128> qs_a_lo = block_load<int8_t, 128>(pa.qs + bia * QK_K);
-        simd<int8_t, 128> qs_a_hi = block_load<int8_t, 128>(pa.qs + bia * QK_K + 128);
+        simd<int8_t, 128> qs_a_lo = block_load<int8_t, 128>(pa.qs + bia * pa.qs_stride);
+        simd<int8_t, 128> qs_a_hi = block_load<int8_t, 128>(pa.qs + bia * pa.qs_stride + 128);
         simd<int8_t, 128> qs_b_lo = 0;
         simd<int8_t, 128> qs_b_hi = 0;
         if (has_b) {
-            qs_b_lo = block_load<int8_t, 128>(pb.qs + bib * QK_K);
-            qs_b_hi = block_load<int8_t, 128>(pb.qs + bib * QK_K + 128);
+            qs_b_lo = block_load<int8_t, 128>(pb.qs + bib * pb.qs_stride);
+            qs_b_hi = block_load<int8_t, 128>(pb.qs + bib * pb.qs_stride + 128);
         }
 
         // sub-blocks 0..NSUB/2-1 live in the low 128 int8, the rest in the high 128
 #pragma unroll
         for (int s = 0; s < NSUB / 2; ++s) {
-            const float d_a = (float) pa.d[bia * NSUB + s];
-            const float d_b = has_b ? (float) pb.d[bib * NSUB + s] : 0.0f;
+            const float d_a = (float) pa.d[bia * pa.d_stride + s];
+            const float d_b = has_b ? (float) pb.d[bib * pb.d_stride + s] : 0.0f;
 
             simd<float, 32> y_s = y_vec.select<32, 1>(32 * s);
             simd<int8_t, 32> qa = qs_a_lo.select<32, 1>(32 * s);
@@ -637,8 +676,8 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
 #pragma unroll
         for (int s = NSUB / 2; s < NSUB; ++s) {
             const int     sl  = s - NSUB / 2;
-            const float   d_a = (float) pa.d[bia * NSUB + s];
-            const float   d_b = has_b ? (float) pb.d[bib * NSUB + s] : 0.0f;
+            const float   d_a = (float) pa.d[bia * pa.d_stride + s];
+            const float   d_b = has_b ? (float) pb.d[bib * pb.d_stride + s] : 0.0f;
 
             simd<float, 32> y_s = y_vec.select<32, 1>(32 * s);
             simd<int8_t, 32> qa = qs_a_hi.select<32, 1>(32 * sl);
