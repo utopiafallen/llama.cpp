@@ -89,6 +89,9 @@ enum rpc_cmd {
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
+// Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
+const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
@@ -410,8 +413,6 @@ public:
         cvar.notify_all();
     }
 
-    }
-
 private:
     bool interrupted = false;
     std::queue<T> queue;
@@ -573,8 +574,9 @@ std::vector<uint8_t> rpc_dispatcher::batch_precheck(
     }
 
     std::vector<uint8_t> rsp_data(sizeof(rpc_msg_batch_precheck_rsp) + tensor_count);
-    std::shared_ptr<const void> req_ptr(req_data.data(), req_data);
-    send(RPC_CMD_BATCH_PRECHECK, req_ptr, req_data.size(), rsp_data.data(), rsp_data.size());
+    const size_t req_size_bytes = req_data.size();
+    std::shared_ptr<const void> req_ptr = std::make_shared<std::vector<uint8_t>>(std::move(req_data));
+    send(RPC_CMD_BATCH_PRECHECK, req_ptr, req_size_bytes, rsp_data.data(), rsp_data.size());
 
     rpc_msg_batch_precheck_rsp * rsp = reinterpret_cast<rpc_msg_batch_precheck_rsp *>(rsp_data.data());
     std::vector<uint8_t> result(rsp->tensor_count);
