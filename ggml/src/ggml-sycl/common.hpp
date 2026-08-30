@@ -69,6 +69,7 @@ extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_q6k_gemv_row;
 extern int g_ggml_sycl_q80_gemv_esimd;
+extern int g_ggml_sycl_q6k_mmvq_hoist;
 extern int g_ggml_sycl_fuse_mm_add;
 extern int g_ggml_sycl_fuse_mm_glu;
 extern int g_ggml_sycl_fuse_gdn_dt;
