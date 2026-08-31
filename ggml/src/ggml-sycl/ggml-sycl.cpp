@@ -107,6 +107,7 @@ int g_ggml_sycl_q80_gemv_esimd = 1;
 int g_ggml_sycl_q6k_mmvq_hoist = 1;
 int g_ggml_sycl_q6k_mmvq_esimd = 1;
 int g_ggml_sycl_q5k_mmvq_esimd = 1;
+int g_ggml_sycl_q80_mmvq_esimd = 1;
 int g_ggml_sycl_fuse_mm_add = 1;
 int g_ggml_sycl_fuse_mm_glu = 1;
 int g_ggml_sycl_fuse_gdn_dt = 1;
@@ -355,6 +356,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_q6k_mmvq_hoist = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_HOIST", 1);
         g_ggml_sycl_q6k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_ESIMD", 1);
         g_ggml_sycl_q5k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q5K_MMVQ_ESIMD", 1);
+        g_ggml_sycl_q80_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_MMVQ_ESIMD", 1);
         g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
         g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
         g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
@@ -476,6 +478,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_HOIST: %d\n", g_ggml_sycl_q6k_mmvq_hoist);
         GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q6k_mmvq_esimd);
         GGML_LOG_INFO("  GGML_SYCL_Q5K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q5k_mmvq_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_Q80_MMVQ_ESIMD: %d\n", g_ggml_sycl_q80_mmvq_esimd);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_ADD: %d\n", g_ggml_sycl_fuse_mm_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_GLU: %d\n", g_ggml_sycl_fuse_mm_glu);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_GDN_DT: %d\n", g_ggml_sycl_fuse_gdn_dt);

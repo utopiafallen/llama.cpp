@@ -72,6 +72,7 @@ extern int g_ggml_sycl_q80_gemv_esimd;
 extern int g_ggml_sycl_q6k_mmvq_hoist;
 extern int g_ggml_sycl_q6k_mmvq_esimd;
 extern int g_ggml_sycl_q5k_mmvq_esimd;
+extern int g_ggml_sycl_q80_mmvq_esimd;
 extern int g_ggml_sycl_fuse_mm_add;
 extern int g_ggml_sycl_fuse_mm_glu;
 extern int g_ggml_sycl_fuse_gdn_dt;
