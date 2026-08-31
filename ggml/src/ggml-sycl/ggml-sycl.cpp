@@ -105,6 +105,7 @@ int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_q6k_gemv_row = 0;
 int g_ggml_sycl_q80_gemv_esimd = 1;
 int g_ggml_sycl_q6k_mmvq_hoist = 1;
+int g_ggml_sycl_q6k_mmvq_esimd = 1;
 int g_ggml_sycl_fuse_mm_add = 1;
 int g_ggml_sycl_fuse_mm_glu = 1;
 int g_ggml_sycl_fuse_gdn_dt = 1;
@@ -351,6 +352,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_q80_gemv_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_GEMV_ESIMD", 1);
         // hoist the shared Q6_K weight dequant out of the small-batch (ncols 2-8) per-token loop
         g_ggml_sycl_q6k_mmvq_hoist = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_HOIST", 1);
+        g_ggml_sycl_q6k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_ESIMD", 1);
         g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
         g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
         g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
@@ -470,6 +472,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_Q6K_GEMV_ROW: %d\n", g_ggml_sycl_q6k_gemv_row);
         GGML_LOG_INFO("  GGML_SYCL_Q80_GEMV_ESIMD: %d\n", g_ggml_sycl_q80_gemv_esimd);
         GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_HOIST: %d\n", g_ggml_sycl_q6k_mmvq_hoist);
+        GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q6k_mmvq_esimd);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_ADD: %d\n", g_ggml_sycl_fuse_mm_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_GLU: %d\n", g_ggml_sycl_fuse_mm_glu);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_GDN_DT: %d\n", g_ggml_sycl_fuse_gdn_dt);

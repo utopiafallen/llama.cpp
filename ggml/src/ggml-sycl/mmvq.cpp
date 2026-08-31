@@ -5,6 +5,7 @@
 #include "element_wise.hpp"
 #include "quants.hpp"
 #include "vecdotq.hpp"
+#include "dmmv.hpp"
 
 // Minimum weight-row count at which the Q4_K multi-column MMVQ kernel handles two output rows per
 // subgroup (rows_per_sg == 2) instead of one, when ncols_dst == 2.
@@ -2420,6 +2421,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
     const size_t q8_1_ts = sizeof(block_q8_1);
     const size_t q8_1_bs = QK8_1;
+
+    // small-batch Q6_K (MTP verify): eSIMD wide-SIMD M-kernel on the f32 activation, gated
+    if (g_ggml_sycl_q6k_mmvq_esimd && src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_F32 &&
+        src1_ncols > 1 && src1_ncols <= 8 &&
+        (ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+        ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+        dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                  (int) src1_ncols, (int) dst->ne[0], stream);
+        return;
+    }
+
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
 
