@@ -482,6 +482,45 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
             acc_b += y_hi * deq_b_hi;
         }
     }
+
+    // dequant one row's 256-elem block to 8 32-wide float vectors (shared across tokens);
+    // the small-batch M-kernel multiplies these against all M activation rows
+    static ESIMD_INLINE void dequant_block(
+            const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 32> deq[8]) {
+        using namespace sycl::ext::intel::esimd;
+
+        simd<uint8_t, 128> qs_a     = block_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
+        simd<uint8_t, 32>  qh_a     = block_load<uint8_t, 32>(pa.qh + bia * (QK_K / 8));
+        simd<uint8_t, 12>  scales_a = block_load<uint8_t, 12>(pa.scales + bia * K_SCALE_SIZE);
+        const float dall_a = (float) pa.dm[bia * 2 + 0];
+        const float dmin_a = (float) pa.dm[bia * 2 + 1];
+
+        simd<float, 8> scale_f_a, min_f_a;
+        unpack_scale_min_k4(scales_a, dall_a, dmin_a, scale_f_a, min_f_a);
+
+        simd<uint8_t, 128> qs_lo_a = qs_a & simd<uint8_t, 128>(0x0F);
+        simd<uint8_t, 128> qs_hi_a = qs_a >> simd<uint8_t, 128>(4);
+
+        #pragma unroll
+        for (int sb = 0; sb < 8; sb += 2) {
+            const int q_offset = sb * 16;
+            const float scale_lo = scale_f_a[sb];
+            const float min_lo   = min_f_a[sb];
+            const float scale_hi = scale_f_a[sb + 1];
+            const float min_hi   = min_f_a[sb + 1];
+
+            simd<uint8_t, 32> qa_lo_u8 = qs_lo_a.select<32, 1>(q_offset);
+            simd<uint8_t, 32> qa_hi_u8 = qs_hi_a.select<32, 1>(q_offset);
+            simd<uint16_t, 32> qa_lo = convert<uint16_t>(qa_lo_u8);
+            simd<uint16_t, 32> qa_hi = convert<uint16_t>(qa_hi_u8);
+            qa_lo += extract_bit_to_pos4(qh_a, sb);
+            qa_hi += extract_bit_to_pos4(qh_a, sb + 1);
+
+            deq[sb]     = convert<float>(qa_lo) * scale_lo + min_lo;
+            deq[sb + 1] = convert<float>(qa_hi) * scale_hi + min_hi;
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
