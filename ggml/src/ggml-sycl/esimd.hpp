@@ -731,6 +731,34 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
             acc_b += y_s * deq_b;
         }
     }
+
+    // dequant one row's 256-elem block to 8 32-wide float vectors (shared across tokens);
+    // the small-batch M-kernel multiplies these against all M activation rows
+    static ESIMD_INLINE void dequant_block(
+            const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 32> deq[8]) {
+        using namespace sycl::ext::intel::esimd;
+
+        constexpr int NSUB = QK_K / QK8_0; // 8 sub-blocks of 32
+
+        simd<int8_t, 128> qs_a_lo = block_load<int8_t, 128>(pa.qs + bia * QK_K);
+        simd<int8_t, 128> qs_a_hi = block_load<int8_t, 128>(pa.qs + bia * QK_K + 128);
+
+        // sub-blocks 0..NSUB/2-1 live in the low 128 int8, the rest in the high 128
+        #pragma unroll
+        for (int s = 0; s < NSUB / 2; ++s) {
+            const float d_a = (float) pa.d[bia * NSUB + s];
+            simd<int8_t, 32> qa = qs_a_lo.select<32, 1>(32 * s);
+            deq[s] = convert<float>(qa) * d_a;
+        }
+        #pragma unroll
+        for (int s = NSUB / 2; s < NSUB; ++s) {
+            const int sl = s - NSUB / 2;
+            const float d_a = (float) pa.d[bia * NSUB + s];
+            simd<int8_t, 32> qa = qs_a_hi.select<32, 1>(32 * sl);
+            deq[s] = convert<float>(qa) * d_a;
+        }
+    }
 };
 
 } // namespace ggml_sycl_esimd
