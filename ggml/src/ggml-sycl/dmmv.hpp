@@ -34,8 +34,14 @@ bool ggml_sycl_dmmv_reorder_esimd_glu(const void * vx_up, const void * vx_gate, 
 
 // small-batch (M=2..8) eSIMD Q6_K GEMV for the MTP verify; f32 activation
 void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,
-                                                               float *dst, const int ncols, const int nrows,
-                                                               const int M, const int dst_col_stride,
-                                                               dpct::queue_ptr stream);
+                                                                float *dst, const int ncols, const int nrows,
+                                                                const int M, const int dst_col_stride,
+                                                                dpct::queue_ptr stream);
+
+// small-batch (M=2..8) eSIMD Q5_K GEMV for the MTP verify; f32 activation
+void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,
+                                                                float *dst, const int ncols, const int nrows,
+                                                                const int M, const int dst_col_stride,
+                                                                dpct::queue_ptr stream);
 
 #endif // GGML_SYCL_DMMV_HPP

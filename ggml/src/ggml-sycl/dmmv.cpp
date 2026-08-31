@@ -2074,14 +2074,14 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
 // small-batch (M tokens, 2..8) eSIMD Q6_K GEMV (MTP verify): dequant the weight block once
 // (shared across tokens), then multiply against all M fp32 activation rows. Reuses the
 // wide-SIMD dequant of the 1/2-row DMMV path. One output row per work-group.
-template <int M>
-ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_m_q6k(
+template <ggml_type T, int M>
+ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_m(
         const void * vx, const float * y, float * dst,
         const int ncols, const int nrows, const int dst_col_stride,
         sycl::local_accessor<float, 1> lmem,
         const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
-    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<GGML_TYPE_Q6_K>;
+    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
 
     const int    num_blocks_per_row = ncols / QK_K;
     const size_t nb = (size_t) nrows * num_blocks_per_row;
@@ -2125,36 +2125,54 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_m_q6k(
     }
 }
 
-template <int M>
-static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m(const void *vx, const float *y,
-                                                             float *dst, const int ncols,
-                                                             const int nrows, const int dst_col_stride,
-                                                             dpct::queue_ptr stream) {
+template <ggml_type T, int M>
+static void dequantize_mul_mat_vec_sycl_reorder_esimd_m(const void *vx, const float *y,
+                                                       float *dst, const int ncols,
+                                                       const int nrows, const int dst_col_stride,
+                                                       dpct::queue_ptr stream) {
     const int workgroups = nrows;
     stream->submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * M), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd_m_q6k<M>(vx, y, dst, ncols, nrows, dst_col_stride, lmem, it);
+                dequantize_mul_mat_vec_reorder_esimd_m<T, M>(vx, y, dst, ncols, nrows, dst_col_stride, lmem, it);
             });
     });
 }
 
 void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,
-                                                                      float *dst, const int ncols,
-                                                                      const int nrows, const int M,
-                                                                      const int dst_col_stride,
-                                                                      dpct::queue_ptr stream) {
+                                                                float *dst, const int ncols,
+                                                                const int nrows, const int M,
+                                                                const int dst_col_stride,
+                                                                dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     switch (M) {
-        case 2: dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m<2>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
-        case 3: dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m<3>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
-        case 4: dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m<4>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
-        case 5: dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m<5>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
-        case 6: dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m<6>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
-        case 7: dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m<7>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
-        case 8: dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m<8>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 2: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q6_K, 2>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 3: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q6_K, 3>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 4: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q6_K, 4>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 5: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q6_K, 5>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 6: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q6_K, 6>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 7: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q6_K, 7>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 8: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q6_K, 8>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        default: GGML_ABORT("unsupported small-batch M = %d\n", M);
+    }
+}
+
+void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,
+                                                                float *dst, const int ncols,
+                                                                const int nrows, const int M,
+                                                                const int dst_col_stride,
+                                                                dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    switch (M) {
+        case 2: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q5_K, 2>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 3: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q5_K, 3>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 4: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q5_K, 4>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 5: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q5_K, 5>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 6: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q5_K, 6>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 7: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q5_K, 7>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
+        case 8: dequantize_mul_mat_vec_sycl_reorder_esimd_m<GGML_TYPE_Q5_K, 8>(vx, y, dst, ncols, nrows, dst_col_stride, stream); break;
         default: GGML_ABORT("unsupported small-batch M = %d\n", M);
     }
 }
