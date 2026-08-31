@@ -582,6 +582,49 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
             }
         }
     }
+
+    // dequant one row's 256-elem block to 8 32-wide float vectors (shared across tokens);
+    // the small-batch M-kernel multiplies these against all M activation rows
+    static ESIMD_INLINE void dequant_block(
+            const ptrs & pa, size_t bia,
+            sycl::ext::intel::esimd::simd<float, 32> deq[8]) {
+        using namespace sycl::ext::intel::esimd;
+
+        simd<uint8_t, 128> ql_a     = block_load<uint8_t, 128>(pa.ql + bia * (QK_K / 2));
+        simd<uint8_t, 64>  qh_a     = block_load<uint8_t, 64>(pa.qh + bia * (QK_K / 4));
+        simd<int8_t, 16>   scales_a = block_load<int8_t, 16>(pa.scales + bia * (QK_K / 16));
+        const float d_a = (float) pa.d[bia];
+        simd<float, 16> sc_a = convert<float>(scales_a);
+
+        #pragma unroll
+        for (int im = 0; im < 2; ++im) {
+            simd<uint8_t, 32> ql_lo_a   = ql_a.select<32, 1>(64 * im);
+            simd<uint8_t, 32> ql_hi_a   = ql_a.select<32, 1>(64 * im + 32);
+            simd<uint8_t, 32> qh_bits_a = qh_a.select<32, 1>(32 * im);
+            #pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const float scale_a_lo = sc_a[8 * im + 2 * g + 0] * d_a;
+                const float scale_a_hi = sc_a[8 * im + 2 * g + 1] * d_a;
+                simd<float, 32> scale_vec_a = splat_lo_hi(scale_a_lo, scale_a_hi);
+                simd<uint8_t, 32> qa;
+                switch (g) {
+                    case 0:
+                        qa = (ql_lo_a & simd<uint8_t, 32>(0x0F)) | ((qh_bits_a & simd<uint8_t, 32>(0x03)) << simd<uint8_t, 32>(4));
+                        break;
+                    case 1:
+                        qa = (ql_hi_a & simd<uint8_t, 32>(0x0F)) | ((qh_bits_a & simd<uint8_t, 32>(0x0C)) << simd<uint8_t, 32>(2));
+                        break;
+                    case 2:
+                        qa = (ql_lo_a >> simd<uint8_t, 32>(4)) | (qh_bits_a & simd<uint8_t, 32>(0x30));
+                        break;
+                    default:
+                        qa = (ql_hi_a >> simd<uint8_t, 32>(4)) | ((qh_bits_a & simd<uint8_t, 32>(0xC0)) >> simd<uint8_t, 32>(2));
+                        break;
+                }
+                deq[4 * im + g] = (convert<float>(qa) - 32.0f) * scale_vec_a;
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
