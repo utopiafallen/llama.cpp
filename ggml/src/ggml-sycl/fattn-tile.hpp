@@ -64,6 +64,7 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
 
@@ -1190,6 +1191,23 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     }
 
     if constexpr (DV <= 256) {
+        // gqa_ratio that is not a power of 2 (e.g. 6) re-reads each KV head
+        // gqa_ratio/ncols2 times under the power-of-2 ncols2 choice. At long KV the
+        // read dominates, so use ncols2 = gqa_ratio when it has a config (1x re-read).
+        // Decode only (Q ne[1] == 1), gated by KV length: short ctx keeps the smaller
+        // ncols2 for its extra parallelism.
+        if constexpr (ggml_sycl_fattn_tile_get_config(DKQ, DV, 6) != 0) {
+            if (use_gqa_opt && gqa_ratio % 6 == 0 && Q->ne[1] == 1
+                && g_ggml_sycl_fa_tile_gqa_min_kv > 0
+                && (int64_t) K->ne[1] >= g_ggml_sycl_fa_tile_gqa_min_kv) {
+                constexpr int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, 6) / WARP_32_SIZE;
+                constexpr int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, 6);
+                launch_fattn<DV, 1, 6,
+                    flash_attn_tile<DKQ, DV, 1, 6, use_logit_softcap, WARP_32_SIZE>, WARP_32_SIZE>
+                    (ctx, dst, nwarps, 0, nbatch_fa, true, true, false);
+                return;
+            }
+        }
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;

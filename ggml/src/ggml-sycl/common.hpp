@@ -80,6 +80,7 @@ extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
 extern int g_ggml_sycl_fa_onednn_max_kv;
+extern int g_ggml_sycl_fa_tile_gqa_min_kv;
 
 
 // Profiling output to file -- avoids stdout interference with model output
