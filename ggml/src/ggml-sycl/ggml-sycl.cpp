@@ -4815,8 +4815,10 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
     if (wu->type == GGML_TYPE_Q6_K) {
         // f32-activation ESIMD DMMV path with the GLU written by the store epilogue;
         // SWIGLU only, as the ESIMD epilogue cannot call the GEGLU tanh
+        // mat-vec only: the epilogue writes the first output column, so a multi-token
+        // call would leave the rest stale
         if (!g_ggml_sycl_fuse_mm_glu || !g_ggml_sycl_enable_esimd || g_ggml_sycl_q6k_gemv_row ||
-            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+            act->ne[1] != 1 || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
             return false;
         }
 
