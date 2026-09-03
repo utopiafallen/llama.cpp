@@ -85,6 +85,7 @@ extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_memtrace;
 extern int g_ggml_sycl_memtrace_step;
 extern int g_ggml_sycl_fa_tile_gqa_min_kv;
+extern int g_ggml_sycl_fa_xmx_decode;
 
 
 // Profiling output to file -- avoids stdout interference with model output
@@ -269,6 +270,7 @@ struct sycl_device_info {
     sycl_hw_info hw_info;
     optimize_feature opt_feature;
     bool    usm_system_support; // support for USM system allocations
+    bool    has_xmx;            // Intel XMX matrix engine (joint_matrix) support
 };
 
 
