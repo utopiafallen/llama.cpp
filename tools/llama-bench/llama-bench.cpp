@@ -27,6 +27,8 @@
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
+#include "sampling.h"
+#include "speculative.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -375,6 +377,9 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    bool                             mtp;
+    int                              mtp_n_max;
+    float                            mtp_p_min;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -420,6 +425,9 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* mtp                  */ false,
+    /* mtp_n_max            */ 4,
+    /* mtp_p_min            */ 0.6f,
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -437,6 +445,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --mtp                                       benchmark MTP (nextn) speculative decoding; -d sets the (untimed) context, -n the timed generation\n");
+    printf("  --mtp-n-max <n>                             max draft tokens for --mtp (default: %d)\n", cmd_params_defaults.mtp_n_max);
+    printf("  --mtp-p-min <p>                             min draft probability for --mtp (default: %.2f)\n", (double) cmd_params_defaults.mtp_p_min);
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -537,6 +548,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.mtp                  = cmd_params_defaults.mtp;
+    params.mtp_n_max            = cmd_params_defaults.mtp_n_max;
+    params.mtp_p_min            = cmd_params_defaults.mtp_p_min;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -552,6 +566,20 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             if (arg == "-h" || arg == "--help") {
                 print_usage(argc, argv);
                 exit(0);
+            } else if (arg == "--mtp") {
+                params.mtp = true;
+            } else if (arg == "--mtp-n-max") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.mtp_n_max = std::stoi(argv[i]);
+            } else if (arg == "--mtp-p-min") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.mtp_p_min = std::stof(argv[i]);
             } else if (arg == "-m" || arg == "--model") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2220,6 +2248,111 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     return true;
 }
 
+// fill n_ctx random tokens into the target + MTP draft contexts, driven through the spec impl
+static bool mtp_build_context(common_speculative * spec, llama_context * ctx, llama_context * ctx_dft,
+        int n_ctx, int n_batch, llama_token & id_last, llama_tokens & prompt) {
+    const llama_vocab * vocab   = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+
+    int pos = 0;
+    while (pos < n_ctx) {
+        const int n = std::min(n_batch, n_ctx - pos);
+
+        common_batch_clear(batch);
+        for (int i = 0; i < n; i++) {
+            llama_token tok = (pos == 0 && i == 0 && llama_vocab_get_add_bos(vocab))
+                                  ? llama_vocab_bos(vocab)
+                                  : std::rand() % n_vocab;
+            prompt.push_back(tok);
+            common_batch_add(batch, tok, pos + i, { 0 }, pos + n == n_ctx);
+        }
+
+        if (llama_decode(ctx, batch) != 0 || !common_speculative_process(spec, batch)) {
+            llama_batch_free(batch);
+            return false;
+        }
+
+        pos += n;
+    }
+
+    llama_batch_free(batch);
+
+    id_last = std::rand() % n_vocab;
+    common_speculative_begin(spec, 0, prompt);
+
+    return true;
+}
+
+// MTP speculative generation of n_new output tokens, starting at position n_past
+static bool mtp_gen_tokens(common_speculative * spec, llama_context * ctx, llama_context * ctx_dft,
+        common_sampler * smpl, llama_token id_last, int n_past, int n_new, int n_batch,
+        llama_tokens & prompt, int n_draft_max) {
+    const llama_seq_id seq_id = 0;
+
+    llama_batch  batch = llama_batch_init(n_batch, 0, 1);
+    llama_tokens draft;
+
+    int n_predict = 0;
+    while (n_predict < n_new) {
+        const int n_past_draft = n_past; // position id_last lands at when drafting
+        if (draft.empty()) {
+            int n_max = std::min(n_draft_max, (int) llama_n_ctx(ctx) - n_past - 1);
+            n_max     = std::max(n_max, 0);
+            common_speculative_get_draft_params(spec, seq_id) = {
+                /* .drafting */ true,
+                /* .n_max    */ n_max,
+                /* .n_past   */ n_past,
+                /* .id_last  */ id_last,
+                /* .prompt   */ &prompt,
+                /* .result   */ &draft,
+            };
+            common_speculative_draft(spec);
+            // the draft wrote its tokens into ctx_dft; roll them back so the
+            // verify batch catch-up decode re-adds them without a position clash
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past_draft, -1);
+            }
+        }
+
+        common_batch_clear(batch);
+        common_batch_add(batch, id_last, n_past++, { seq_id }, true);
+        for (size_t i = 0; i < draft.size(); i++) {
+            common_batch_add(batch, draft[i], n_past + i, { seq_id }, true);
+        }
+
+        if (llama_decode(ctx, batch) != 0 || !common_speculative_process(spec, batch)) {
+            llama_batch_free(batch);
+            return false;
+        }
+
+        auto ids = common_sampler_sample_and_accept_n(smpl, ctx, draft);
+        if (ids.empty()) {
+            llama_batch_free(batch);
+            return false;
+        }
+
+        common_speculative_accept(spec, seq_id, (uint16_t) (ids.size() - 1));
+
+        n_past    += (int) ids.size() - 1;
+        n_predict += (int) ids.size();
+        for (llama_token tok : ids) {
+            prompt.push_back(id_last);
+            id_last = tok;
+        }
+        draft.clear();
+
+        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, n_past, -1);
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
+        }
+    }
+
+    llama_batch_free(batch);
+    return true;
+}
+
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) text;
@@ -2322,6 +2455,11 @@ int llama_bench(int argc, char ** argv) {
         }
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
+        mparams.load_mtp = params.mtp; // MTP (nextn) tensors are only loaded on request
+        if (params.mtp) {
+            // the target must track re-entrant state for the MTP nextn embeddings (cf. need_n_rs_seq)
+            cparams.n_rs_seq = params.mtp_n_max;
+        }
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
@@ -2437,77 +2575,156 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
-        for (int i = 0; i < params.reps; i++) {
-            llama_memory_clear(llama_get_memory(ctx), false);
+        if (params.mtp) {
+            // create the MTP draft context on the same model via the canonical path (spec_init owns ctx_dft)
+            common_params params_dft;
+            params_dft.n_ctx             = inst.n_prompt + inst.n_gen + inst.n_depth;
+            params_dft.n_batch           = t.n_batch;
+            params_dft.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            params_dft.speculative.draft.n_max = params.mtp_n_max;
+            params_dft.speculative.draft.p_min = params.mtp_p_min;
 
-            if (t.n_depth > 0) {
-                bool is_cached = t.n_depth == cstate.depth;
+            common_speculative_init_result_ptr spec_init =
+                common_speculative_init_from_params(params_dft, lmodel, ctx);
+            llama_context * ctx_dft = spec_init ? spec_init->context() : nullptr;
 
-                if (is_cached) {
-                    // if previously we have computed at this depth, just restore the state
-                    const size_t ret = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
-                    if (ret == 0) {
-                        // if the old state is incompatible with the current context - reprocess from scratch
-                        is_cached = false;
+            common_params_speculative sp;
+            sp.types         = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            sp.draft.n_max   = params.mtp_n_max;
+            sp.draft.p_min   = params.mtp_p_min;
+            sp.draft.ctx_tgt = ctx;
+            sp.draft.ctx_dft = ctx_dft;
+
+            common_speculative * spec = common_speculative_init(sp, /* n_seq */ 1);
+            if (ctx_dft == nullptr || spec == nullptr) {
+                fprintf(stderr, "%s: error: failed to init MTP speculative decoding\n", __func__);
+                if (spec) {
+                    common_speculative_free(spec);
+                }
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                ggml_threadpool_free_fn(threadpool);
+                return 1;
+            }
+
+            common_params_sampling sps;
+            sps.top_k = 1; // greedy: deterministic baseline
+            common_sampler_ptr smpl(common_sampler_init(lmodel, sps));
+
+            const int n_ctx_depth = inst.n_depth;  // established (untimed) context length (-d)
+            const int n_new       = inst.n_gen;    // timed MTP output tokens (-n)
+            t.n_prompt = 0;
+            t.n_depth  = n_ctx_depth;
+            t.n_gen    = n_new;
+
+            for (int i = 0; i < params.reps; i++) {
+                if (params.progress) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: MTP generation run %d/%d\n", params_idx, params_count, i + 1, params.reps);
+                }
+                llama_memory_clear(llama_get_memory(ctx), false);
+                llama_memory_clear(llama_get_memory(ctx_dft), false);
+
+                llama_tokens prompt;
+                llama_token  id_last;
+                if (!mtp_build_context(spec, ctx, ctx_dft, n_ctx_depth, t.n_batch, id_last, prompt)) {
+                    fprintf(stderr, "%s: error: failed to build MTP context\n", __func__);
+                    common_speculative_free(spec);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+                common_sampler_reset(smpl.get());
+
+                uint64_t  t_start = get_time_ns();
+                bool      ok      = mtp_gen_tokens(spec, ctx, ctx_dft, smpl.get(), id_last, n_ctx_depth, n_new, t.n_batch, prompt, params.mtp_n_max);
+                uint64_t  t_ns    = get_time_ns() - t_start;
+                if (!ok) {
+                    fprintf(stderr, "%s: error: failed to run MTP generation\n", __func__);
+                    common_speculative_free(spec);
+                    llama_free(ctx);
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+                t.samples_ns.push_back(t_ns);
+            }
+
+            common_speculative_free(spec);
+            // ctx_dft is owned by spec_init; freed on scope exit
+        } else {
+            for (int i = 0; i < params.reps; i++) {
+                llama_memory_clear(llama_get_memory(ctx), false);
+
+                if (t.n_depth > 0) {
+                    bool is_cached = t.n_depth == cstate.depth;
+
+                    if (is_cached) {
+                        // if previously we have computed at this depth, just restore the state
+                        const size_t ret = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+                        if (ret == 0) {
+                            // if the old state is incompatible with the current context - reprocess from scratch
+                            is_cached = false;
+                        }
+                    }
+
+                    if (!is_cached) {
+                        if (params.progress) {
+                            fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
+                                    i + 1, params.reps);
+                        }
+                        bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                        if (!res) {
+                            fprintf(stderr, "%s: error: failed to run depth\n", __func__);
+                            llama_free(ctx);
+                            llama_model_free(lmodel);
+                            exit(1);
+                        }
+
+                        // store the context state for reuse in later runs
+                        cstate.depth = t.n_depth;
+                        cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
+                        llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+                    } else {
+                        if (params.progress) {
+                            fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
+                                    i + 1, params.reps);
+                        }
                     }
                 }
 
-                if (!is_cached) {
+                uint64_t t_start = get_time_ns();
+
+                if (t.n_prompt > 0) {
                     if (params.progress) {
-                        fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
+                        fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                    bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                     if (!res) {
-                        fprintf(stderr, "%s: error: failed to run depth\n", __func__);
+                        fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                         llama_free(ctx);
                         llama_model_free(lmodel);
                         exit(1);
                     }
-
-                    // store the context state for reuse in later runs
-                    cstate.depth = t.n_depth;
-                    cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
-                    llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
-                } else {
+                }
+                if (t.n_gen > 0) {
                     if (params.progress) {
-                        fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
+                        fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
+                    bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                    if (!res) {
+                        fprintf(stderr, "%s: error: failed to run gen\n", __func__);
+                        llama_free(ctx);
+                        llama_model_free(lmodel);
+                        exit(1);
+                    }
                 }
-            }
 
-            uint64_t t_start = get_time_ns();
-
-            if (t.n_prompt > 0) {
-                if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
-                            i + 1, params.reps);
-                }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
-                }
+                uint64_t t_ns = get_time_ns() - t_start;
+                t.samples_ns.push_back(t_ns);
             }
-            if (t.n_gen > 0) {
-                if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
-                            i + 1, params.reps);
-                }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run gen\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
-                }
-            }
-
-            uint64_t t_ns = get_time_ns() - t_start;
-            t.samples_ns.push_back(t_ns);
         }
 
         if (p) {
