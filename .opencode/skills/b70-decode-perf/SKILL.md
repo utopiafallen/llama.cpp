@@ -9,7 +9,7 @@ Model: `Qwen3.8-27B-UD-Q6_K.gguf` (20.46 GiB, dense), B70 = Intel Arc Pro B70
 (32GB GDDR6, 256-bit @ 19 Gbps = 608 GB/s spec, 16MB L2). Bench:
 `llama-bench -r 2 --device SYCL0 -m <model> -p 8 -n 128` (see sycl16-build-deploy).
 
-## Bottom line (2026-08-22, REVISED 2026-08-27, INTERLEAVED DEAD-END + MTP WIN 2026-08-30)
+## Bottom line (2026-08-22, REVISED 2026-08-27, INTERLEAVED DEAD-END + MTP WIN 2026-08-30, XMX DECODE FA 2026-09-02)
 
 - **Best decode WITHOUT speculation = ~23.05 t/s** (Q6_K/Q5_K/Q8_0 on eSIMD DMMV + 1-row
   small-N kernel + f16-convert skip, committed `76f80b445`). 23.05 t/s x 21.97 GB/token =
@@ -23,8 +23,17 @@ Model: `Qwen3.8-27B-UD-Q6_K.gguf` (20.46 GiB, dense), B70 = Intel Arc Pro B70
 - **The interleaved-weight-layout path is a DEAD END (exhausted 2026-08-30).** The
   2026-08-27 REVISED note predicted 25-26 t/s from GEMV-shaped probes (580-594 GB/s),
   but the probes over-predicted: every real interleaved variant loses to SoA 23.05.
-  See "Interleaved Q6_K: all three layouts lose to SoA" below. Do NOT re-attempt any
-  Q6_K interleaved/padded/pair layout for decode.
+   See "Interleaved Q6_K: all three layouts lose to SoA" below. Do NOT re-attempt any
+   Q6_K interleaved/padded/pair layout for decode.
+- **XMX (joint_matrix) decode FA is a long-context ATTENTION lever, not a headline
+  decode one (added 2026-09-02).** At 32K context it is ~8% faster than the tile FA
+  (20.5 vs 18.9 t/s); at the small-context bench behind the ~23 t/s headline it is a
+  wash (attention is negligible there). The tile FA decode was COMPUTE-bound (EU FMA
+  QK^T/PV), not DRAM-bound; XMX removes that compute and the attention then hits the
+  KV-read (DRAM) floor. It shows as only ~8% overall because the GEMV still dominates the
+  token. It is decode-only (never runs in prefill), so prefill is untouched. See the
+  "XMX (joint_matrix) decode flash-attention" section. Prefill is the bigger XMX target
+  (compute-bound) but a much larger change - not done.
 
 ## Quant distribution (probed via gguf-inspect)
 
@@ -441,7 +450,95 @@ dominates (4.3 t/s observed), over 256 (bench) it is ~2% (22.60).
   identical). Validate with a single-token decode flow (llama-cli -p ... -n 48).
 - A 15-token prompt goes the MMQ/XMX path (ne[1] 9..32); an 8-token prompt goes MMVQ
   (ne[1] 2..8). They leave different GPU state and different reorder timing - always A/B
-  the SAME prompt length.
+   the SAME prompt length.
+
+
+## XMX (joint_matrix) decode flash-attention (2026-09-02)
+
+Decode-only FA kernel that runs QK^T and PV on the Intel XMX matrix engine
+(joint_matrix) instead of the EU FMA loop. Files: fattn-xmx-decode.{cpp,hpp}, dispatch in
+fattn.cpp before the best-kernel switch. Kernel originally committed 9ad5d30eb. The
+enable env GGML_SYCL_FA_XMX_DECODE defaults to 1 (perf win) and is read ONCE at startup
+into g_ggml_sycl_fa_xmx_decode (not per dispatch). The support gate also requires the
+device to have XMX (sycl_device_info.has_xmx, populated at init via gpu_has_xmx), so
+default-on is safe on non-XMX GPUs (iGPU) - it just falls back to tile/vec. Correct;
+~8% at 32K context; a wash at short context (see below).
+
+### XMX hardware on the B70 (confirmed via runtime query)
+- The B70 is bmg_g31 (arch low-word 0x00800000 = 8388608), NOT the bmg_g21 the AOT build
+  targets. bmg_g21 AOT binaries run fine on bmg_g31 (same Battlemage family).
+- 53 matrix_combinations on the B70 (the iGPU has 0) - XMX is present and usable.
+- fp16 tiles: M=1-8 (variable), N=16, K=16; M=16, N=16, K=16; M=1/32, N=64, K=16/32. The
+  M=1-8 variable tile is what lets one tile batch the gqa queries.
+- Dense 1024^3 GEMM (16x16x16 tiles): XMX 27 TFLOPS fp16 vs 2.0 TFLOPS naive scalar =
+  13.2x. That is the compute the kernel buys (JIT and AOT bmg_g31 match).
+
+### Kernel design
+- Main kernel grid (n_splits, n_kv_heads, 16); one 16-lane sub_group per work-group. One
+  work-group = one 256-position KV split x one KV head. All gqa queries (Qwen3.8-27B
+  gqa=6) batch into a single M=gqa XMX tile so the K/V row loads once and is reused.
+- QK^T: scores[gqa][256] = Q16[gqa][256] @ K[256][256]^T, per 16-pos chunk. A=Q16
+  row_major from LDS; B=K global col_major, stride = pos stride (gives B[d][pos]=K[pos][d]).
+- Online softmax over the split (unnormalized P + m + l in registers/LDS).
+- PV: O[gqa][256] += P[gqa][16] @ V[16][16], per 16-dim chunk (A=P local, B=V global).
+- Combine kernel: flash-decoding merge of the per-split partials (per q_head x dim).
+- Support gate: decode (Q ne[1]==1), Q F32 / K,V F16, head_dim==256, gqa 1-8, single
+  batch (ne[3]==1), no sinks / no logit_softcap. n_splits = ceil(n_kv/256).
+- LDS ~12 KB/WG at gqa=6 (Q16 3KB + scores 6KB + P16 3KB).
+
+### joint_matrix API gotchas
+- joint_matrix<sub_group, T, use::a/b/accumulator, M, N, layout> + joint_matrix_load /
+  fill / mad / store. a/b load layout is a template param; acc store layout is a runtime arg.
+- a/b/store take a multi_ptr<T, addr_space, decorated::legacy> built from the raw pointer
+  at the call site (xmp_g_h(ptr) for global, xmp_l_h(ptr) for LDS).
+- **const sycl::half* K/V will NOT convert to the non-const multi_ptr** - cast to
+  (sycl::half*) at the load, else the compile fails (and cascades, see below).
+- local_space (LDS) load/store works for staging Q16/P16/scores. In-place accumulate
+  (mad with D=C) works for the K-loop.
+- One 16-lane sub_group per tile; the 16-lane grid axis must be a multiple of 16.
+- reduce_over_group(sg, val, op) (free fn) for the sub_group softmax reductions.
+- A `static` helper fn called from the kernel lambda is fine (cf. dmmv.cpp). BUT any
+  compile error inside it cascades into "SYCL kernel cannot call an undefined function
+  without SYCL_EXTERNAL attribute" at every call site - fix the root error, cascade clears.
+
+### FA mask layout (the correctness bug)
+- For decode the mask dim-1 is the query-position dim, which is 1 (n_q==1). So the mask
+  is purely per-position: value = mask[pos] (pos stride = mask->nb[0]/2 = 1). The q-head
+  does NOT index the mask. Measured: n_kv=256 -> mask ne=256x1, nb=2/512.
+- Bug: indexing the mask with the q-head (0..23) as dim-1 reads OUT OF BOUNDS ->
+  garbage scores -> NaN -> sampler assert after one token ("Assertion failed: found",
+  llama-sampler.cpp). Symptom of an OOB mask read.
+
+### Benchmark method: the -pg prefill trap (cost a 2x error this session)
+- llama-bench `tg` (from -n) runs with n_prompt=0 -> decodes over a TINY context
+  (~256 KV). Attention is negligible there, so XMX vs tile is a wash (~22 both). It
+  CANNOT measure 32K-context decode.
+- To decode at a big context use -pg 32768,N (prefill 32K to build the cache, then
+  generate N). It reports a COMBINED pp+tg t/s.
+- **The prefill in a -pg run is SLOWER than a standalone -p run** (measured 819 vs 973
+  t/s; the -pg run has a larger n_ctx). So DO NOT subtract a standalone pp time from a
+  -pg time. Subtract WITHIN one run: `llama-bench -pg 32768,0 -pg 32768,N` (same
+  session), then tg = N / ((N+32768)/combined - 32768/pp0). A cross-run prefill gave
+  9.7 t/s vs the true ~19 (2x low).
+
+### Gains (verified 2026-09-02, -pg 32768,128 same-run subtraction)
+- 32K-context decode: XMX 20.5 t/s vs tile FA 18.9 t/s = **+8%** (the 18.9 confirms the
+  prior 19.07 tile baseline; the ~1.6 t/s delta is ~50x the std dev).
+- Small-context decode (the normal tg test): wash, ~22 t/s both (attention negligible).
+- Prefill: identical 819.6 t/s both - the kernel is decode-only, never runs in prefill.
+- Why the gain is ~8% overall (not bigger): the tile FA decode was COMPUTE-bound, not
+  DRAM-bound (prior probes confirmed: removing the QK^T/PV work pushed decode toward the
+  KV-read DRAM floor). XMX offloads that compute to the matrix engine, so the 32K
+  attention drops to its KV-read (DRAM) floor - a large win WITHIN the attention. But the
+  attention is only a slice of the total token (the GEMV dominates), so the whole-token
+  gain is ~8% (18.9 -> 20.5 t/s).
+- Prefill attention is the COMPUTE-bound case (big Q@K^T over many tokens) where XMX has
+  far more headroom. Extending the XMX path to prefill is the bigger potential win but a
+  much larger change (full online-softmax tiling, large M tiles). Not done.
+
+### Correctness
+- Verified coherent output ("Paris") at 1-split (n_kv=256) and 2-split (n_kv=512) via
+  llama-cli. n_splits = ceil(n_kv/256); the combine kernel is exercised at >=2 splits.
 
 
 ## Lessons / gotchas
