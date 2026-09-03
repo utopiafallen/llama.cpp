@@ -176,6 +176,9 @@ static void xmx_decode_combine(
 }
 
 bool ggml_sycl_flash_attn_ext_xmx_decode_supported(int device, const ggml_tensor * dst) {
+    if (!ggml_sycl_info().devices[device].has_xmx) {
+        return false;
+    }
     if (dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
