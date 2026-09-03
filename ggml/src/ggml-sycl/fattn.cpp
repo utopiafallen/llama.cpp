@@ -314,7 +314,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     // XMX decode FA: QK^T and PV on the Intel XMX matrix engine (joint_matrix),
     // split-KV with a combine kernel. falls back to the tile/vec kernel when the
     // XMX decode kernel does not apply.
-    if (ggml_sycl_get_env("GGML_SYCL_FA_XMX_DECODE", 0) &&
+    if (g_ggml_sycl_fa_xmx_decode &&
         ggml_sycl_flash_attn_ext_xmx_decode_supported(ctx.device, dst)) {
         ggml_sycl_flash_attn_ext_xmx_decode(ctx, dst);
         return;
