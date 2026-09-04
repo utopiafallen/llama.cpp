@@ -69,6 +69,20 @@ ssh b70 "C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16\llama-bench.exe --device S
   for both). The flag is singular and comma-separated; this build REJECTS `--devices`
   (error: invalid parameter). `set ONEAPI_DEVICE_SELECTOR=level_zero:0 && <cmd>` is the
   process-level alternative.
+- **Device ownership convention (the box has 2 B70s, one instance per GPU is fine):**
+  the USER's long-running llama-server lives on **SYCL1**; MY benchmark runs always pin
+  **SYCL0**. Never put two instances on the same GPU (2 x 20 GB = 40 GB > 32 GB card ->
+  Level Zero oversubscribes, buffers go host-backed ~56 GB/s, sshd starves).
+- **NEVER launch a second 27B load while the user's server is already resident**, even on
+  the other GPU: two concurrent 20 GB model loads wedge the box (disk/CPU/host-RAM pressure)
+  - sshd resets ("Connection reset by peer") while ping still answers. Check
+  `ssh b70 "tasklist | findstr /i llama"` FIRST; if any llama process is up, stop and ask
+  before launching another. (Note: `wmic` is gone on this Windows build; use `tasklist`.)
+- **Avoid VRAM idle drain in harnesses:** the user wants `--gpu-heartbeat 5` passed to
+  llama-cli / llama-server, BUT the deployed `llama-cpp-sycl16` build does NOT have that flag
+  (it errors `invalid argument: --gpu-heartbeat`). It only has `--warmup,--no-warmup` (warmup
+  on by default). Do NOT pass `--gpu-heartbeat` to this build; if a rebuild adds it, pass
+  `--gpu-heartbeat 5` then.
 - Long runs: the local bash tool has its own timeout, so pass an explicit `timeout`
   (e.g. 600000 ms) for multi-minute llama-bench runs. For very long jobs, detach on the
   remote: `start /min cmd /c "<cmd> > G:\bench.log 2>&1"` then poll the log with a second
