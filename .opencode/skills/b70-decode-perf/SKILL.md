@@ -268,7 +268,12 @@ Replicates the eSIMD DMMV access pattern exactly (4-lane WG, 2 rows/WG, lanes st
 Model shapes (Qwen3.8-27B, 64 blocks = 48 GDN + 16 full-attn, every 4th block full-attn):
 - GDN blocks: attn_qkv [5120,10240], attn_gate [5120,6144], ffn_up [5120,17408], ffn_gate [5120,17408]
   (Q5_K/IQ4_XS), ffn_down [17408,5120], ssm_out [6144,5120].
-- Full-attn blocks: attn_q [5120,12288], attn_k/v [5120,1024], attn_output [6144,5120].
+- Full-attn blocks: attn_q [5120,12288] is a JOINT Q+gate projection (2 x 24 heads x 256 head_dim =
+  12288; query = first 6144, gate = second 6144, gated attention - qwen35.cpp:266), attn_k/v
+  [5120,1024] (4 KV heads x 256), attn_output [6144,5120].
+- Attention heads (GGUF kv qwen35.attention.*): head_count=24 (query), head_count_kv=4, head_dim=256,
+  gqa=6. DO NOT read 12288/256=48 as the head count - that is the Q+gate width; the query alone is
+  6144 (24 heads). This is why the XMX decode FA gate (gqa 1-8) PASSES for this model.
 - output (lm_head) [5120,248320] Q8_0 (1.35GB/token); token_embd [5120,248320] Q6_K (only 1 row read
   at decode). Local model copy: G:\tmp\Qwen3.8-27B-UD-Q6_K.gguf (gguf-inspect works on it).
 
@@ -429,6 +434,22 @@ GPUs (iGPU) - it just falls back to tile/vec. The device banner prints an `XMX|Y
 ### Correctness
 - Coherent output ("Paris") at 1-split (n_kv=256) and 2-split (n_kv=512) via llama-cli. n_splits =
   ceil(n_kv/256); the combine kernel is exercised at >=2 splits.
+
+### MTP in llama-bench + the verify path = next lever (2026-09-03)
+- MTP is now a first-class llama-bench mode (`--mtp`, committed `191548555`): `-d` sets the untimed
+  established context, `-n` the timed generation, `--mtp-n-max` / `--mtp-p-min` the draft params. It
+  runs the canonical common_speculative path (same as speculative-simple) on a single SYCL context.
+  **Baseline: `tg128 @ d32768` = 41.12 t/s** (n_max=4, p_min=0.6) vs non-MTP 32K tg128 = 21.58 t/s
+  -> ~1.9x. This matches/exceeds the cli MTP number (~39.9) and confirms the MTP path is correct.
+- **Why the current XMX decode FA does NOT help MTP t/s:** the draft is a chain of single-token
+  decodes (ne[1]==1 -> XMX decode FA runs), but the ONE main-model verify decodes the whole
+  [id_last + draft] batch in a single graph pass (ne[1]=K+1, e.g. 5) -> the ne[1]==1 gate skips XMX,
+  so verify attention runs on tile FA. The verify is ~86% of an MTP step, so it is the lever.
+- **Next step: extend the XMX decode FA M-tile to ne[1]=2..8** (the verify batch size). The kernel
+  already batches the gqa queries into one M=gqa tile; the extension batches the K+1 verify positions
+  too (M = gqa*(K+1) or a separate dim). Covers verify attention (the compute-bound slice); the GEMVs
+  already use the eSIMD M-kernel. See fattn-xmx-decode.cpp:191 (the ne[1]!=1 gate) + the support gate
+  (Q ne[1]==1).
 
 ## Lessons / gotchas
 
