@@ -3846,7 +3846,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.gpu_heartbeat_seconds = val;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
