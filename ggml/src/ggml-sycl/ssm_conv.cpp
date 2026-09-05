@@ -1,5 +1,6 @@
 #include "ssm_conv.hpp"
 #include "common.hpp"
+#include "presets.hpp"
 
 #include <cstdio>
 
@@ -147,23 +148,26 @@ void ggml_sycl_op_batched_conv_state_cpy(ggml_backend_sycl_context & ctx,
         queue *q = ctx.stream();
 
         const size_t total_work = (size_t)n * (size_t)rows * (size_t)cols;
-        const range<1> global_range(total_work);
+        const size_t block_size = SYCL_CPY_BLOCK_SIZE;
+        const size_t num_blocks = (total_work + block_size - 1) / block_size;
 
         q->submit([&](handler &h) {
             h.parallel_for(
-                global_range,
-                [=](item<1> it) {
-                    const size_t idx = it.get_id(0);
+                nd_range<1>(range<1>(num_blocks * block_size), range<1>(block_size)),
+                [=](nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    const size_t idx = (size_t)item.get_local_range(0) * item.get_group(0) + item.get_local_id(0);
+                    if (idx >= total_work) return;
 
                     const int c = (int)(idx / ((size_t)rows * (size_t)cols));
                     const int rem = (int)(idx % ((size_t)rows * (size_t)cols));
-                    const int row = rem / cols;
-                    const int col = rem % cols;
+                    // ggml column-major: dim0 varies fastest
+                    const int i0 = rem % rows;
+                    const int i1 = rem / rows;
 
                     const float *src = params.srcs[c];
                     float *dst = params.dsts[c];
 
-                    dst[(size_t)row * cols + col] = src[(size_t)row * stride_row + (size_t)col * stride_col];
+                    dst[rem] = src[i0 * stride_row + i1 * stride_col];
                 }
             );
         });
