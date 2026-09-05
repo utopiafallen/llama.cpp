@@ -24,6 +24,8 @@
 #include <optional>
 #include <stdint.h>
 #include <stdio.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cmath>
 #include <iostream>
@@ -5961,12 +5963,74 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
 
+    // batched conv-state CPY: group of 5 per GDN layer, dispatched in-place
+    std::unordered_set<const ggml_tensor *> batched_cpy_done;
+    int n_cpy_saved = 0;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (g_ggml_sycl_enable_fusion && node->op == GGML_OP_CPY &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32) {
+            const int64_t rows = node->src[0]->ne[0];
+            const int64_t cols = node->src[0]->ne[1];
+            if (rows >= 2 && cols >= 1000 && node->src[1]->ne[0] == rows * cols) {
+                const int stride_row = (int)(node->src[0]->nb[0] / sizeof(float));
+                const int stride_col = (int)(node->src[0]->nb[1] / sizeof(float));
+                if (stride_row == 1 && stride_col > (int)rows) {
+                    // collect this CPY + up to 4 matching CPYs within next 15 nodes
+                    ggml_sycl_batched_cpy_params bp = {};
+                    bp.rows = (int) rows;
+                    bp.cols = (int) cols;
+                    bp.stride_row = stride_row;
+                    bp.stride_col = stride_col;
+                    bp.srcs[0] = (const float *) node->src[0]->data;
+                    bp.dsts[0] = (float *) node->src[1]->data;
+                    bp.n_copies = 1;
+                    batched_cpy_done.insert(node);
+
+                    for (int j = i + 1; j < cgraph->n_nodes && j < i + 15 && bp.n_copies < GGML_SYCL_MAX_CONV_STATE_BATCH; j++) {
+                        const ggml_tensor * m = cgraph->nodes[j];
+                        if (m->op != GGML_OP_CPY) continue;
+                        if (m->src[0]->type != GGML_TYPE_F32 || m->src[1]->type != GGML_TYPE_F32) continue;
+                        if (m->src[0]->ne[0] != rows || m->src[0]->ne[1] != cols) continue;
+                        if (m->src[1]->ne[0] != rows * cols) continue;
+                        const int sr = (int)(m->src[0]->nb[0] / sizeof(float));
+                        const int sc = (int)(m->src[0]->nb[1] / sizeof(float));
+                        if (sr != stride_row || sc != stride_col) continue;
+                        bp.srcs[bp.n_copies] = (const float *) m->src[0]->data;
+                        bp.dsts[bp.n_copies] = (float *) m->src[1]->data;
+                        bp.n_copies++;
+                        batched_cpy_done.insert(m);
+                    }
+
+                    if (bp.n_copies > 1) {
+                        int64_t t_bc = ggml_time_us();
+                        ggml_sycl_op_batched_conv_state_cpy(*sycl_ctx, bp);
+                        if (g_ggml_sycl_profile) {
+                            op_times["batched_conv_state_cpy"] += ggml_time_us() - t_bc;
+                        }
+                        n_cpy_saved += bp.n_copies - 1;
+                    } else {
+                        // single copy, use normal path
+                        int64_t t_op_start = ggml_time_us();
+                        bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+                        if (g_ggml_sycl_profile) op_times[ggml_op_name(node->op)] += ggml_time_us() - t_op_start;
+                        GGML_ASSERT(ok);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // skip already-batched CPYs
+        if (batched_cpy_done.count(node)) {
             continue;
         }
 
@@ -6061,6 +6125,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
+
     int64_t t_graph_end = ggml_time_us();
     if (g_ggml_sycl_profile) {
         std::vector<std::pair<std::string, int64_t>> sorted_ops(op_times.begin(), op_times.end());
