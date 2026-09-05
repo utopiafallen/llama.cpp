@@ -134,3 +134,42 @@ void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     ggml_sycl_op_ssm_conv(ctx, dst);
 }
+
+void ggml_sycl_op_batched_conv_state_cpy(ggml_backend_sycl_context & ctx,
+                                         const ggml_sycl_batched_cpy_params & params) {
+    const int n = params.n_copies;
+    const int rows = params.rows;
+    const int cols = params.cols;
+    const int stride_row = params.stride_row;
+    const int stride_col = params.stride_col;
+
+    try {
+        queue *q = ctx.stream();
+
+        const size_t total_work = (size_t)n * (size_t)rows * (size_t)cols;
+        const range<1> global_range(total_work);
+
+        q->submit([&](handler &h) {
+            h.parallel_for(
+                global_range,
+                [=](item<1> it) {
+                    const size_t idx = it.get_id(0);
+
+                    const int c = (int)(idx / ((size_t)rows * (size_t)cols));
+                    const int rem = (int)(idx % ((size_t)rows * (size_t)cols));
+                    const int row = rem / cols;
+                    const int col = rem % cols;
+
+                    const float *src = params.srcs[c];
+                    float *dst = params.dsts[c];
+
+                    dst[(size_t)row * cols + col] = src[(size_t)row * stride_row + (size_t)col * stride_col];
+                }
+            );
+        });
+
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[SYCL-BATCHED_CONV_STATE_CPY] ERROR: %s\n", e.what());
+        throw;
+    }
+}
