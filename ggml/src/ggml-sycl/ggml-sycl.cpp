@@ -6244,8 +6244,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
-        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
-
         if (node->op == GGML_OP_ADD && g_ggml_sycl_fuse_gdn_dt &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
             ggml_sycl_op_add_softplus_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 2]);
