@@ -24,6 +24,9 @@ Model: `Qwen3.8-27B-UD-Q6_K.gguf` (20.46 GiB, dense), B70 = Intel Arc Pro B70
   tile FA at 32K (20.5 vs 18.9 t/s); a wash at short context. Decode FA was COMPUTE-bound (EU FMA
   QK^T/PV), not DRAM-bound; XMX offloads that compute so the attention hits the KV-read floor.
   Decode-only (prefill, the bigger XMX target, is untouched). See the "XMX" section.
+- **XMX verify FA (MTP) = M=32/N=64/K=16 row_major works** (31.0 vs 35.6 t/s tile FA at 32K).
+  The N=64 col_major path was blocked but **row_major N=64 B-load exists** (see sycl-xmx-joint-matrix
+  skill). Still ~13% behind tile FA due to flash-decoding split overhead, but 8% better than M=16.
 
 ## Quant distribution (gguf-inspect)
 
@@ -445,11 +448,64 @@ GPUs (iGPU) - it just falls back to tile/vec. The device banner prints an `XMX|Y
   decodes (ne[1]==1 -> XMX decode FA runs), but the ONE main-model verify decodes the whole
   [id_last + draft] batch in a single graph pass (ne[1]=K+1, e.g. 5) -> the ne[1]==1 gate skips XMX,
   so verify attention runs on tile FA. The verify is ~86% of an MTP step, so it is the lever.
-- **Next step: extend the XMX decode FA M-tile to ne[1]=2..8** (the verify batch size). The kernel
-  already batches the gqa queries into one M=gqa tile; the extension batches the K+1 verify positions
-  too (M = gqa*(K+1) or a separate dim). Covers verify attention (the compute-bound slice); the GEMVs
-  already use the eSIMD M-kernel. See fattn-xmx-decode.cpp:191 (the ne[1]!=1 gate) + the support gate
-  (Q ne[1]==1).
+- **Done (2026-09-04): XMX verify FA implemented** (M=16/N=16/K=16, see "XMX verify FA" section
+  above). Working but ~wash vs tile FA at 37K (28.7 vs 29.2 t/s). N=64 tiles blocked by missing
+  backend builtin - the main perf lever is unavailable until oneAPI updates the XMX driver.
+
+### XMX verify FA (MTP ne[1]=2..8) - implemented, working (2026-09-04)
+
+The verify path is now implemented in fattn-xmx-decode.cpp (uncommitted). Env
+`GGML_SYCL_FA_XMX_DECODE=1` enables both decode + verify. `GGML_SYCL_XMX_VERIFY_OFF=1` disables
+verify only (A/B testing).
+
+- Kernel: M=16/N=16/K=16 tiles with NCHUNK M-dim chunking (K/V re-loaded per chunk). One work-group
+  per (KV split, KV head); all gqa*n_q_pos rows batched into 1-2 M=16 tiles. Combine kernel merges
+  per-split partials. Gate: gqa==6, gqa*n_q_pos<=32, D==256, Q F32/KV F16, single batch, no sinks.
+- **N=64 tiles are UNUSABLE on this backend.** `matrix_query` lists M=32/N=64/K=16/32 as supported,
+  but the JIT fails with `undefined reference to OpJointMatrixLoadINTEL_PackedB_ColumnMajor_SG16_32x64`
+  for BOTH global (`_v8i8_pi32_i32`) and local (`_local_v8i8_pi32_i32`) variants. LDS staging does
+  not help - the 32x64 col_major B-load builtin simply does not exist in oneAPI 2026.1. M=16/N=16/K=16
+  is the ceiling until a backend update adds it.
+- **Output tensor layout gotcha (cost a full debugging session):** FA dst is [D][n_q_heads][n_q_pos]
+  (ne[1]=heads, ne[2]=positions). The strides for the combine write must use nb[1] for head_stride
+  and nb[2] for pos_stride. Swapping them writes all but (head=0,pos=0) to wrong offsets -> garbled
+  output while the first head/pos looks correct in a debug dump.
+- **Perf A/B at ~37K context (Qwen3.8-27B Q6_K, B70 SYCL0, MTP n_max=6):**
+  XMX verify ON: 28.7 t/s | XMX verify OFF (tile FA): 29.2 t/s. Within ~2% - the smaller N=16 tile
+  requires more iterations than the tile FA's larger tiles, offsetting the XMX compute advantage.
+  Correct output ("Paris") confirmed. The kernel is functionally complete but not yet a speedup.
+
+### XMX Q6_K GEMV - DEAD END (2026-09-04)
+
+Attempted to offload the 82% MUL_MAT GEMV time to XMX hardware matrix engine. Built a full kernel
+(dmmv-q6k-xmx.cpp, template fn, M=4/N=16/K=16 tiles, LDS staging for A+B+Cout). All crashes and
+wrong-results bugs resolved (correct dequant verified vs CPU reference). **Final: 2.3 t/s vs 22.5
+eSIMD baseline - a 10x loss.** Root cause: XMX requires 2D tile access (M rows simultaneously) which
+forces scattered byte-granular reads per element instead of eSIMD's single `block_load<uint8_t,128>`
+per 256-elem block. Plus 2 LDS barriers per K-tile x 320 iterations. The memory pattern is
+structurally inferior for quantized data. XMX only wins where data is already natural FP16 row-major
+(FA attention). **Do not retry.** Kernel stashed to `.opencode/dmmv-q6k-xmx-stash.patch`.
+
+### eSIMD M-kernel v2 experiments - v1 is already optimal (2026-09-04)
+
+Attempted to beat the v1 M-kernel (43.5 t/s MTP @ 32K, `GGML_SYCL_Q6K_MMVQ_ESIMD_V2` gate):
+
+| variant | change | t/s | verdict |
+|---------|--------|-----|---------|
+| **v1 (baseline)** | fully unrolled, 1 block/iter, 4 lanes | **43.5** | best |
+| v2a | hoist all M y_vecs + 2 blocks/iter (ILP) | 14.0 | 3x LOSS: register spill (M=7 gives 56+56 y_regs + 16 deq + 7 acc = 135 regs) |
+| v2b | remove `#pragma unroll` on m-loop only | 35.6 | -18%: compiler needs the unrolled form to interleave loads with FMAs |
+
+**Conclusion:** the v1 kernel (fully unrolled, sequential per-token y-load + 8 FMA) is already the
+optimal structure for this hardware. The EU register file handles the unrolled M=7 case without
+spilling, and the compiler's instruction scheduler already overlaps the L2 y-loads with the dequant
+ALU pipeline. The remaining gap to full DRAM BW (608 GB/s) is the inherent Q6_K dequant cost
+(~60 SIMD instructions per 160B of weight: bit extraction, scale multiply) - a fixed ALU floor that
+can't be reduced without changing the quant format or precomputing into an intermediate buffer
+(extra memory pass, defeats the purpose).
+
+Gate left in place (default 0 = off) as documentation. Do not invest further in M-kernel structure
+changes for Q6_K on B70.
 
 ## Lessons / gotchas
 
