@@ -14,7 +14,7 @@ Model: `Qwen3.8-27B-UD-Q6_K.gguf` (20.46 GiB, dense), B70 = Intel Arc Pro B70
 - **Best plain decode = ~23.05 t/s** (Q6_K/Q5_K/Q8_0 eSIMD DMMV + 1-row small-N kernel +
   f16-convert skip, `76f80b445`). ~506 GB/s = 83% of spec; the practical plain-decode ceiling.
 - **Best decode = MTP speculation.** `--spec-type draft-mtp --spec-draft-n-max 6` gave ~30.8 t/s
-  (+34% vs plain) as of 2026-08-30, pushed to ~39.9 by the eSIMD M-kernel work (see "MTP"
+  (+34% vs plain) as of 2026-08-30, pushed to ~45.6 by the eSIMD M-kernel + fp16 work (see "MTP"
   section). It amortizes the 20.46 GB main-model read over accepted tokens - the only route past
   the DRAM ceiling. n_max=8 collapses to 4.8.
 - **Interleaved Q6_K weight layouts = DEAD END** (2026-08-30): every real variant loses to SoA
@@ -24,9 +24,10 @@ Model: `Qwen3.8-27B-UD-Q6_K.gguf` (20.46 GiB, dense), B70 = Intel Arc Pro B70
   tile FA at 32K (20.5 vs 18.9 t/s); a wash at short context. Decode FA was COMPUTE-bound (EU FMA
   QK^T/PV), not DRAM-bound; XMX offloads that compute so the attention hits the KV-read floor.
   Decode-only (prefill, the bigger XMX target, is untouched). See the "XMX" section.
-- **XMX verify FA (MTP) = M=32/N=64/K=16 row_major works** (31.0 vs 35.6 t/s tile FA at 32K).
-  The N=64 col_major path was blocked but **row_major N=64 B-load exists** (see sycl-xmx-joint-matrix
-  skill). Still ~13% behind tile FA due to flash-decoding split overhead, but 8% better than M=16.
+- **XMX verify FA (MTP) = M=32/N=64/K=16 row_major works** (31.0 vs 35.6 t/s tile FA at 32K,
+  pre-fp16-M-kernel numbers). The N=64 col_major B-load is missing from the backend, but **row_major
+  N=64 works** (see sycl-xmx-joint-matrix skill). Still ~13% behind tile FA due to flash-decoding
+  split overhead, but 8% better than M=16.
 
 ## Quant distribution (gguf-inspect)
 
@@ -204,20 +205,27 @@ small-batch verify, the wide-SIMD fp32 dequant-amortized-over-M kernel is the fa
 (matches the llm-scaler M-tile idea). Remaining levers: a 2-row variant for large-N FFN, and the
 llm-scaler qh pre-shuffle repack.
 
-### fp16 / bf16 M-kernel variants - NOT wins (2026-08-30)
-- **fp16** (`GGML_SYCL_Q6K_MMVQ_ESIMD_F16`, default 0): fp16 FMA is ~1.29x faster in isolation
-  (32-wide eSIMD probe, FMA-bound: fp32 ~20 TF, fp16 ~25.9 TF), but the **fp32->fp16 convert**
-  (activation is f32 in memory, converted every time) eats the savings -> **~0.2 t/s SLOWER**
-  (31.57/31.6 vs 31.76/31.8, i16, M=7, same acc len 6.00). Would only win if the activation were
-  already stored fp16. Left behind the gate, uncommitted.
-- **bf16** (`..._BF16`, default 0): bf16 is a near-free fp32 truncation (cheap convert - the right
-  intuition), but the B70 (Xe2) has **no fast bf16 FMA**: the probe reads fp32=20056, fp16=23590
-  (1.18x), **bf16=10405 GF (0.52x)**. So the bf16 FMA is HALF the fp32 rate -> **25.8 t/s**, far
-  worse than fp16 (loses on both the slow FMA and the convert). On the B70 the fp16 FMA is the only
-  fast 16-bit FMA; bf16 is not.
-- NOTE: the M-kernel low-precision path accumulates in T then reduces in fp32 (the bfloat16/half
-  simd `operator+` for the reduce is ambiguous; the scalar bfloat16 `operator+=` is unsupported in
-  the ESIMD context).
+### fp16 / bf16 M-kernel variants (2026-08-30, superseded 2026-09-04)
+- **fp16 in-loop convert** (original attempt, NOT committed): converted y fp32->fp16 inside the
+  kernel per-block per-token. The repeated convert ate the FMA savings -> ~0.2 t/s SLOWER.
+  This is SUPERSEDED: the fix was to pre-convert the activation ONCE outside the kernel (see below).
+- **bf16**: the B70 (Xe2) has **no fast bf16 FMA**: fp32=20056, fp16=23590 (1.18x),
+  bf16=10405 GF (0.52x). Dead end regardless of convert cost.
+
+### fp16 M-kernel with pre-converted activation - the win (2026-09-04, committed `2e6a2187b`)
+The prior fp16 failure was caused by converting y inside the kernel loop (per block per token).
+Fix: convert the tiny activation (M x ncols = 143KB) to fp16 ONCE before the main kernel. The
+M-kernel then loads y as `block_load<half, 256>` directly. Dequant produces fp32 (unchanged bit
+extraction), cast to half for the MAC. Accumulation in half (safe: post-LayerNorm activations keep
+the 256-elem sum well under fp16 max 65504). Final reduce converts back to fp32.
+
+Key benefit: **half the register file** (23 vs 46 VRs/lane for M=7) -> ~2.5x more WGs per EU ->
+better DRAM latency hiding. A/B (llama-bench --mtp -d 32768 -n 128, 2 runs):
+- fp32 M-kernel: 43.51 / 43.56 t/s
+- fp16 M-kernel: 45.62 / 45.66 t/s = **+4.8% reproducible**
+
+Correctness: byte-identical token output vs fp32 at temp=0 over 100 tokens at 32K context.
+Compile-gated on `GGML_SYCL_F16` (always active in the f16 build). No runtime env var.
 
 ### Q5_K + Q8_0 M-kernel (templated) - the win (2026-08-30, committed)
 Templatize the kernel on the quant (`dequantize_mul_mat_vec_reorder_esimd_m<T,M>`,
@@ -230,10 +238,10 @@ of `ggml_sycl_op_mul_mat_vec_q`: `GGML_SYCL_Q6K/Q5K/Q80_MMVQ_ESIMD` (all default
 - +Q5K, Q80 off: 39.38/39.33    ->  Q80 on: **39.85/39.91 (+0.5, +1.3%)**
 
 Q5_K is large (22% of bytes now on wide-SIMD M); Q8_0 (lm_head) small but consistent (groups don't
-overlap; within-run variance ~0.06 t/s). Net MTP decode **~39.9 t/s** (was ~31.8 fp32-M-only,
-~28.9 pre-M-kernel). fp16/bf16 remain stashed (no win). NOTE: MTP t/s is flag-dependent - i12
-(temp 1.0, -n 64) ~27.9-28.85 vs i5 (temp 0.0, -n 128) 30.8; different sampling/length, not a
-regression, A/B within one protocol.
+overlap; within-run variance ~0.06 t/s). Net MTP decode **~45.6 t/s** (fp16 M-kernel, llama-bench
+--mtp -d 32768; was ~39.9 fp32-M-only, ~31.8 fp32-M-Q6K-only, ~28.9 pre-M-kernel). NOTE: MTP t/s is
+flag-dependent - i12 (temp 1.0, -n 64) ~27.9-28.85 vs i5 (temp 0.0, -n 128) 30.8; different
+sampling/length, not a regression, A/B within one protocol.
 
 ## DRAM ceiling probe (and its traps)
 
@@ -442,15 +450,16 @@ GPUs (iGPU) - it just falls back to tile/vec. The device banner prints an `XMX|Y
 - MTP is now a first-class llama-bench mode (`--mtp`, committed `191548555`): `-d` sets the untimed
   established context, `-n` the timed generation, `--mtp-n-max` / `--mtp-p-min` the draft params. It
   runs the canonical common_speculative path (same as speculative-simple) on a single SYCL context.
-  **Baseline: `tg128 @ d32768` = 41.12 t/s** (n_max=4, p_min=0.6) vs non-MTP 32K tg128 = 21.58 t/s
-  -> ~1.9x. This matches/exceeds the cli MTP number (~39.9) and confirms the MTP path is correct.
+  **Current best: `tg128 @ d32768` = 45.6 t/s** (n_max=6, p_min=0.6, fp16 M-kernel) vs non-MTP 32K
+  tg128 = 21.58 t/s -> ~2.1x.
 - **Why the current XMX decode FA does NOT help MTP t/s:** the draft is a chain of single-token
   decodes (ne[1]==1 -> XMX decode FA runs), but the ONE main-model verify decodes the whole
   [id_last + draft] batch in a single graph pass (ne[1]=K+1, e.g. 5) -> the ne[1]==1 gate skips XMX,
   so verify attention runs on tile FA. The verify is ~86% of an MTP step, so it is the lever.
-- **Done (2026-09-04): XMX verify FA implemented** (M=16/N=16/K=16, see "XMX verify FA" section
-  above). Working but ~wash vs tile FA at 37K (28.7 vs 29.2 t/s). N=64 tiles blocked by missing
-  backend builtin - the main perf lever is unavailable until oneAPI updates the XMX driver.
+- **Done (2026-09-04): XMX verify FA implemented** (M=16/N=16/K=16 initial, later upgraded to
+  M=32/N=64/K=16 row_major once the correct B-load layout was found). Working but ~13% behind
+  tile FA at 37K due to flash-decoding split overhead. The N=64 col_major builtin is missing from
+  the backend, but row_major N=64 works fine (see sycl-xmx-joint-matrix skill).
 
 ### XMX verify FA (MTP ne[1]=2..8) - implemented, working (2026-09-04)
 
@@ -458,14 +467,14 @@ The verify path is now implemented in fattn-xmx-decode.cpp (uncommitted). Env
 `GGML_SYCL_FA_XMX_DECODE=1` enables both decode + verify. `GGML_SYCL_XMX_VERIFY_OFF=1` disables
 verify only (A/B testing).
 
-- Kernel: M=16/N=16/K=16 tiles with NCHUNK M-dim chunking (K/V re-loaded per chunk). One work-group
-  per (KV split, KV head); all gqa*n_q_pos rows batched into 1-2 M=16 tiles. Combine kernel merges
+- Kernel: initially M=16/N=16/K=16 tiles with NCHUNK M-dim chunking. Later upgraded to M=32/N=64/K=16
+  row_major (the fast path - K staged transposed in LDS, B loaded row_major from LDS). One work-group
+  per (KV split, KV head); all gqa*n_q_pos rows batched into a single M=32 tile. Combine kernel merges
   per-split partials. Gate: gqa==6, gqa*n_q_pos<=32, D==256, Q F32/KV F16, single batch, no sinks.
-- **N=64 tiles are UNUSABLE on this backend.** `matrix_query` lists M=32/N=64/K=16/32 as supported,
-  but the JIT fails with `undefined reference to OpJointMatrixLoadINTEL_PackedB_ColumnMajor_SG16_32x64`
-  for BOTH global (`_v8i8_pi32_i32`) and local (`_local_v8i8_pi32_i32`) variants. LDS staging does
-  not help - the 32x64 col_major B-load builtin simply does not exist in oneAPI 2026.1. M=16/N=16/K=16
-  is the ceiling until a backend update adds it.
+- **N=64 col_major B-load is missing on this backend.** `matrix_query` lists M=32/N=64/K=16/32 as
+  supported, but the JIT fails for the col_major variant. The ROW_MAJOR variant works fine (staging K
+  transposed in LDS first). This is NOT a ceiling - it's a layout choice. See sycl-xmx-joint-matrix
+  skill for details.
 - **Output tensor layout gotcha (cost a full debugging session):** FA dst is [D][n_q_heads][n_q_pos]
   (ne[1]=heads, ne[2]=positions). The strides for the combine write must use nb[1] for head_stride
   and nb[2] for pos_stride. Swapping them writes all but (head=0,pos=0) to wrong offsets -> garbled
@@ -486,26 +495,22 @@ per 256-elem block. Plus 2 LDS barriers per K-tile x 320 iterations. The memory 
 structurally inferior for quantized data. XMX only wins where data is already natural FP16 row-major
 (FA attention). **Do not retry.** Kernel stashed to `.opencode/dmmv-q6k-xmx-stash.patch`.
 
-### eSIMD M-kernel v2 experiments - v1 is already optimal (2026-09-04)
+### eSIMD M-kernel v2 structure experiments - fp32 v1 is optimal (2026-09-04)
 
-Attempted to beat the v1 M-kernel (43.5 t/s MTP @ 32K, `GGML_SYCL_Q6K_MMVQ_ESIMD_V2` gate):
+Attempted to beat the fp32 M-kernel (43.5 t/s MTP @ 32K) via structural changes:
 
 | variant | change | t/s | verdict |
 |---------|--------|-----|---------|
-| **v1 (baseline)** | fully unrolled, 1 block/iter, 4 lanes | **43.5** | best |
-| v2a | hoist all M y_vecs + 2 blocks/iter (ILP) | 14.0 | 3x LOSS: register spill (M=7 gives 56+56 y_regs + 16 deq + 7 acc = 135 regs) |
+| **fp32 v1 (baseline)** | fully unrolled, 1 block/iter, 4 lanes | **43.5** | best fp32 structure |
+| v2a | hoist all M y_vecs + 2 blocks/iter (ILP) | 14.0 | 3x LOSS: register spill (M=7 gives 135 VRs) |
 | v2b | remove `#pragma unroll` on m-loop only | 35.6 | -18%: compiler needs the unrolled form to interleave loads with FMAs |
 
-**Conclusion:** the v1 kernel (fully unrolled, sequential per-token y-load + 8 FMA) is already the
-optimal structure for this hardware. The EU register file handles the unrolled M=7 case without
-spilling, and the compiler's instruction scheduler already overlaps the L2 y-loads with the dequant
-ALU pipeline. The remaining gap to full DRAM BW (608 GB/s) is the inherent Q6_K dequant cost
-(~60 SIMD instructions per 160B of weight: bit extraction, scale multiply) - a fixed ALU floor that
-can't be reduced without changing the quant format or precomputing into an intermediate buffer
-(extra memory pass, defeats the purpose).
+**Conclusion:** for fp32, the v1 kernel structure is already optimal. The remaining gap to full DRAM
+BW was the inherent Q6_K dequant ALU cost (~60 SIMD ops per 160B). However, a PRECISION change (not
+structure) did yield a further win: the fp16 M-kernel (committed, +4.8%) halves register pressure
+enabling more WGs per EU. See the fp16 section above.
 
-Gate left in place (default 0 = off) as documentation. Do not invest further in M-kernel structure
-changes for Q6_K on B70.
+Do not invest further in fp32 M-kernel structure changes for Q6_K on B70.
 
 ## Lessons / gotchas
 
