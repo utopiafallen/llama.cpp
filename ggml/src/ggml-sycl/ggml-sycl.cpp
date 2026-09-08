@@ -5057,7 +5057,6 @@ static bool ggml_sycl_mul_mat_add_fused(ggml_backend_sycl_context & ctx, ggml_cg
     return true;
 }
 
->>>>>>> f49a5601b (sycl: env-gated q6_K GEMV fusions (residual add, GLU, GDN dt) + row GEMV)
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
     const mmid_row_mapping *__restrict__ row_mapping,
@@ -6205,8 +6204,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 continue;
             }
         }
-
-        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
 
         if (node->op == GGML_OP_ADD && g_ggml_sycl_fuse_gdn_dt &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
