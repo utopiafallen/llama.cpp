@@ -2437,23 +2437,33 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
         return;
     }
 
-    // small-batch Q5_K (MTP verify): eSIMD wide-SIMD M-kernel on the f32 activation, gated
+    // small-batch Q5_K (MTP verify): eSIMD wide-SIMD M-kernel, gated
     if (g_ggml_sycl_q5k_mmvq_esimd && src0->type == GGML_TYPE_Q5_K && src1->type == GGML_TYPE_F32 &&
         src1_ncols > 1 && src1_ncols <= 8 &&
         (ggml_tensor_extra_gpu *) dst->src[0]->extra &&
         ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+#ifdef GGML_SYCL_F16
+        dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_f16_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, (int) dst->ne[0], stream);
+#else
         dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
-                                                                  (int) src1_ncols, (int) dst->ne[0], stream);
+                                                                   (int) src1_ncols, (int) dst->ne[0], stream);
+#endif
         return;
     }
 
-    // small-batch Q8_0 (lm_head, MTP verify): eSIMD wide-SIMD M-kernel on the f32 activation, gated
+    // small-batch Q8_0 (lm_head, MTP verify): eSIMD wide-SIMD M-kernel, gated
     if (g_ggml_sycl_q80_mmvq_esimd && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 &&
         src1_ncols > 1 && src1_ncols <= 8 &&
         (ggml_tensor_extra_gpu *) dst->src[0]->extra &&
         ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+#ifdef GGML_SYCL_F16
+        dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd_m_f16_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, (int) dst->ne[0], stream);
+#else
         dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd_m_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
-                                                                  (int) src1_ncols, (int) dst->ne[0], stream);
+                                                                   (int) src1_ncols, (int) dst->ne[0], stream);
+#endif
         return;
     }
 

@@ -41,6 +41,16 @@ void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_dispatch(const void *vx, c
 #ifdef GGML_SYCL_F16
 // fp16 variant: MAC in half (lower register pressure, more WGs per EU)
 void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_f16_dispatch(const void *vx, const float *y,
+                                                                     float *dst, const int ncols, const int nrows,
+                                                                     const int M, const int dst_col_stride,
+                                                                     dpct::queue_ptr stream);
+
+void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_f16_dispatch(const void *vx, const float *y,
+                                                                    float *dst, const int ncols, const int nrows,
+                                                                    const int M, const int dst_col_stride,
+                                                                    dpct::queue_ptr stream);
+
+void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd_m_f16_dispatch(const void *vx, const float *y,
                                                                     float *dst, const int ncols, const int nrows,
                                                                     const int M, const int dst_col_stride,
                                                                     dpct::queue_ptr stream);
