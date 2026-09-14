@@ -249,6 +249,50 @@ static __dpct_inline__ void flash_attn_tile_load_tile(const sycl::half2 * const 
     ggml_sycl_unroll<7>{}(load);
 }
 
+// Q8_0 AoS tile load: reads block_q8_0 from global, dequants to FP16 in shared mem.
+// I = nbatch_fa (seq positions), J = nbatch_K (head_dim elements, must be multiple of 32).
+// stride_bytes = bytes per row (e.g. head_dim/32*34 for Q8_0).
+template <int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+static __dpct_inline__ void flash_attn_tile_load_tile_q8(const char * const __restrict__ KV_q8,
+                                                         sycl::half2 * const __restrict__ tile_KV,
+                                                         const int stride_bytes,
+                                                         const int i_sup) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int nblocks_row = J / 32;       // Q8_0 blocks per row
+    constexpr int nblocks_tot = I * nblocks_row;
+
+    const int tid      = item_ct1.get_local_id(1) * warp_size + item_ct1.get_local_id(2);
+    const int nthreads = nwarps * warp_size;
+
+    for (int b = tid; b < nblocks_tot; b += nthreads) {
+        const int i = b / nblocks_row;   // seq position within tile
+        const int j = (b % nblocks_row) * 32; // head_dim offset within tile
+
+        const char * blk_ptr = KV_q8 + i * stride_bytes + j / 32 * 34;
+
+        sycl::half2 vals[16];
+        if (!oob_check || i < i_sup) {
+            const ggml_half scale_h = *(const ggml_half *)blk_ptr;
+            const float scale = (float)scale_h;
+            const int8_t * qs = (const int8_t *)(blk_ptr + 2);
+#pragma unroll
+            for (int k = 0; k < 32; k += 2) {
+                vals[k/2] = sycl::half2((float)qs[k] * scale, (float)qs[k+1] * scale);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < 16; k++) vals[k] = sycl::half2(0.0f, 0.0f);
+        }
+
+        // Write to shared memory: row i, starting at half2 index j/2
+        sycl::half2 * dst = tile_KV + i * (J/2 + J_padding) + j / 2;
+#pragma unroll
+        for (int k = 0; k < 16; k++) {
+            dst[k] = vals[k];
+        }
+    }
+}
+
 template <int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __dpct_inline__ void flash_attn_tile_load_tile(const sycl::half2 * const __restrict__ KV,
                                                       float * const __restrict__ tile_KV,
@@ -330,7 +374,8 @@ static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
                                                     const int         k_VKQ_0,
                                                     const int         k_VKQ_sup,
                                                     const int         k_KQ_0,
-                                                    float *           KQ_acc) {
+                                                    float *           KQ_acc,
+                                                    const bool        q8_input = false) {
     auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int cpy_nb   = ggml_sycl_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
@@ -339,8 +384,14 @@ static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
-    flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    if (q8_input) {
+        flash_attn_tile_load_tile_q8<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+            ((const char *)K_h2 + int64_t(k_VKQ_0)*stride_K2*4 + k_KQ_0/32*34,
+             (sycl::half2 *)KV_tmp, stride_K2*4, k_VKQ_sup);
+    } else {
+        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    }
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
 #ifdef SYCL_FAST_FP16
@@ -428,9 +479,10 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                                                  float * const     KQ_sum,
                                                  T_acc * const     VKQ,
                                                  const int         k_VKQ_0,
-                                                 const int         k_VKQ_max,
-                                                 const int         col_Q_0,
-                                                 float *           KQ_max_new_shared) {
+                                                  const int         k_VKQ_max,
+                                                  const int         col_Q_0,
+                                                  float *           KQ_max_new_shared,
+                                                  const bool        q8_input = false) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int cpy_nb   = ggml_sycl_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
@@ -462,12 +514,12 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, q8_input);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, q8_input);
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -581,8 +633,14 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
-        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-            (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        if (q8_input) {
+            flash_attn_tile_load_tile_q8<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                ((const char *)V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2*4,
+                 (sycl::half2 *)KV_tmp, stride_V2*4, k_VKQ_sup - k0);
+        } else {
+            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        }
         item_ct1.barrier(sycl::access::fence_space::local_space);
 
 #ifdef SYCL_FAST_FP16
@@ -695,7 +753,8 @@ static void flash_attn_tile(const char *  Q,
                             const int32_t        ne33,
                             const int32_t        nb31,
                             const int32_t        nb32,
-                            const int64_t        nb33) {
+                            const int64_t        nb33,
+                            const bool           q8_input) {
 #ifdef SYCL_FLASH_ATTN
     // Skip unused kernel variants for faster compilation:
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -860,7 +919,7 @@ static void flash_attn_tile(const char *  Q,
 
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
-    // Main loop over KV cache:
+// Main loop over KV cache:
     const int k_VKQ_max = KV_max ? KV_max[sequence * item_ct1.get_group_range(2) + item_ct1.get_group(2)] : ne11;
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
@@ -870,7 +929,7 @@ static void flash_attn_tile(const char *  Q,
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
-                                            KQ_max_new_shared);
+                                            KQ_max_new_shared, q8_input);
             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
@@ -878,7 +937,7 @@ static void flash_attn_tile(const char *  Q,
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
-                                            KQ_max_new_shared);
+                                            KQ_max_new_shared, q8_input);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -889,7 +948,7 @@ static void flash_attn_tile(const char *  Q,
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
-                                            KQ_max_new_shared);
+                                            KQ_max_new_shared, q8_input);
         }
     }
 
@@ -1194,12 +1253,15 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
         // gqa_ratio that is not a power of 2 (e.g. 6) re-reads each KV head
         // gqa_ratio/ncols2 times under the power-of-2 ncols2 choice. At long KV the
         // read dominates, so use ncols2 = gqa_ratio when it has a config (1x re-read).
-        // Decode only (Q ne[1] == 1), gated by KV length: short ctx keeps the smaller
-        // ncols2 for its extra parallelism.
+        // No mask required: ncols2 grouping is a DRAM traffic optimization independent of masking.
         if constexpr (ggml_sycl_fattn_tile_get_config(DKQ, DV, 6) != 0) {
-            if (use_gqa_opt && gqa_ratio % 6 == 0 && Q->ne[1] == 1
+            if (gqa_ratio % 6 == 0 && Q->ne[1] <= 4
                 && g_ggml_sycl_fa_tile_gqa_min_kv > 0
                 && (int64_t) K->ne[1] >= g_ggml_sycl_fa_tile_gqa_min_kv) {
+                static int ncols6_debug = 0;
+                if (ncols6_debug++ < 3)
+                    GGML_LOG_INFO("[FA-TILE] using ncols2=6 path: gqa=%d Q_ne1=%lld KV=%lld\n",
+                            gqa_ratio, (long long)Q->ne[1], (long long)K->ne[1]);
                 constexpr int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, 6) / WARP_32_SIZE;
                 constexpr int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, 6);
                 launch_fattn<DV, 1, 6,

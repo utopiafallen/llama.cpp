@@ -14,6 +14,8 @@
 #include <cmath>
 #include <float.h>
 
+extern bool g_fattn_tile_q8_input;
+
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         sycl::half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -57,7 +59,8 @@ typedef void (*fattn_kernel_t)(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33);
+    const int64_t nb33,
+    const bool q8_input);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -874,7 +877,8 @@ static void lauch_kernel(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33) {
+    const int64_t nb33,
+    const bool q8_input) {
     GGML_UNUSED(local_mem_size);
     q->submit([&](sycl::handler &cgh) {
         cgh.parallel_for(
@@ -887,7 +891,7 @@ static void lauch_kernel(
                              max_bias, m0, m1, n_head_log2, logit_softcap, ne00,
                              ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11,
                              ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
-                             ne31, ne32, ne33, nb31, nb32, nb33);
+                             ne31, ne32, ne33, nb31, nb32, nb33, q8_input);
             });
     });
 }
@@ -943,31 +947,37 @@ void launch_fattn(
     size_t nb23 = V->nb[3];
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
-        const size_t bs = ggml_blck_size(K->type);
-        const size_t ts = ggml_type_size(K->type);
-
-        sycl::half * K_f16_ptr = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr
-                                                    : K_f16.alloc(ggml_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
-            to_fp16(K_data, K_f16_ptr, ggml_nelements(K), main_stream);
-
-            nb11 = nb11 * bs * sizeof(sycl::half) / ts;
-            nb12 = nb12 * bs * sizeof(sycl::half) / ts;
-            nb13 = nb13 * bs * sizeof(sycl::half) / ts;
+        if (K->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(K)) {
+            // Q8_0 fast path: skip conversion, kernel dequants tiles on-the-fly
+            g_fattn_tile_q8_input = true;
+            // nb11/nb12/nb13 stay as raw byte strides (no scaling)
         } else {
-            GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            const size_t bs = ggml_blck_size(K->type);
+            const size_t ts = ggml_type_size(K->type);
 
-            nb11 = K->ne[0] * sizeof(sycl::half);
-            nb12 = K->ne[1] * nb11;
-            nb13 = K->ne[2] * nb12;
+            sycl::half * K_f16_ptr = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr
+                                                        : K_f16.alloc(ggml_nelements(K));
+            if (ggml_is_contiguously_allocated(K)) {
+                to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
+                to_fp16(K_data, K_f16_ptr, ggml_nelements(K), main_stream);
+
+                nb11 = nb11 * bs * sizeof(sycl::half) / ts;
+                nb12 = nb12 * bs * sizeof(sycl::half) / ts;
+                nb13 = nb13 * bs * sizeof(sycl::half) / ts;
+            } else {
+                GGML_ASSERT(K->nb[0] == ts);
+                to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                to_fp16(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+
+                nb11 = K->ne[0] * sizeof(sycl::half);
+                nb12 = K->ne[1] * nb11;
+                nb13 = K->ne[2] * nb12;
+            }
+            K_data = (char *) K_f16_ptr;
         }
-        K_data = (char *) K_f16_ptr;
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -976,6 +986,9 @@ void launch_fattn(
             nb21   = nb11;
             nb22   = nb12;
             nb23   = nb13;
+        } else if (V->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(V)) {
+            // Q8_0 fast path: skip conversion
+            g_fattn_tile_q8_input = true;
         } else {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
@@ -1135,8 +1148,9 @@ void launch_fattn(
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,
         mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
-        mask ? mask->nb[3] : 0);
+        mask ? mask->nb[3] : 0, g_fattn_tile_q8_input);
     SYCL_CHECK(0);
+    g_fattn_tile_q8_input = false;
 
     if (stream_k) {
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
