@@ -57,6 +57,14 @@ Never put a private key in this skill or in the repo.
 
 ## Running commands
 
+**CRITICAL: Before ANY `taskkill` of llama-server, check which PIDs are running and
+exclude the user's instance.** The user's long-running server is on SYCL1 (RDP-Tcp#0
+session). Always run `ssh b70 "tasklist | findstr /i llama-server"` first, identify
+the user's PID (the one on RDP-Tcp#0 or with ~15GB+ RAM), then use
+`taskkill /f /im llama-server.exe /fi "PID ne <user_pid>"`. NEVER use bare
+`taskkill /f /im llama-server.exe` - it will kill the user's server.
+The user's PID changes when they restart, so re-check every time.
+
 ```
 # simple
 ssh b70 "hostname & whoami"
