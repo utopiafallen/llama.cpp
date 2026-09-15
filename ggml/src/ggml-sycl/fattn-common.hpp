@@ -946,8 +946,12 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
+    static const bool disable_q8_tile = []() {
+        return ggml_sycl_get_env("GGML_SYCL_FATTN_TILE_Q8", 1) == 0;
+    }();
+
     if (need_f16_K && K->type != GGML_TYPE_F16) {
-        if (K->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(K)) {
+        if (!disable_q8_tile && K->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(K)) {
             // Q8_0 fast path: skip conversion, kernel dequants tiles on-the-fly
             g_fattn_tile_q8_input = true;
             // nb11/nb12/nb13 stay as raw byte strides (no scaling)
@@ -986,7 +990,7 @@ void launch_fattn(
             nb21   = nb11;
             nb22   = nb12;
             nb23   = nb13;
-        } else if (V->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(V)) {
+        } else if (!disable_q8_tile && V->type == GGML_TYPE_Q8_0 && ggml_is_contiguously_allocated(V)) {
             // Q8_0 fast path: skip conversion
             g_fattn_tile_q8_input = true;
         } else {

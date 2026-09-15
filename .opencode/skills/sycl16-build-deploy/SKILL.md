@@ -75,19 +75,29 @@ llama-server.exe --device SYCL0 -m D:\model.md -c 170000 \
 
 **Slot save/restore workflow (do NOT use `slot_save` in the request body - it is ignored):**
 
-1. Prefill: send the full chat/completion request (e.g. `TestPrompt152k.json` on desktop)
-   to build up the KV cache. This takes several minutes at 144K context.
-2. Save: `curl POST /slots/0?action=save` with JSON body `{"filename":"my-save"}`
-3. Erase (optional): `curl POST /slots/0?action=erase`
-4. Restore: `curl POST /slots/0?action=restore` with JSON body `{"filename":"my-save"}`
-5. Decode test: send a completion request with the same prompt but `max_tokens` set to
-   the desired decode length (e.g. 512). Use the modified JSON on desktop
-   (`TestPrompt152k-512.json`).
+The server is STATELESS. Each completion request must carry the full conversation history.
+The slot cache only persists the KV cache, NOT the prompt/token state.
+
+1. **First run (establishes baseline + creates slot save):**
+   - Send the full chat/completion request (e.g. `TestPrompt152k.json`) with a small
+     `max_tokens` (e.g. 32-512). This does the full prefill AND generates decode tokens.
+     The decode timing from THIS run is valid.
+   - **Use a long bash timeout (600000+ ms)** - initial prefill at 144K takes minutes.
+   - Save the slot: `curl POST /slots/0?action=save` with `{"filename":"my-save"}`
+2. **After server restart (re-test with changes):**
+   - Restore: `curl POST /slots/0?action=restore` with `{"filename":"my-save"}`
+     (loads KV cache only, takes seconds instead of minutes)
+   - Send the SAME full prompt JSON again (same messages/conversation). The prefix hits
+     the restored KV cache (fast), then decode begins. Measure the decode timing.
+3. **Do NOT send a short/" " prompt after restore** - that only has 1 token of input,
+   the server doesn't know about the 144K context from the request's perspective.
 
 Read results from server log `print_timing` lines, NOT the API response
 (`eval_tokens_per_second` in the JSON is often 0.0 for speculative/chat requests).
 
 Decode baseline (2026-09-15, fresh 144K prefill, SYCL1): **8.59 t/s** (116 ms/tok).
+Test prompts on desktop: `TestPrompt152k.json` (full), `TestPrompt152k-512.json`,
+`TestPrompt152k-32.json`, `test-64k.json` (~25K tokens).
 
 ## 4. Correctness sanity check (after any kernel change)
 
