@@ -111,8 +111,8 @@ is: background the ssh in local bash, sleep, health-check from a second ssh, the
 the first ssh PID:
 
 ```bash
-# Start server (no MTP) on SYCL0, port 8082, with Q8_0 KV cache:
-ssh b70 "cmd.exe /C \"cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 && set GGML_SYCL_PROFILE=0 && llama-server.exe --device SYCL0 -m D:\model.md -c 170000 -ctk q8_0 -ctv q8_0 --jinja --port 8082 -np 1 --no-ui --gpu-heartbeat 5 > server-test.log 2>&1 &\"" &
+# Start server on SYCL0, port 8082 (see sycl16-build-deploy skill for full params):
+ssh b70 "cmd.exe /C \"cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 && set GGML_SYCL_PROFILE=0 && llama-server.exe --device SYCL0 -m D:\model.md -c 170000 -ctk q8_0 -ctv q8_0 --jinja --port 8082 -np 1 --no-ui --gpu-heartbeat 5 --load-mode none --slot-save-path D:\slot-save\ --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.0 --min-p 0.00 --repeat-penalty 1.0 > server-test.log 2>&1 &\"" &
 SSH_PID=$!
 sleep 55
 ssh b70 "curl -s http://localhost:8082/health"   # expect {"status":"ok"}
@@ -128,10 +128,10 @@ With MTP speculative decoding (post-rebase flag names):
 ```
 (Old names `-sp mtp` and `--draft-max N` no longer exist.)
 
-Completion request with slot-save load:
-```bash
-ssh b70 "curl -s http://localhost:8082/completion -d \"{\\\"prompt\\\":\\\"hello\\\",\\\"stream\\\":false,\\\"max_tokens\\\":32,\\\"slot_save\\\":\\\"D:\\\\slot-save\\\\fa-decode-142k\\\"}\""
-```
+**Slot save/restore: use explicit endpoints, NOT `slot_save` in the request body
+(it is silently ignored).** See `sycl16-build-deploy` skill for the full workflow.
+Test prompts: `C:\Users\LocalAdmin\Desktop\TestPrompt152k.json` (full prefill),
+`TestPrompt152k-512.json` (512-token decode after restore).
 
 ## GPU per-op profiling (GGML_SYCL_PROFILE)
 

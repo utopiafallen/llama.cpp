@@ -59,6 +59,36 @@ The trailing `build: <commit>` line confirms which binary actually ran.
   `set VAR=x && llama-bench.exe ...`
 - Model load takes ~30-60 s; give ssh bash calls a 600000 ms timeout.
 
+## 3b. llama-server for decode perf testing
+
+Full parameter list for a decode performance test server:
+
+```
+llama-server.exe --device SYCL0 -m D:\model.md -c 170000 \
+  -ctk q8_0 -ctv q8_0 \
+  --jinja --port 8082 -np 1 --no-ui \
+  --gpu-heartbeat 5 --load-mode none \
+  --slot-save-path D:\slot-save\ \
+  --temp 1.0 --top-p 0.95 --top-k 20 \
+  --presence-penalty 1.0 --min-p 0.00 --repeat-penalty 1.0
+```
+
+**Slot save/restore workflow (do NOT use `slot_save` in the request body - it is ignored):**
+
+1. Prefill: send the full chat/completion request (e.g. `TestPrompt152k.json` on desktop)
+   to build up the KV cache. This takes several minutes at 144K context.
+2. Save: `curl POST /slots/0?action=save` with JSON body `{"filename":"my-save"}`
+3. Erase (optional): `curl POST /slots/0?action=erase`
+4. Restore: `curl POST /slots/0?action=restore` with JSON body `{"filename":"my-save"}`
+5. Decode test: send a completion request with the same prompt but `max_tokens` set to
+   the desired decode length (e.g. 512). Use the modified JSON on desktop
+   (`TestPrompt152k-512.json`).
+
+Read results from server log `print_timing` lines, NOT the API response
+(`eval_tokens_per_second` in the JSON is often 0.0 for speculative/chat requests).
+
+Decode baseline (2026-09-15, fresh 144K prefill, SYCL1): **8.59 t/s** (116 ms/tok).
+
 ## 4. Correctness sanity check (after any kernel change)
 
 Throughput and perplexity both fail to flag garbled output; verify real text:
