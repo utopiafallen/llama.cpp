@@ -103,11 +103,50 @@ ssh b70 "C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16\llama-bench.exe --device S
 - llama.cpp SYCL f16 build + runtime dlls: `C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16`
   (llama-bench.exe, llama-server.exe, ggml-sycl.dll, sycl9.dll, ...). Build + deploy
   workflow: see the `sycl16-build-deploy` skill.
-- Model: `D:\huggingface_cache\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\27af057ecb382ddfea5d12837360a8980560e3ed\Qwen3.8-27B-UD-Q6_K.gguf`
-  (20.5 GiB dense Q6_K).
-- Helper scripts in the deploy dir: run-llama-bench.ps1 (formal bench, -b 2048 -p 32768
-  --device SYCL0), run-qwen3.8-multi.ps1 (2-GPU server, 524k ctx, MTP draft on SYCL1),
-  sycl.conf (device allowlist).
+- Model symlink: `D:\model.md` -> Qwen3.8-27B-UD-Q6_K.gguf (20.5 GiB dense Q6_K).
+  Use this short path in all commands - avoids quote-escaping issues over SSH with the
+  long huggingface_cache path. If missing, recreate:
+  `mklink D:\model.md "D:\huggingface_cache\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\<hash>\Qwen3.8-27B-UD-Q6_K.gguf"`
+- Slot saves: `D:\slot-save\fa-decode-142k` (142K KV), `D:\slot-save\kv-64k` (64K KV).
+- Helper scripts in the deploy dir: run-llama-bench.ps1, sycl.conf.
+
+## Launching llama-server over SSH
+
+`start /B`, `Start-Process`, and `wmic` all fail or hang over SSH. The working pattern
+is: background the ssh in local bash, sleep, health-check from a second ssh, then kill
+the first ssh PID:
+
+```bash
+# Start server (no MTP) on SYCL0, port 8082, with Q8_0 KV cache:
+ssh b70 "cmd.exe /C \"cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 && set GGML_SYCL_PROFILE=0 && llama-server.exe --device SYCL0 -m D:\model.md -c 170000 -ctk q8_0 -ctv q8_0 --jinja --port 8082 -np 1 --no-ui > server-test.log 2>&1 &\"" &
+SSH_PID=$!
+sleep 55
+ssh b70 "curl -s http://localhost:8082/health"   # expect {"status":"ok"}
+# ... run tests ...
+# Kill only my PID (never /IM):
+ssh b70 "taskkill /F /PID <my_pid>"
+kill $SSH_PID 2>/dev/null
+```
+
+With MTP speculative decoding (post-rebase flag names):
+```
+--spec-type draft-mtp --spec-draft-n-max 4
+```
+(Old names `-sp mtp` and `--draft-max N` no longer exist.)
+
+Completion request with slot-save load:
+```bash
+ssh b70 "curl -s http://localhost:8082/completion -d \"{\\\"prompt\\\":\\\"hello\\\",\\\"stream\\\":false,\\\"max_tokens\\\":32,\\\"slot_save\\\":\\\"D:\\\\slot-save\\\\fa-decode-142k\\\"}\""
+```
+
+## GPU per-op profiling (GGML_SYCL_PROFILE)
+
+Set `GGML_SYCL_PROFILE=1` in the server launch env. The profiler calls `stream->wait()`
+after each op, serializing GPU execution and attributing wall time to each op type.
+Output is written to `sycl-profile.log` (relative to CWD) via `ggml_sycl_profile_write`.
+
+Warning: this adds ~10ms/step overhead (serialization). Use for breakdowns, not for
+throughput numbers. For throughput, use `GGML_SYCL_PROFILE=0`.
 
 ## Network share (\\epycdesktop\media)
 

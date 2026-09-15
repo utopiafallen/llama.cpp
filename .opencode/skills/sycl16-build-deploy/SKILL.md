@@ -49,32 +49,31 @@ Connection details for the B70 live in the `battlematrix-ssh` skill.
 
 ## 3. Smoke test (B70)
 
-Model: `D:\huggingface_cache\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\27af057ecb382ddfea5d12837360a8980560e3ed\Qwen3.8-27B-UD-Q6_K.gguf` (20.5 GiB, dense Q6_K)
+Model: `D:\model.md` (symlink to Qwen3.8-27B-UD-Q6_K.gguf, 20.5 GiB dense Q6_K)
 
 ```
-ssh b70 'cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 & llama-bench.exe --device SYCL0 -m "D:\huggingface_cache\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\27af057ecb382ddfea5d12837360a8980560e3ed\Qwen3.8-27B-UD-Q6_K.gguf" -p 256 -n 32'
+ssh b70 "cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 & llama-bench.exe --device SYCL0 -m D:\model.md -p 256 -n 32"
 ```
 
-Baseline (2026-08-21, pre-optimization, single GPU): pp256 ~753 t/s, tg32 ~21.5 t/s.
+Baseline (2026-09-14, Q8_0 FA tile load, single GPU): pp32768 ~931 t/s, tg32 ~22.7 t/s.
+Pre-Q8_0-fa-fix baseline: pp256 ~753 t/s, tg32 ~21.5 t/s.
 The trailing `build: <commit>` line confirms which binary actually ran.
 
 - Device pinning: `--device SYCL0` / `--device SYCL0,SYCL1`. This build REJECTS
   `--devices` (error: invalid parameter). The flag is singular, comma-separated list.
 - Machine has 2x B70 - always pin with --device, or results are confounded.
-- A/B env vars (from run-llama-bench.ps1): GGML_SYCL_ENABLE_ESIMD, GGML_SYCL_Q6K_GEMV_ROW,
+- A/B env vars: GGML_SYCL_ENABLE_ESIMD, GGML_SYCL_Q6K_GEMV_ROW,
   GGML_SYCL_PRIORITIZE_DMMV, GGML_SYCL_FUSE_MM_ADD, GGML_SYCL_FUSE_MM_GLU,
   GGML_SYCL_FUSE_GDN_DT, GGML_SYCL_PROFILE, GGML_SYCL_PROFILE_FILE. In cmd:
   `set VAR=x && llama-bench.exe ...`
 - Model load takes ~30-60 s; give ssh bash calls a 600000 ms timeout.
-- Formal benchmark script on the B70: run-llama-bench.ps1
-  (`-b 2048 -p 32768 --device SYCL0` + the env vars above).
 
 ## 4. Correctness sanity check (after any kernel change)
 
 Throughput and perplexity both fail to flag garbled output; verify real text:
 
 ```
-ssh b70 'cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 & llama-cli.exe --device SYCL0 --simple-io --no-warmup -c 2048 --reasoning off -m "D:\huggingface_cache\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\27af057ecb382ddfea5d12837360a8980560e3ed\Qwen3.8-27B-UD-Q6_K.gguf" -st -p "The capital of France is" -n 48'
+ssh b70 "cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 & llama-cli.exe --device SYCL0 --simple-io --no-warmup -c 2048 --reasoning off -m D:\model.md -st -p \"The capital of France is\" -n 48"
 ```
 
 Expected: a coherent answer starting "The capital of France is **Paris**.", then
