@@ -59,11 +59,9 @@ Never put a private key in this skill or in the repo.
 
 **CRITICAL: Before ANY `taskkill` of llama-server, check which PIDs are running and
 exclude the user's instance.** The user's long-running server is on SYCL1 (RDP-Tcp#0
-session). Always run `ssh b70 "tasklist | findstr /i llama-server"` first, identify
-the user's PID (the one on RDP-Tcp#0 or with ~15GB+ RAM), then use
-`taskkill /f /im llama-server.exe /fi "PID ne <user_pid>"`. NEVER use bare
-`taskkill /f /im llama-server.exe` - it will kill the user's server.
-The user's PID changes when they restart, so re-check every time.
+session). Always run `ssh b70 "tasklist /FI \"IMAGENAME eq llama-server.exe\" /FO CSV"`
+first. Identify sessions: RDP-Tcp#0 = user's (NEVER kill), Services = mine (safe to kill).
+NEVER use bare `taskkill /f /im llama-server.exe`. The user's PID changes on restart.
 
 ```
 # simple
@@ -86,11 +84,7 @@ ssh b70 "C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16\llama-bench.exe --device S
   - sshd resets ("Connection reset by peer") while ping still answers. Check
   `ssh b70 "tasklist | findstr /i llama"` FIRST; if any llama process is up, stop and ask
   before launching another. (Note: `wmic` is gone on this Windows build; use `tasklist`.)
-- **Avoid VRAM idle drain in harnesses:** the user wants `--gpu-heartbeat 5` passed to
-  llama-cli / llama-server, BUT the deployed `llama-cpp-sycl16` build does NOT have that flag
-  (it errors `invalid argument: --gpu-heartbeat`). It only has `--warmup,--no-warmup` (warmup
-  on by default). Do NOT pass `--gpu-heartbeat` to this build; if a rebuild adds it, pass
-  `--gpu-heartbeat 5` then.
+- **Avoid VRAM idle drain:** always pass `--gpu-heartbeat 5` to llama-cli / llama-server.
 - Long runs: the local bash tool has its own timeout, so pass an explicit `timeout`
   (e.g. 600000 ms) for multi-minute llama-bench runs. For very long jobs, detach on the
   remote: `start /min cmd /c "<cmd> > G:\bench.log 2>&1"` then poll the log with a second
@@ -118,7 +112,7 @@ the first ssh PID:
 
 ```bash
 # Start server (no MTP) on SYCL0, port 8082, with Q8_0 KV cache:
-ssh b70 "cmd.exe /C \"cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 && set GGML_SYCL_PROFILE=0 && llama-server.exe --device SYCL0 -m D:\model.md -c 170000 -ctk q8_0 -ctv q8_0 --jinja --port 8082 -np 1 --no-ui > server-test.log 2>&1 &\"" &
+ssh b70 "cmd.exe /C \"cd /d C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16 && set GGML_SYCL_PROFILE=0 && llama-server.exe --device SYCL0 -m D:\model.md -c 170000 -ctk q8_0 -ctv q8_0 --jinja --port 8082 -np 1 --no-ui --gpu-heartbeat 5 > server-test.log 2>&1 &\"" &
 SSH_PID=$!
 sleep 55
 ssh b70 "curl -s http://localhost:8082/health"   # expect {"status":"ok"}
@@ -150,13 +144,6 @@ throughput numbers. For throughput, use `GGML_SYCL_PROFILE=0`.
 
 ## Network share (\\epycdesktop\media)
 
-- Hosts the CORSAIR AI drive; `\\epycdesktop\media\CORSAIRAI Backup\llama-cpp-sycl16` is
-  the dev->B70 staging dir (dev box pushes via copy-sycl16.bat, B70 pulls via its own
-  copy-sycl16.bat).
-- The dev box authenticates with a stored cmdkey credential
-  (`Domain:target=epycdesktop`, user 122abalone\administrator).
-- The B70's `localadmin` has NO stored credential (cmdkey empty). The user's interactive
-  RDP session (RDP logon as LocalAdmin, session 2) holds the password in its token and
-  sees mapped drive Z:; my key-based ssh logon gets Access denied on the share no matter
-  what, because a key logon has no password to piggyback on.
-- Therefore deploy via scp from the dev box (see sycl16-build-deploy), not via the share.
+- Hosts the CORSAIR AI drive. The B70's `localadmin` has NO stored credential for the
+  share; key-based ssh logon gets Access denied. Use scp from the dev box instead
+  (see `sycl16-build-deploy` skill).

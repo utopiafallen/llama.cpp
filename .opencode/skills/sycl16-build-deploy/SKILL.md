@@ -12,40 +12,31 @@ Connection details for the B70 live in the `battlematrix-ssh` skill.
 
 - oneAPI env is required. WSL interop mangles double quotes in argv to Windows processes
   (they arrive as `\"`), so do NOT inline `setvars.bat` in the ssh/cmd command line.
-  Use the wrapper bat (created 2026-08-21): `G:\llama-cpp-src\build-sycl16-oneapi.bat`
-  (calls setvars.bat intel64 vs2026, then build-sycl16.bat).
-- Run: `cmd.exe /C "G:\llama-cpp-src\build-sycl16-oneapi.bat"` with a long bash timeout
-  (SYCL recompile of ggml-sycl.dll is slow; no-op if nothing changed).
-- Targets (build-sycl16.bat): llama-server, ggml-rpc-server, llama-bench, llama-perplexity,
-  llama-cli (llama-cli was added 2026-08-21 for output-correctness checks;
-  llama-bench/perplexity both miss garbled output).
+  Use the wrapper bat: `G:\llama-cpp-src\build-full-oneapi.bat`
+  (calls setvars.bat intel64 vs2026, then cmake --build with all targets).
+- Run: `cmd.exe /C "G:\llama-cpp-src\build-full-oneapi.bat"` with a long bash timeout
+  (SYCL recompile of ggml-sycl.dll is slow; CMake handles incremental builds natively,
+  no-op if nothing changed).
+- Targets: llama-server, llama-cli, llama-bench (all in one cmake --build invocation).
 - Output: `G:\llama-cpp-src\build-x64-windows-sycl-release-f16\bin\`
-- Reconfigure ONLY when build flags change: `cmake-sycl.bat` (needs oneAPI env; it sets
-  LEVEL_ZERO_V1_SDK_PATH, preset x64-windows-sycl-release-f16,
-  GGML_SYCL_DEVICE_ARCH=bmg_g21, GGML_RPC=ON). It has no wrapper bat yet - make one the
-  same way as build-sycl16-oneapi.bat if needed.
+- **NEVER delete .obj files or individual build artifacts to force a "targeted" rebuild.**
+  CMake already performs correct incremental builds. Deleting objects causes link errors,
+  stale ABI mismatches, and wastes the full recompile time you were trying to save.
+- Reconfigure ONLY when build flags change: `cmake-sycl-oneapi.bat` (needs oneAPI env;
+  sets LEVEL_ZERO_V1_SDK_PATH, preset x64-windows-sycl-release-f16,
+  GGML_SYCL_DEVICE_ARCH=bmg_g21, GGML_RPC=ON). After a reconfigure, ALL dlls change.
 
 ## 2. Deploy (dev -> B70, via scp)
 
 - B70 deploy dir: `C:\Users\LocalAdmin\Desktop\llama-cpp-sycl16`
-- From WSL, using the `b70` ssh alias (key auth, see battlematrix-ssh skill):
+- **Always copy the FULL binary set.** Never pick individual files you think changed.
+  Stale companion DLLs cause ABI mismatches (exe loads, prints "Loading model...", then
+  fastfail 0xC0000409). The full set is ~20 files and copies in seconds:
   ```
-  scp /mnt/g/llama-cpp-src/build-x64-windows-sycl-release-f16/bin/<changed>.exe \
-      /mnt/g/llama-cpp-src/build-x64-windows-sycl-release-f16/bin/<changed>.dll \
-      b70:"C:/Users/LocalAdmin/Desktop/llama-cpp-sycl16/"
+  scp /mnt/g/llama-cpp-src/build-x64-windows-sycl-release-f16/bin/* b70:"C:/Users/LocalAdmin/Desktop/llama-cpp-sycl16/"
   ```
-- Verify with MD5 on both sides: dev box `cmd.exe /C "certutil -hashfile <f> MD5"`,
-  B70 `ssh b70 "certutil -hashfile <f> MD5"`.
-- IMPORTANT: after a CMake RECONFIGURE (cmake-sycl-oneapi.bat) the whole build is
-  recompiled, so ALL the ggml-*/llama-*.dll change together. Deploying only the
-  changed .dll/.exe then leaves stale companion dlls on the B70 -> ABI mismatch ->
-  the exe runs, prints "Loading model...", then dies with EXIT=-1073740791
-  (0xC0000409 fastfail). Symptom is easy to misread as a kernel bug. Fix: after any
-  reconfigure, deploy the ENTIRE bin (`scp bin/*.dll bin/*.exe b70:...`), not just
-  the changed files. (The runtime dlls sycl9/mkl/tbb/ur_* are NOT in bin/ - leave them.)
-- Do NOT use the SMB share (\\epycdesktop\media\...) from an ssh logon: access denied.
-  The user's interactive RDP session can reach it, but the key-based ssh logon has no
-  stored credential (cmdkey empty) and cannot. scp is the working deploy path.
+- Before deploying, kill ONLY your own llama-server (Services session). See
+  `battlematrix-ssh` skill for the PID identification rules.
 
 ## 3. Smoke test (B70)
 
