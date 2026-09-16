@@ -9,15 +9,16 @@ Model: `Qwen3.8-27B-UD-Q6_K.gguf` (20.46 GiB, dense Q6_K), B70 = Intel Arc Pro B
 (32GB GDDR6, 256-bit @ 19 Gbps = 608 GB/s spec, 16MB L2).
 Symlink: `D:\model.md` on the B70.
 
-## Current best (2026-09-15, post-XMX-Q8_0-decode)
+## Current best (2026-09-16, post-batch2-XMX-Q8_0-decode)
 
 | config | context | t/s | ms/tok | notes |
 |--------|---------|-----|--------|-------|
 | Tile FA (eSIMD) | 51K | 14.71 | 67.9 | baseline, Q8_0 per-tile dequant |
-| XMX decode + per-tile Q8_0 dequant | 51K | **15.97** | **62.6** | best with Q8_0 KV |
+| XMX decode + batch=2 Q8_0 dequant | 51K | **16.25** | **61.5** | best with Q8_0 KV |
 | XMX decode + FP16 KV (no dequant) | 51K | 18.42 | 54.3 | ceiling, won't fit at 256K |
 | Tile FA (eSIMD) | 144K | 8.6 | 116.0 | |
-| XMX decode + per-tile Q8_0 dequant | 144K | **10.18** | **98.2** | +18% vs tile at long ctx |
+| XMX decode + per-tile Q8_0 dequant | 144K | 10.18 | 98.2 | +18% vs tile at long ctx |
+| XMX decode + batch=2, profiled | 152K | **9.97** | **100.3** | 735 tok, serialized profile |
 
 **CRITICAL: Previous "22.6 t/s at 142K" numbers were INVALID.** The `slot_save` parameter in
 the completion request body is silently ignored by llama-server. All prior slot-save tests
@@ -25,24 +26,30 @@ were measuring zero-context decode. Real long-context decode is 8.6-10.2 t/s at 
 
 MTP is parked (draft state save/restore has size-mismatch issues).
 
-## Per-op GPU breakdown at 144K (GGML_SYCL_PROFILE=1, serialized, XMX decode FA active)
+## Per-op GPU breakdown at 152K (GGML_SYCL_PROFILE=1, serialized, XMX decode FA active)
 
 Method: `stream->wait()` after each op in graph_compute. Times are CPU-enqueue + GPU-exec.
 Profiling serializes execution; use for breakdowns only, not throughput numbers.
 
-| Op | Time | % | Notes |
-|---|---|---|---|
-| MUL_MAT | 533.47ms | 79.9% | weight streaming (20GB), dominates serialized time |
-| FLASH_ATTN_EXT | 73.86ms | 11.1% | 32 ops x ~2.3ms, XMX per-tile Q8_0 dequant |
-| GLU | 14.50ms | 2.2% | FFN activation |
-| ADD | 8.55ms | 1.3% | residuals |
-| SSM_CONV | 8.26ms | 1.2% | GDN conv |
-| CONCAT | 6.75ms | 1.0% | GDN conv_input |
-| misc | ~22ms | ~3% | UNARY, ROPE, CONT, RMS_NORM, etc |
-| **Total** | **667.41ms** | | pipelined = 98ms/tok (10.18 t/s) |
+| Op | Time (735 tok) | ms/tok | % | Notes |
+|---|---|---|---|---|
+| MUL_MAT | 59774ms | 81.3 | 60% | 255K ops, avg 0.23ms, weight streaming |
+| FLASH_ATTN_EXT | 38838ms | 52.8 | 39% | 16.4K ops, avg 2.37ms, XMX Q8_0 dequant |
+| GLU | 425ms | 0.58 | 0.4% | FFN activation |
+| ADD | 417ms | 0.57 | 0.4% | residuals |
+| SSM_CONV | 312ms | 0.43 | 0.3% | GDN conv |
+| CONCAT | 174ms | 0.24 | 0.2% | GDN conv_input |
+| misc | ~330ms | ~0.45 | 0.4% | UNARY, ROPE, CONT, GET_ROWS, etc |
+| **Total serialized** | **~100212ms** | **136.3** | | wall-clock = 100.3ms/tok (9.97 t/s) |
 
-FA is 32 ops (one per full-attention layer). Each XMX FA op at 144K: ~2.3ms
-(563 splits x 4 kv_heads WGs, SPLIT=256, GQA=6, D=256).
+FA grew from 11% (at 51K) to 39% (at 152K) of big-op time. FA scales linearly with n_kv.
+MUL_MAT per-op time is CONSTANT (0.23ms avg regardless of context). The "slowness" at
+long context is entirely FA growth, not MUL_MAT degradation.
+
+**MUL_MAT analysis:** 346 ops/token, each ~0.23ms. Total weight data ~20.5 GiB read per
+token. Effective bandwidth: 20500MB / 81.3ms = 252 GB/s (41% of 608 GB/s spec). Kernel
+already uses reordered Q6_K layout (16 sub_groups/WG, coalesced access). The 41% is the
+practical ceiling for Q6_K GEMV on B70 (scattered byte-level dequant, DRAM page conflicts).
 
 ## XMX decode FA with Q8_0 KV (committed 2026-09-15)
 
