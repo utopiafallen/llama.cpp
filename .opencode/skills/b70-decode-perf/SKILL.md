@@ -79,6 +79,14 @@ Backend lacks INT8 matrix builtins. Cannot avoid FP16 staging for XMX operands.
   co-issue claim. "Minimal XMX+vector co-issue" (Chips and Cheese) is accurate in practice.
 - Do NOT retry double-buffering for XMX decode FA on B70.
 
+**Full-batch dequant (all tiles, 1 barrier): WORSE (-5%).**
+- Dequant all D/16=16 K tiles upfront (8KB LDS), one barrier, then 16 XMX mads with no
+  intermediate barriers. Same for V in PV loop.
+- Result: 19.37 t/s vs 20.41 single-tile at 16.5K ctx.
+- Likely register pressure from 16 unrolled Q8_0 block reads, or LDS bank conflicts
+  with the larger working set. Single-tile-per-iteration is optimal.
+- Do NOT retry batched dequant for XMX decode FA on B70.
+
 ## Quant distribution + kernel paths
 
 | type  | bytes   | frac  | decode kernel path       |
