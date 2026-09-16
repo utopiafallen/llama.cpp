@@ -19,6 +19,9 @@ Symlink: `D:\model.md` on the B70.
 | Tile FA (eSIMD) | 144K | 8.6 | 116.0 | |
 | XMX decode + per-tile Q8_0 dequant | 144K | 10.18 | 98.2 | +18% vs tile at long ctx |
 | XMX decode + batch=2, profiled | 152K | **9.97** | **100.3** | 735 tok, serialized profile |
+| XMX SPLIT=128, single-tile | 16.5K | **21.01** | **47.6** | +3% vs SPLIT=256 |
+| XMX SPLIT=128, single-tile | 51K | **16.73** | **59.8** | +3% vs SPLIT=256 |
+| XMX SPLIT=64, single-tile | 16.5K | 20.56 | 48.6 | worse than 128 |
 
 **CRITICAL: Previous "22.6 t/s at 142K" numbers were INVALID.** The `slot_save` parameter in
 the completion request body is silently ignored by llama-server. All prior slot-save tests
