@@ -14,6 +14,7 @@
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/oneapi/work_group_static.hpp>
 #include "common.hpp"
+#include "convert.hpp"
 #include "fattn.hpp"
 #include "fattn-xmx-decode.hpp"
 
@@ -194,7 +195,13 @@ bool ggml_sycl_flash_attn_ext_xmx_decode_supported(int device, const ggml_tensor
     if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) { // single batch
         return false;
     }
-    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || Q->type != GGML_TYPE_F32) {
+    if (Q->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0) {
         return false;
     }
     if (dst->src[4] != nullptr) { // sinks
@@ -243,8 +250,38 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
     pl.alloc((size_t) n_splits * n_q_heads);
 
     const float * Q_h = (const float *) Q->data;
-    const sycl::half * K_h = (const sycl::half *) K->data;
-    const sycl::half * V_h = (const sycl::half *) V->data;
+
+    // Convert Q8_0 KV to FP16 for XMX (requires F16 input)
+    const sycl::half * K_h;
+    const sycl::half * V_h;
+    int k_pos_stride, k_head_stride, v_pos_stride, v_head_stride;
+
+    if (K->type == GGML_TYPE_Q8_0) {
+        ggml_sycl_pool_alloc<sycl::half> pK16(pool);
+        ggml_sycl_pool_alloc<sycl::half> pV16(pool);
+        const int64_t n_k = ggml_nelements(K);
+        const int64_t n_v = ggml_nelements(V);
+        pK16.alloc(n_k);
+        pV16.alloc(n_v);
+        to_fp16_sycl_t to_fp16_K = ggml_get_to_fp16_sycl(K->type, dst);
+        to_fp16_sycl_t to_fp16_V = ggml_get_to_fp16_sycl(V->type, dst);
+        to_fp16_K(K->data, pK16.ptr, n_k, stream);
+        to_fp16_V(V->data, pV16.ptr, n_v, stream);
+        K_h = pK16.ptr;
+        V_h = pV16.ptr;
+        k_pos_stride    = D;
+        k_head_stride   = n_kv * D;
+        v_pos_stride    = D;
+        v_head_stride   = n_kv * D;
+    } else {
+        K_h = (const sycl::half *) K->data;
+        V_h = (const sycl::half *) V->data;
+        k_pos_stride    = (int) (K->nb[1]  / sizeof(sycl::half));
+        k_head_stride   = (int) (K->nb[2]  / sizeof(sycl::half));
+        v_pos_stride    = (int) (V->nb[1]  / sizeof(sycl::half));
+        v_head_stride   = (int) (V->nb[2]  / sizeof(sycl::half));
+    }
+
     const sycl::half * m_h = mask ? (const sycl::half *) mask->data : nullptr;
     float * out_f = (float *) dst->data;
     float * pO_p  = pO.ptr;
@@ -252,10 +289,6 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
     float * pl_p  = pl.ptr;
 
     const int q_head_stride   = (int) (Q->nb[2]  / sizeof(float));
-    const int k_pos_stride    = (int) (K->nb[1]  / sizeof(sycl::half));
-    const int k_head_stride   = (int) (K->nb[2]  / sizeof(sycl::half));
-    const int v_pos_stride    = (int) (V->nb[1]  / sizeof(sycl::half));
-    const int v_head_stride   = (int) (V->nb[2]  / sizeof(sycl::half));
     const int mask_head_stride = mask ? (int) (mask->nb[1] / sizeof(sycl::half)) : 0;
     const int mask_ne1         = mask ? (int) (mask->ne[1]) : 1;
     const int out_head_stride = (int) (dst->nb[1] / sizeof(float));
