@@ -23,8 +23,12 @@ description: Intel XMX (joint_matrix) optimization reference for SYCL kernels on
   This is the same mechanism Triton's Intel backend uses (`TritonIntelGPU::PrefetchOp`).
   Pattern from Codeplay (Sep 2025): prefetch tile i+1 into L1 while computing tile i, so the
   actual load hits L1 instead of DRAM. Gives 5-10% on FA kernels (PVC data; untested on BMG).
-  NOTE: compile error if passing raw `const char*` - must wrap in `sycl::multi_ptr`.
-  API signature needs a `multi_ptr<T, address_space, decorated>` or an `accessor`.
+  NOTE: use the simple overload `joint_prefetch(group, void* ptr, size_t bytes)` - the
+  property-hint overloads require wrapping hints in a `sycl::property_list<>`.
+  **TESTED ON B70: NEUTRAL.** Prefetching next K-tile Q8_0 data (D=256 bytes per lane)
+  into L1 before processing current tile: 21.00 t/s vs 21.01 baseline. No measurable
+  benefit. Either the instruction is a no-op on BMG or the HW prefetcher already handles
+  the sequential access pattern. Do not retry for XMX decode FA on B70.
 
 ## Tile constraints (oneAPI 2026.1, confirmed by JIT)
 
