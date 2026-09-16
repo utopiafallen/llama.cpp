@@ -14,7 +14,6 @@
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/oneapi/work_group_static.hpp>
 #include "common.hpp"
-#include "convert.hpp"
 #include "fattn.hpp"
 #include "fattn-xmx-decode.hpp"
 
@@ -43,6 +42,8 @@ static void xmx_decode_main(
         const float * __restrict__ Q,
         const sycl::half * __restrict__ K,
         const sycl::half * __restrict__ V,
+        const char  * __restrict__ K_q8,
+        const char  * __restrict__ V_q8,
         const sycl::half * __restrict__ mask,
         float * __restrict__ partial_O,
         float * __restrict__ partial_m,
@@ -50,7 +51,9 @@ static void xmx_decode_main(
         const int n_kv, const int n_kv_heads, const int n_q_heads, const int n_splits,
         const int q_head_stride, const int k_pos_stride, const int k_head_stride,
         const int v_pos_stride, const int v_head_stride, const int mask_head_stride, const int mask_ne1,
-        const float scale, const sycl::nd_item<3> & it) {
+        const int k_pos_stride_b, const int k_head_stride_b,
+        const int v_pos_stride_b, const int v_head_stride_b,
+        const float scale, const bool q8_input, const sycl::nd_item<3> & it) {
     const int split   = it.get_group(0);
     const int kv_head = it.get_group(1);
     const int lane    = it.get_local_id(2);
@@ -59,11 +62,12 @@ static void xmx_decode_main(
     const int pos_base = split * SPLIT;
     const int pos_end  = std::min(pos_base + SPLIT, n_kv);
 
-    constexpr int LDS_BYTES = GQA*D*2 + GQA*SPLIT*4 + GQA*SPLIT*2;
+    constexpr int LDS_BYTES = GQA*D*2 + GQA*SPLIT*4 + GQA*SPLIT*2 + 16*16*2;
     syclex::work_group_static<char[LDS_BYTES]> lsm;
     sycl::half * Q16    = (sycl::half *)&lsm;              // [GQA][D]
     float    * scores  = (float *)(Q16 + GQA*D);           // [GQA][SPLIT]
     sycl::half * P16   = (sycl::half *)(scores + GQA*SPLIT); // [GQA][SPLIT]
+    sycl::half * tile_buf = (sycl::half *)(P16 + GQA*SPLIT); // [16][16] staging
 
     // 1. Q F32 -> F16 into LDS (row qi is global q_head kv_head*GQA+qi)
     for (int i = lane; i < GQA*D; i += 16) {
@@ -80,9 +84,27 @@ static void xmx_decode_main(
         mx::joint_matrix_fill(sg, C_jm, 0.0f);
         for (int dc = 0; dc < D/16; dc++) {
             mx::joint_matrix_load(sg, A_jm, xmp_l_h(Q16 + dc*16), D);
-            mx::joint_matrix_load(sg, B_jm,
-                xmp_g_h((sycl::half *) (K + kv_head*k_head_stride + (pos_base + c*16)*k_pos_stride + dc*16)),
-                k_pos_stride);
+            if (q8_input) {
+                // Per-tile Q8_0 dequant: each lane handles one position
+                const int pos = pos_base + c*16 + lane;
+                const int dim0 = dc * 16;
+                const int blk  = dim0 / 32;
+                const int off  = dim0 % 32;
+                const char * blk_ptr = K_q8 + kv_head*k_head_stride_b + pos*k_pos_stride_b + blk*34;
+                const sycl::half sc = *(const sycl::half *)blk_ptr;
+                const float s = (float)sc;
+                const int8_t * qs = (const int8_t *)(blk_ptr + 2);
+                #pragma unroll
+                for (int d = 0; d < 16; d++) {
+                    tile_buf[d + lane*16] = (sycl::half)((float)qs[off+d] * s);
+                }
+                sg.barrier();
+                mx::joint_matrix_load(sg, B_jm, xmp_l_h(tile_buf), 16);
+            } else {
+                mx::joint_matrix_load(sg, B_jm,
+                    xmp_g_h((sycl::half *) (K + kv_head*k_head_stride + (pos_base + c*16)*k_pos_stride + dc*16)),
+                    k_pos_stride);
+            }
             mx::joint_matrix_mad(sg, C_jm, A_jm, B_jm, C_jm);
         }
         mx::joint_matrix_store(sg, C_jm, xmp_l_f(scores + c*16), SPLIT, layout::row_major);
@@ -135,9 +157,26 @@ static void xmx_decode_main(
         mx::joint_matrix_fill(sg, O_jm, 0.0f);
         for (int c = 0; c < SPLIT/16; c++) {
             mx::joint_matrix_load(sg, A_jm, xmp_l_h(P16 + c*16), SPLIT);
-            mx::joint_matrix_load(sg, B_jm,
-                xmp_g_h((sycl::half *) (V + kv_head*v_head_stride + (pos_base + c*16)*v_pos_stride + dc*16)),
-                v_pos_stride);
+            if (q8_input) {
+                const int pos = pos_base + c*16 + lane;
+                const int dim0 = dc * 16;
+                const int blk  = dim0 / 32;
+                const int off  = dim0 % 32;
+                const char * blk_ptr = V_q8 + kv_head*v_head_stride_b + pos*v_pos_stride_b + blk*34;
+                const sycl::half sc = *(const sycl::half *)blk_ptr;
+                const float s = (float)sc;
+                const int8_t * qs = (const int8_t *)(blk_ptr + 2);
+                #pragma unroll
+                for (int d = 0; d < 16; d++) {
+                    tile_buf[lane*16 + d] = (sycl::half)((float)qs[off+d] * s);
+                }
+                sg.barrier();
+                mx::joint_matrix_load(sg, B_jm, xmp_l_h(tile_buf), 16);
+            } else {
+                mx::joint_matrix_load(sg, B_jm,
+                    xmp_g_h((sycl::half *) (V + kv_head*v_head_stride + (pos_base + c*16)*v_pos_stride + dc*16)),
+                    v_pos_stride);
+            }
             mx::joint_matrix_mad(sg, O_jm, A_jm, B_jm, O_jm);
         }
         mx::joint_matrix_store(sg, O_jm,
@@ -251,36 +290,20 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
 
     const float * Q_h = (const float *) Q->data;
 
-    // Convert Q8_0 KV to FP16 for XMX (requires F16 input)
-    const sycl::half * K_h;
-    const sycl::half * V_h;
-    int k_pos_stride, k_head_stride, v_pos_stride, v_head_stride;
+    const bool q8_input = (K->type == GGML_TYPE_Q8_0);
+    const sycl::half * K_h = q8_input ? nullptr : (const sycl::half *) K->data;
+    const sycl::half * V_h = q8_input ? nullptr : (const sycl::half *) V->data;
+    const char  * K_q8_p  = q8_input ? (const char *) K->data : nullptr;
+    const char  * V_q8_p  = q8_input ? (const char *) V->data : nullptr;
 
-    if (K->type == GGML_TYPE_Q8_0) {
-        ggml_sycl_pool_alloc<sycl::half> pK16(pool);
-        ggml_sycl_pool_alloc<sycl::half> pV16(pool);
-        const int64_t n_k = ggml_nelements(K);
-        const int64_t n_v = ggml_nelements(V);
-        pK16.alloc(n_k);
-        pV16.alloc(n_v);
-        to_fp16_sycl_t to_fp16_K = ggml_get_to_fp16_sycl(K->type, dst);
-        to_fp16_sycl_t to_fp16_V = ggml_get_to_fp16_sycl(V->type, dst);
-        to_fp16_K(K->data, pK16.ptr, n_k, stream);
-        to_fp16_V(V->data, pV16.ptr, n_v, stream);
-        K_h = pK16.ptr;
-        V_h = pV16.ptr;
-        k_pos_stride    = D;
-        k_head_stride   = n_kv * D;
-        v_pos_stride    = D;
-        v_head_stride   = n_kv * D;
-    } else {
-        K_h = (const sycl::half *) K->data;
-        V_h = (const sycl::half *) V->data;
-        k_pos_stride    = (int) (K->nb[1]  / sizeof(sycl::half));
-        k_head_stride   = (int) (K->nb[2]  / sizeof(sycl::half));
-        v_pos_stride    = (int) (V->nb[1]  / sizeof(sycl::half));
-        v_head_stride   = (int) (V->nb[2]  / sizeof(sycl::half));
-    }
+    const int k_pos_stride    = q8_input ? 0 : (int) (K->nb[1]  / sizeof(sycl::half));
+    const int k_head_stride   = q8_input ? 0 : (int) (K->nb[2]  / sizeof(sycl::half));
+    const int v_pos_stride    = q8_input ? 0 : (int) (V->nb[1]  / sizeof(sycl::half));
+    const int v_head_stride   = q8_input ? 0 : (int) (V->nb[2]  / sizeof(sycl::half));
+    const int k_pos_stride_b  = (int) K->nb[1];
+    const int k_head_stride_b = (int) K->nb[2];
+    const int v_pos_stride_b  = (int) V->nb[1];
+    const int v_head_stride_b = (int) V->nb[2];
 
     const sycl::half * m_h = mask ? (const sycl::half *) mask->data : nullptr;
     float * out_f = (float *) dst->data;
@@ -312,9 +335,11 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
     #define XMX_DECODE_LAUNCH(G) \
         stream->parallel_for(sycl::nd_range<3>(wg_global, wg_local), \
             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
-                xmx_decode_main<G, 256, SPLIT>(Q_h, K_h, V_h, m_h, pO_p, pm_p, pl_p, \
+                xmx_decode_main<G, 256, SPLIT>(Q_h, K_h, V_h, K_q8_p, V_q8_p, m_h, pO_p, pm_p, pl_p, \
                     n_kv, n_kv_heads, n_q_heads, n_splits, q_head_stride, k_pos_stride, \
-                    k_head_stride, v_pos_stride, v_head_stride, mask_head_stride, mask_ne1, scale, it); \
+                    k_head_stride, v_pos_stride, v_head_stride, mask_head_stride, mask_ne1, \
+                    k_pos_stride_b, k_head_stride_b, v_pos_stride_b, v_head_stride_b, \
+                    scale, q8_input, it); \
             }); \
         SYCL_CHECK(0)
     switch (gqa) {
