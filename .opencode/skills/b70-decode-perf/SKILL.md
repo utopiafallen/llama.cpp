@@ -85,6 +85,12 @@ Backend lacks INT8 matrix builtins. Cannot avoid FP16 staging for XMX operands.
 - Result: 19.37 t/s vs 20.41 single-tile at 16.5K ctx.
 - Likely register pressure from 16 unrolled Q8_0 block reads, or LDS bank conflicts
   with the larger working set. Single-tile-per-iteration is optimal.
+
+**Batch=4 dequant (4 tiles, 4 barriers): NEUTRAL (no gain).**
+- Result: 20.44 t/s vs 20.41 single-tile at 16.5K ctx. Within noise.
+- Reducing barrier count from 16 to 4 per c-iteration has no measurable effect.
+- Confirms the per-barrier overhead is negligible; the LDS write+read round-trip is
+  the fixed cost that cannot be amortized by batching.
 - Do NOT retry batched dequant for XMX decode FA on B70.
 
 ## Quant distribution + kernel paths
