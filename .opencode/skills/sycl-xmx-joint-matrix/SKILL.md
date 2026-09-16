@@ -12,6 +12,8 @@ description: Intel XMX (joint_matrix) optimization reference for SYCL kernels on
 - Sub-group width: **16 lanes** (all XMX tiles are per-sub_group).
 - Dense 1024^3 GEMM benchmark: ~27 TFLOPS fp16 (13.2x vs naive scalar FMA).
 - LDS: work-group shared memory via `syclex::work_group_static`. B70 has 1MB LDS per EU partition.
+- **Data types: FP16 only.** INT8 joint_matrix is NOT supported on B70 (hard crash during JIT).
+  All operands must be `sycl::half`. No INT8, no BF16, no FP32 operand modes.
 
 ## Tile constraints (oneAPI 2026.1, confirmed by JIT)
 
@@ -22,6 +24,7 @@ description: Intel XMX (joint_matrix) optimization reference for SYCL kernels on
 | M=32, N=64, K=16 | row_major | **row_major** | **WORKS** (the big win) |
 | M=32, N=64, K=16 | row_major | col_major | **MISSING** (`OpJointMatrixLoadINTEL_PackedB_ColumnMajor_SG16_32x64` undefined) |
 | M=32, N=64, K=32 | row_major | col_major | **MISSING** (same builtin, different K) |
+| int8_t any tile | any | any | **NOT SUPPORTED** (hard crash during JIT, no builtins) |
 
 ### CRITICAL: BMG uses `layout::row_major` for B, NOT `col_major`
 

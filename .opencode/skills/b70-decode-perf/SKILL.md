@@ -9,59 +9,61 @@ Model: `Qwen3.8-27B-UD-Q6_K.gguf` (20.46 GiB, dense Q6_K), B70 = Intel Arc Pro B
 (32GB GDDR6, 256-bit @ 19 Gbps = 608 GB/s spec, 16MB L2).
 Symlink: `D:\model.md` on the B70.
 
-## Current best (2026-09-14, post-Q8_0-FA-fix)
+## Current best (2026-09-15, post-XMX-Q8_0-decode)
 
 | config | context | t/s | ms/tok | notes |
 |--------|---------|-----|--------|-------|
-| Plain decode | 32K | 22.7 | 44.0 | llama-bench tg32, -p 32768 |
-| Plain decode | 142K | 22.6 | 44.2 | slot-save, server API |
-| MTP (n_max=4) | 142K | 25.9-27.5 | 36.4-38.6 | +20% vs plain |
-| MTP (n_max=6) | 32K | ~45.6 | - | llama-bench --mtp -d 32768 |
+| Tile FA (eSIMD) | 51K | 14.71 | 67.9 | baseline, Q8_0 per-tile dequant |
+| XMX decode + per-tile Q8_0 dequant | 51K | **15.97** | **62.6** | best with Q8_0 KV |
+| XMX decode + FP16 KV (no dequant) | 51K | 18.42 | 54.3 | ceiling, won't fit at 256K |
+| Tile FA (eSIMD) | 144K | 8.6 | 116.0 | |
+| XMX decode + per-tile Q8_0 dequant | 144K | **10.18** | **98.2** | +18% vs tile at long ctx |
 
-Key insight: **at long context (>=142K), MTP gives only +20% not the theoretical +5x.**
-The verify step is weight-streaming bound (MUL_MAT ~31ms) and doesn't amortize with batch
-size the way it does at short context where FA was dominant.
+**CRITICAL: Previous "22.6 t/s at 142K" numbers were INVALID.** The `slot_save` parameter in
+the completion request body is silently ignored by llama-server. All prior slot-save tests
+were measuring zero-context decode. Real long-context decode is 8.6-10.2 t/s at 144K.
 
-## Per-op GPU breakdown at 142K (GGML_SYCL_PROFILE=1, serialized)
+MTP is parked (draft state save/restore has size-mismatch issues).
+
+## Per-op GPU breakdown at 144K (GGML_SYCL_PROFILE=1, serialized, XMX decode FA active)
 
 Method: `stream->wait()` after each op in graph_compute. Times are CPU-enqueue + GPU-exec.
-Profiling adds ~10ms/step overhead; use for breakdowns only, not throughput numbers.
-
-### Plain decode (ne[1]=1, 4518 nodes, ~67ms serialized)
+Profiling serializes execution; use for breakdowns only, not throughput numbers.
 
 | Op | Time | % | Notes |
 |---|---|---|---|
-| MUL_MAT | 31.25ms | 59.8% | weight streaming (22GB), unavoidable |
-| GET_ROWS | 11.41ms | 21.9% | token embedding + GDN state reads |
-| rms_norm_fused | 1.04ms | 2.0% | |
-| FLASH_ATTN_EXT | **0.92ms** | **1.8%** | Q8_0 tile load (was 69ms pre-fix) |
-| RMS_NORM | 0.86ms | 1.7% | |
-| CONCAT | 0.77ms | 1.5% | GDN conv_input |
-| ADD | 0.71ms | 1.4% | residuals |
-| batched_conv_state_cpy | 0.71ms | 1.4% | |
-| misc (SCALE, UNARY, etc) | ~20ms | ~30% | small ops, many of them |
+| MUL_MAT | 533.47ms | 79.9% | weight streaming (20GB), dominates serialized time |
+| FLASH_ATTN_EXT | 73.86ms | 11.1% | 32 ops x ~2.3ms, XMX per-tile Q8_0 dequant |
+| GLU | 14.50ms | 2.2% | FFN activation |
+| ADD | 8.55ms | 1.3% | residuals |
+| SSM_CONV | 8.26ms | 1.2% | GDN conv |
+| CONCAT | 6.75ms | 1.0% | GDN conv_input |
+| misc | ~22ms | ~3% | UNARY, ROPE, CONT, RMS_NORM, etc |
+| **Total** | **667.41ms** | | pipelined = 98ms/tok (10.18 t/s) |
 
-### MTP draft head (ne[1]=1, 55 nodes, ~3.3ms each x4 = 13ms/step)
+FA is 32 ops (one per full-attention layer). Each XMX FA op at 144K: ~2.3ms
+(563 splits x 4 kv_heads WGs, SPLIT=256, GQA=6, D=256).
 
-Small graph: 1 transformer layer (eh_proj + attn + FFN) + shared lm_head.
+## XMX decode FA with Q8_0 KV (committed 2026-09-15)
 
-### MTP step total: ~67ms (main verify) + 13ms (4x draft head) = ~80ms
+Three commits: bulk conv support, per-op profiler, per-tile dequant.
 
-## The Q8_0 FA tile load (the big long-context win, committed 2026-09-14)
+**Tile FA (eSIMD) is compute-bound:** FP16 MUL + CVT to FP32 + FP32 ADD = 3 instructions
+per 2 FLOPs. No native FP16xFP16->FP32 FMA on eSIMD. XMX offloads to dedicated matrix HW.
 
-Before: every FA op converted the ENTIRE Q8_0 KV cache to FP16 before the kernel ran.
-At 142K context with 4 KV heads x 256 head_dim: K+V Q8_0 = 310MB, FP16 = 1168MB.
-Per FA op: read 310MB Q8_0 + write 1168MB FP16 + read 1168MB FP16 = ~2.7GB traffic.
+**Per-tile Q8_0 dequant in XMX kernel:** Each 16x16 B-tile reads Q8_0 blocks (34B) from
+global, dequants to FP16 in registers, stores to a 512B LDS staging buffer, then XMX loads
+from LDS. No bulk tensor conversion needed. Eliminates the full write+read round trip.
 
-After: `flash_attn_tile_load_tile_q8` reads Q8_0 blocks directly, dequants to FP16 in
-shared memory per tile. Per FA op: read 310MB Q8_0 only. **4.7x less DRAM traffic.**
+Files: `fattn-xmx-decode.cpp` (kernel + host launch), `ggml-sycl.cpp` (profiler).
 
-Result: FA went from 69ms to 0.92ms at 142K context (75x faster). This made long-context
-decode 2.5x faster overall (8.9 -> 22.6 t/s) because the conversion was the dominant cost,
-not the FA compute itself.
+**Conversion overhead is real but smaller than theoretical:**
+- Theoretical: ~1.4ms per FA op at 144K (894MB DRAM traffic at 640 GB/s)
+- Measured delta (Q8_0 vs FP16 KV at 51K): ~10ms/step / 32 ops = 0.31ms per FA op
+- Per-tile saves ~2.3% over bulk conv (15.97 vs 15.61 t/s)
 
-Files: fattn-tile.hpp (load fn + q8_input branch), fattn-common.hpp (skip conversion +
-q8_input kernel arg), fattn-vec.hpp (signature), fattn-tile.cpp (global var).
+**INT8 XMX: NOT supported on B70.** Hard crash during JIT (no catchable SYCL exception).
+Backend lacks INT8 matrix builtins. Cannot avoid FP16 staging for XMX operands.
 
 ## Quant distribution + kernel paths
 
@@ -76,34 +78,23 @@ q8_input kernel arg), fattn-vec.hpp (signature), fattn-tile.cpp (global var).
 output/lm_head = Q8_0 [5120, 248320]. token_embd = Q6_K [5120, 248320].
 Model: 64 blocks (48 GDN + 16 full-attn every 4th), head_dim=256, gqa=6 (24 q heads, 4 kv).
 
-## MTP (NextN) decode
+## MTP (NextN) decode - PARKED
 
 Qwen3.8 ships 1 MTP block (`qwen35.nextn_predict_layers = 1`).
 Enable: `--spec-type draft-mtp --spec-draft-n-max 4` (or 6).
 MTP ctx shares main model weights (no second 20GB copy). Fits 32GB B70.
 
-Mechanism per step:
-1. Draft: 4x MTP head passes (55 nodes each, ~3.3ms) = 13ms
-2. Verify: 1x main model pass with N+1 tokens (4518 nodes, ~67ms)
-3. Accept/reject based on probability match
+**Parked:** Draft state slot save/restore has a size-mismatch issue (file=107KB vs
+expected=16 post-erase). Unresolved. The .dft slot-save change was reverted.
 
-At 142K: ~80ms/step total, ~1.2-1.5 tokens accepted per step = 26-27 t/s.
-At 32K: the fp16 M-kernel + eSIMD small-batch paths make verify faster (~45 t/s with n_max=6).
+At 142K context, MTP is expected to give modest gains since the verify step is
+weight-streaming bound (MUL_MAT dominates) and FA is a smaller fraction with XMX.
 
-**Why MTP is less effective at long context:** FA was the bottleneck pre-Q8_0-fix, and MTP
-amortizes it well (same KV read for 1 or 5 queries). Now that FA is 0.92ms (negligible),
-the verify step is dominated by MUL_MAT weight streaming (31ms) which is IDENTICAL whether
-processing 1 or 5 tokens. The MTP head overhead (13ms) is pure cost with no corresponding
-savings in the verify. Net: only +20% at 142K vs +100%+ at short context.
+## Plain decode at short context (~32K)
 
-## Plain decode ceiling analysis (short context, ~22.7 t/s)
-
-- 22.7 t/s x 22.0 GB = 500 GB/s = 82% of 608 GB/s spec
-- FFN q6_K/q5_K (fused GLU/add): 516-570 GB/s (saturated)
-- attn projections: 380-500 GB/s
-- lm_head Q8_0: 590 GB/s
-- iq4_nl 17408x5120: 92.6 GB/s (biggest single inefficiency, ~2% of time)
-- The 2-row SoA eSIMD DMMV is at the practical ceiling; ROWS>2, wider loads, XMX GEMV all lose.
+llama-bench tg32 at 32K: ~22-23 t/s (weight-streaming bound, ~82% of DRAM bandwidth).
+This is the eSIMD DMMV ceiling - no FA optimization helps here since FA is negligible
+at short context. The XMX FA gains only matter at long context (>=50K).
 
 ## Dead ends (do NOT retry)
 
@@ -112,18 +103,39 @@ savings in the verify. Net: only +20% at 142K vs +100%+ at short context.
 - **Interleaved Q6_K layouts**: all variants (210B, 212B padded, 420B pair) lose to SoA 23.05.
   The Xe2 backend doesn't handle misaligned/padded loads well.
 - **bf16 M-kernel**: B70 has no fast bf16 FMA (0.52x of fp32). Dead.
-- **XMX decode FA**: +8% at 32K, wash at short context. Now irrelevant since Q8_0 tile load
-  made FA negligible (0.92ms at 142K). The XMX verify FA for MTP is also a wash vs tile FA.
+- **INT8 joint_matrix on B70**: hard crash during JIT, no builtins. Only FP16 supported.
+- **nbatch_fa 64->128 in tile kernel**: 14.50 vs 14.71 t/s (register pressure). Worse.
+- **XMX_DECODE_SPLIT 256->512**: 14.69 vs 15.61 t/s (LDS occupancy loss at 24KB/WG). Worse.
+- **Custom KV cache format for XMX INT8**: backend has no discretion over tensor layout.
+  Would require new ggml type (all backends) or shadow buffer (architecturally invasive).
+  Blocked by lack of INT8 XMX support anyway.
 - **SYCL graph mode**: -16%, avoid.
 - **2-GPU split**: worse (cross-GPU sync overhead).
 
 ## Profiling infrastructure
 
 - `GGML_SYCL_PROFILE=1`: per-op GPU timing via `stream->wait()` after each op in
-  graph_compute. Writes summary to `sycl-profile.log` (CWD). Serializes execution (+10ms/step
-  overhead). Shows top 15 ops by time with % of total.
+  graph_compute. Writes per-op lines (>50us) + summary to `sycl-profile.log` (CWD).
+  Serializes execution. Shows top ops by time with % of total.
 - `GGML_SYCL_PROFILE=0`: no profiling (default for throughput runs).
 - Server launch for profiling: see battlematrix-ssh skill for the SSH background pattern.
+
+## Measurement methodology (IMPORTANT)
+
+**The server is STATELESS.** Each completion request must carry the full conversation history.
+Slot cache only persists KV, NOT prompt/token state. The `slot_save` parameter in the request
+body is SILENTLY IGNORED - it does NOT save/restore the slot.
+
+Correct workflow for measuring decode at N context tokens:
+1. Launch server with `--slot-save-path D:\slot-save\`
+2. Send the full prompt JSON (e.g. test-64k.json) to prefill the KV cache
+3. `POST /slots/0?action=save` with `{"filename":"name"}` to save KV
+4. `POST /slots/0?action=restore` with `{"filename":"name"}` to restore KV
+5. Send the SAME full prompt JSON again - prefix hits restored KV (fast), then decode begins
+6. Read `eval time` from server log for decode speed
+
+NEVER send a short `" "` prompt after restore. Always send the same full prompt.
+Test prompts on B70 desktop: `TestPrompt152k.json` (~144K), `test-64k.json` (~51K).
 
 ## Prefill reorder poison (pre-existing, not decode)
 
