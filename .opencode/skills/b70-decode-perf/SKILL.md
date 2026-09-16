@@ -65,6 +65,13 @@ Files: `fattn-xmx-decode.cpp` (kernel + host launch), `ggml-sycl.cpp` (profiler)
 **INT8 XMX: NOT supported on B70.** Hard crash during JIT (no catchable SYCL exception).
 Backend lacks INT8 matrix builtins. Cannot avoid FP16 staging for XMX operands.
 
+**Zero-dequant A/B test (proves LDS staging is the cost, not ALU):**
+- Real dequant (multiply by scale): 20.41 t/s at 16.5K ctx
+- Zero-dequant (no multiply, just cast): 20.60 t/s at 16.5K ctx
+- Delta: 0.9% = noise. The scale multiply is free (overlapped with memory ops).
+- Conclusion: the ~13% gap to FP16 KV at 51K is entirely the LDS write + barrier +
+  XMX load-from-LDS path. Not reducible without INT8 XMX or a custom KV format.
+
 ## Quant distribution + kernel paths
 
 | type  | bytes   | frac  | decode kernel path       |
