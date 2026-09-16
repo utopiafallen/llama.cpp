@@ -72,6 +72,13 @@ Backend lacks INT8 matrix builtins. Cannot avoid FP16 staging for XMX operands.
 - Conclusion: the ~13% gap to FP16 KV at 51K is entirely the LDS write + barrier +
   XMX load-from-LDS path. Not reducible without INT8 XMX or a custom KV format.
 
+**Double-buffered dequant (co-issue attempt): WORSE (-15%).**
+- Restructured loop: XMX mad → dequant next tile → barrier (dequant co-issues with XMX?)
+- Result: 17.24 t/s vs 20.41 single-buffer at 16.5K ctx.
+- Confirms `joint_matrix_mad` effectively blocks the sub_group despite hardware 3-way
+  co-issue claim. "Minimal XMX+vector co-issue" (Chips and Cheese) is accurate in practice.
+- Do NOT retry double-buffering for XMX decode FA on B70.
+
 ## Quant distribution + kernel paths
 
 | type  | bytes   | frac  | decode kernel path       |
