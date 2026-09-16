@@ -62,12 +62,14 @@ static void xmx_decode_main(
     const int pos_base = split * SPLIT;
     const int pos_end  = std::min(pos_base + SPLIT, n_kv);
 
-    constexpr int LDS_BYTES = GQA*D*2 + GQA*SPLIT*4 + GQA*SPLIT*2 + 16*16*2;
+    constexpr int BATCH = 2;
+    constexpr int NDTILES = D/16;
+    constexpr int LDS_BYTES = GQA*D*2 + GQA*SPLIT*4 + GQA*SPLIT*2 + BATCH*16*16*2;
     syclex::work_group_static<char[LDS_BYTES]> lsm;
     sycl::half * Q16    = (sycl::half *)&lsm;              // [GQA][D]
     float    * scores  = (float *)(Q16 + GQA*D);           // [GQA][SPLIT]
     sycl::half * P16   = (sycl::half *)(scores + GQA*SPLIT); // [GQA][SPLIT]
-    sycl::half * tile_buf = (sycl::half *)(P16 + GQA*SPLIT); // [16][16] staging
+    sycl::half * tile_buf = (sycl::half *)(P16 + GQA*SPLIT); // [BATCH][16][16] staging
 
     // 1. Q F32 -> F16 into LDS (row qi is global q_head kv_head*GQA+qi)
     for (int i = lane; i < GQA*D; i += 16) {
@@ -82,30 +84,41 @@ static void xmx_decode_main(
         mx::joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::col_major> B_jm;
         mx::joint_matrix<sycl::sub_group, float, use::accumulator, GQA, 16> C_jm;
         mx::joint_matrix_fill(sg, C_jm, 0.0f);
-        for (int dc = 0; dc < D/16; dc++) {
-            mx::joint_matrix_load(sg, A_jm, xmp_l_h(Q16 + dc*16), D);
-            if (q8_input) {
-                // Per-tile Q8_0 dequant: each lane handles one position
-                const int pos = pos_base + c*16 + lane;
-                const int dim0 = dc * 16;
-                const int blk  = dim0 / 32;
-                const int off  = dim0 % 32;
-                const char * blk_ptr = K_q8 + kv_head*k_head_stride_b + pos*k_pos_stride_b + blk*34;
-                const sycl::half sc = *(const sycl::half *)blk_ptr;
-                const float s = (float)sc;
-                const int8_t * qs = (const int8_t *)(blk_ptr + 2);
+        if (q8_input) {
+            const int pos = pos_base + c*16 + lane;
+            #pragma unroll
+            for (int g = 0; g < NDTILES/BATCH; g++) {
                 #pragma unroll
-                for (int d = 0; d < 16; d++) {
-                    tile_buf[d + lane*16] = (sycl::half)((float)qs[off+d] * s);
+                for (int b = 0; b < BATCH; b++) {
+                    const int dc = g*BATCH + b;
+                    const int blk = dc / 2;
+                    const int off = (dc * 16) % 32;
+                    const char * blk_ptr = K_q8 + kv_head*k_head_stride_b + pos*k_pos_stride_b + blk*34;
+                    const sycl::half sc = *(const sycl::half *)blk_ptr;
+                    const float s = (float)sc;
+                    const int8_t * qs = (const int8_t *)(blk_ptr + 2);
+                    #pragma unroll
+                    for (int d = 0; d < 16; d++) {
+                        tile_buf[b*256 + d + lane*16] = (sycl::half)((float)qs[off+d] * s);
+                    }
                 }
                 sg.barrier();
-                mx::joint_matrix_load(sg, B_jm, xmp_l_h(tile_buf), 16);
-            } else {
+                #pragma unroll
+                for (int b = 0; b < BATCH; b++) {
+                    const int dc = g*BATCH + b;
+                    mx::joint_matrix_load(sg, A_jm, xmp_l_h(Q16 + dc*16), D);
+                    mx::joint_matrix_load(sg, B_jm, xmp_l_h(tile_buf + b*256), 16);
+                    mx::joint_matrix_mad(sg, C_jm, A_jm, B_jm, C_jm);
+                }
+            }
+        } else {
+            for (int dc = 0; dc < NDTILES; dc++) {
+                mx::joint_matrix_load(sg, A_jm, xmp_l_h(Q16 + dc*16), D);
                 mx::joint_matrix_load(sg, B_jm,
                     xmp_g_h((sycl::half *) (K + kv_head*k_head_stride + (pos_base + c*16)*k_pos_stride + dc*16)),
                     k_pos_stride);
+                mx::joint_matrix_mad(sg, C_jm, A_jm, B_jm, C_jm);
             }
-            mx::joint_matrix_mad(sg, C_jm, A_jm, B_jm, C_jm);
         }
         mx::joint_matrix_store(sg, C_jm, xmp_l_f(scores + c*16), SPLIT, layout::row_major);
         sg.barrier();
@@ -155,29 +168,42 @@ static void xmx_decode_main(
         mx::joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::row_major> B_jm;
         mx::joint_matrix<sycl::sub_group, float, use::accumulator, GQA, 16> O_jm;
         mx::joint_matrix_fill(sg, O_jm, 0.0f);
-        for (int c = 0; c < SPLIT/16; c++) {
-            mx::joint_matrix_load(sg, A_jm, xmp_l_h(P16 + c*16), SPLIT);
-            if (q8_input) {
-                const int pos = pos_base + c*16 + lane;
-                const int dim0 = dc * 16;
-                const int blk  = dim0 / 32;
-                const int off  = dim0 % 32;
-                const char * blk_ptr = V_q8 + kv_head*v_head_stride_b + pos*v_pos_stride_b + blk*34;
-                const sycl::half sc = *(const sycl::half *)blk_ptr;
-                const float s = (float)sc;
-                const int8_t * qs = (const int8_t *)(blk_ptr + 2);
+        if (q8_input) {
+            const int dim0 = dc * 16;
+            const int blk  = dim0 / 32;
+            const int off  = dim0 % 32;
+            #pragma unroll
+            for (int g = 0; g < (SPLIT/16)/BATCH; g++) {
                 #pragma unroll
-                for (int d = 0; d < 16; d++) {
-                    tile_buf[lane*16 + d] = (sycl::half)((float)qs[off+d] * s);
+                for (int b = 0; b < BATCH; b++) {
+                    const int c = g*BATCH + b;
+                    const int pos = pos_base + c*16 + lane;
+                    const char * blk_ptr = V_q8 + kv_head*v_head_stride_b + pos*v_pos_stride_b + blk*34;
+                    const sycl::half sc = *(const sycl::half *)blk_ptr;
+                    const float s = (float)sc;
+                    const int8_t * qs = (const int8_t *)(blk_ptr + 2);
+                    #pragma unroll
+                    for (int d = 0; d < 16; d++) {
+                        tile_buf[b*256 + lane*16 + d] = (sycl::half)((float)qs[off+d] * s);
+                    }
                 }
                 sg.barrier();
-                mx::joint_matrix_load(sg, B_jm, xmp_l_h(tile_buf), 16);
-            } else {
+                #pragma unroll
+                for (int b = 0; b < BATCH; b++) {
+                    const int c = g*BATCH + b;
+                    mx::joint_matrix_load(sg, A_jm, xmp_l_h(P16 + c*16), SPLIT);
+                    mx::joint_matrix_load(sg, B_jm, xmp_l_h(tile_buf + b*256), 16);
+                    mx::joint_matrix_mad(sg, O_jm, A_jm, B_jm, O_jm);
+                }
+            }
+        } else {
+            for (int c = 0; c < SPLIT/16; c++) {
+                mx::joint_matrix_load(sg, A_jm, xmp_l_h(P16 + c*16), SPLIT);
                 mx::joint_matrix_load(sg, B_jm,
                     xmp_g_h((sycl::half *) (V + kv_head*v_head_stride + (pos_base + c*16)*v_pos_stride + dc*16)),
                     v_pos_stride);
+                mx::joint_matrix_mad(sg, O_jm, A_jm, B_jm, O_jm);
             }
-            mx::joint_matrix_mad(sg, O_jm, A_jm, B_jm, O_jm);
         }
         mx::joint_matrix_store(sg, O_jm,
             xmp_g_f(partial_O + (size_t)(split*n_q_heads + kv_head*GQA)*D + dc*16),
