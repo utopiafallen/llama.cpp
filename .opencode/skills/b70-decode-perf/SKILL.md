@@ -54,6 +54,23 @@ token. Effective bandwidth: 20500MB / 81.3ms = 252 GB/s (41% of 608 GB/s spec). 
 already uses reordered Q6_K layout (16 sub_groups/WG, coalesced access). The 41% is the
 practical ceiling for Q6_K GEMV on B70 (scattered byte-level dequant, DRAM page conflicts).
 
+**MUL_MAT is NOT constant with context - it degrades due to DRAM contention with FA.**
+Profiled comparison (serialized, same binary):
+- 51K: MUL_MAT = 59.5 ms/tok, FA = 25.9 ms/tok → MUL_MAT BW ~303 GB/s (50%)
+- 152K: MUL_MAT = 81.3 ms/tok, FA = 52.8 ms/tok → MUL_MAT BW ~221 GB/s (36%)
+
+MUL_MAT reads a FIXED amount of data (weight matrix) regardless of context. The 37%
+degradation at long context is pure bandwidth contention: FA's KV reads compete for the
+same DRAM pipe. Per-layer op order alternates [weight reads] → [KV reads (FA)] → [weight
+reads (out_proj + FFN)], causing DRAM row-buffer thrashing between KV cache and weight
+addresses. Both ops are partially LATENCY-BOUND (not purely bandwidth-saturated):
+- Evidence: SPLIT 256→128 helped FA (+3%) = more WGs hide latency
+- Evidence: Q8_0 FA slower than FP16 despite half the bytes = LDS round-trip latency > BW savings
+
+Implication: reducing FA's KV byte volume helps MUL_MAT too (frees DRAM cycles). Total
+decode time at long context is governed by (weight_bytes + KV_bytes) / effective_BW, not
+by summing independent op times.
+
 ## XMX decode FA with Q8_0 KV (committed 2026-09-15)
 
 Three commits: bulk conv support, per-op profiler, per-tile dequant.
