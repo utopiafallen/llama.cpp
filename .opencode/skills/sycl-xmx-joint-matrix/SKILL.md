@@ -14,6 +14,17 @@ description: Intel XMX (joint_matrix) optimization reference for SYCL kernels on
 - LDS: work-group shared memory via `syclex::work_group_static`. B70 has 1MB LDS per EU partition.
 - **Data types: FP16 only.** INT8 joint_matrix is NOT supported on B70 (hard crash during JIT).
   All operands must be `sycl::half`. No INT8, no BF16, no FP32 operand modes.
+- **Hardware L1 cache (not explicit SMEM):** Unlike NVIDIA Hopper+ where Tensor Cores read
+  from SMEM via descriptors, B70 XMX reads from registers or LDS. Global data flows through
+  a hardware-managed L1 cache. Data path: Global -> L1 -> Registers -> XMX.
+- **Async prefetch available:** `sycl::ext::oneapi::experimental::joint_prefetch(group, ptr, count, hint)`
+  issues a non-blocking Global->L1 prefetch. Header: `<sycl/ext/oneapi/experimental/prefetch.hpp>`.
+  Hints: `prefetch_hint_L1`, `prefetch_hint_L2`, plus `_nt` (nontemporal) variants.
+  This is the same mechanism Triton's Intel backend uses (`TritonIntelGPU::PrefetchOp`).
+  Pattern from Codeplay (Sep 2025): prefetch tile i+1 into L1 while computing tile i, so the
+  actual load hits L1 instead of DRAM. Gives 5-10% on FA kernels (PVC data; untested on BMG).
+  NOTE: compile error if passing raw `const char*` - must wrap in `sycl::multi_ptr`.
+  API signature needs a `multi_ptr<T, address_space, decorated>` or an `accessor`.
 
 ## Tile constraints (oneAPI 2026.1, confirmed by JIT)
 
