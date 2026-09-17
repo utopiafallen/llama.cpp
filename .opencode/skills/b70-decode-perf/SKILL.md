@@ -166,6 +166,48 @@ at short context. The XMX FA gains only matter at long context (>=50K).
   Blocked by lack of INT8 XMX support anyway.
 - **SYCL graph mode**: -16%, avoid.
 - **2-GPU split**: worse (cross-GPU sync overhead).
+- **FA softmax exp2f instead of std::exp**: 16.70 vs 16.73 t/s at 51K (noise). The softmax
+  is a tiny fraction of FA kernel time; XMX mads + LDS round-trips dominate. Neutral.
+- **GEMV #pragma unroll 2/4 on outer block loop**: no measurable effect at any context.
+  Tested via llama-bench at zero context.
+- **GEMV explicit 2-stage software pipeline** (manual: load block i+1 before compute of
+  block i, all data in registers): 16.71 vs 16.73 t/s at 51K via llama-server slot-restore.
+  NEUTRAL. Confirms the SYCL compiler already schedules scattered loads optimally; the
+  GEMV bottleneck is DRAM bandwidth saturation, not load latency or instruction order.
+
+## xpu-kernels skill review (2026-09-16)
+
+Reviewed `/mnt/g/hf-kernels/kernel-builder/skills/xpu-kernels/` (Triton/Xe-Forge patterns
+for Battlemage). Transferable findings vs SYCL C++ kernels:
+
+| Pattern | Applicability | Result |
+|---------|--------------|--------|
+| exp2 for softmax | FA softmax | NEUTRAL (tested) |
+| num_stages software pipelining | GEMV block loop | NEUTRAL (pragma unroll 2/4, tested) |
+| GRF mode 256 | Triton-specific (launch metadata), no SYCL equivalent | N/A |
+| Persistent kernels | Would need graph-level change to batch ops | Too invasive |
+| Stream K | Not applicable for GEMV (K is row length, not reduction) | N/A |
+| Algebraic weight folding | Fold bias into GEMV weights | Would need graph change |
+| Tensor descriptors | Triton-specific API | N/A |
+| Pre-pack to bf16 | Already doing Q6_K reorder (equivalent) | Already done |
+
+Conclusion: The xpu-kernels patterns target Triton's auto-pipelining and launch
+configuration. In SYCL C++, the compiler already handles instruction scheduling, and
+the kernel launch configuration is fixed by the work group structure. The remaining
+optimization space is at the system/graph level, not the individual kernel level.
+
+## System-level bandwidth ceiling at long context
+
+At 51K+ context, decode is DRAM-bandwidth-limited system-wide. Total bytes moved per
+token: ~19GB weights + n_kv x 4 heads x 256 dim x ~1B (Q8_0) KV. Individual kernel
+micro-optimizations (exp2, GEMV unroll, WG size) show zero measurable effect because
+the bottleneck is total DRAM throughput, not any single kernel's compute or latency.
+
+Only paths to meaningful improvement at long context:
+1. Reduce KV byte volume (new format - user needs Q8_0 quality for 256K)
+2. Graph-level scheduling (overlap FA/KV-reads with GEMV/weight-reads across layers)
+3. Fundamentally different FA algorithm avoiding LDS round-trip (needs INT8 XMX or
+   register-to-XMX path, neither available on B70)
 
 ## Profiling infrastructure
 

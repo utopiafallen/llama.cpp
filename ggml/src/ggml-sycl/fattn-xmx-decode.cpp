@@ -137,7 +137,7 @@ static void xmx_decode_main(
     for (int qi = 0; qi < GQA; qi++) {
         float ps = 0.0f;
         for (int pos = lane; pos < SPLIT; pos += 16) {
-            const float e = std::exp(scores[qi*SPLIT + pos] - m[qi]);
+            const float e = exp2f((scores[qi*SPLIT + pos] - m[qi]) * 1.4426950408889634f);
             P16[qi*SPLIT + pos] = (sycl::half) e;
             ps += e;
         }
@@ -208,7 +208,7 @@ static void xmx_decode_combine(
     }
     float num = 0.0f, den = 0.0f;
     for (int s = 0; s < n_splits; s++) {
-        const float w = std::exp(m_s[(size_t) s * n_q_heads] - M);
+        const float w = exp2f((m_s[(size_t) s * n_q_heads] - M) * 1.4426950408889634f);
         den += w * l_s[(size_t) s * n_q_heads];
         num += w * O_s[(size_t) s * n_q_heads * D + dim];
     }
