@@ -6601,6 +6601,10 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    // Submit a trivial no-op kernel to keep the GPU alive.
+    // Without this, headless/secondary GPUs may be evicted by the driver
+    // after extended idle periods (e.g. --no-sleep heartbeat in server).
+    stream->single_task([=](){});
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
 
     GGML_UNUSED(backend);
@@ -6690,6 +6694,7 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    ggml_sycl_set_main_device(sycl_ctx->device);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {

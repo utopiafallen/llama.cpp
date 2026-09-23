@@ -2927,11 +2927,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+int ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices, int heartbeat_seconds) {
     if (n_devices == 0 || devices == nullptr) {
         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
-        return;
+        return 0;
     }
     std::vector<ggml_backend_t> backends;
     LOG_INFO("Starting RPC server v%d.%d.%d\n",
@@ -2950,7 +2950,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             LOG_ERROR("Failed to create backend for device %s\n", dev->iface.get_name(dev));
-            return;
+            return 0;
         }
         backends.push_back(backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -2965,7 +2965,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
-        return;
+        return 0;
     }
 
 #ifdef GGML_RPC_RDMA
@@ -2973,29 +2973,53 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 #else
     LOG_INFO("  transport      : TCP\n");
 #endif // GGML_RPC_RDMA
+
+    std::thread heartbeat_thread;
+    std::atomic<bool> server_running{false};
+    if (heartbeat_seconds > 0) {
+        heartbeat_thread = std::thread([backends, heartbeat_seconds, &server_running]() {
+            while (server_running) {
+                std::this_thread::sleep_for(std::chrono::seconds(heartbeat_seconds));
+                for (auto backend : backends) {
+                    ggml_backend_synchronize(backend);
+                }
+            }
+        });
+        server_running = true;
+    }
+
     if (!rpc_transport_init()) {
         LOG_ERROR("Failed to initialize RPC transport\n");
-        return;
+        server_running = false;
+        if (heartbeat_thread.joinable()) heartbeat_thread.join();
+        return 0;
     }
     auto server_socket = socket_t::create_server(host.c_str(), port);
     if (server_socket == nullptr) {
         LOG_ERROR("Failed to create server socket\n");
-        return;
+        server_running = false;
+        if (heartbeat_thread.joinable()) heartbeat_thread.join();
+        return 0;
     }
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
             LOG_ERROR("Failed to accept client connection\n");
-            return;
+            server_running = false;
+            if (heartbeat_thread.joinable()) heartbeat_thread.join();
+            return 0;
         }
         LOG_INFO("Accepted client connection\n");
         rpc_serve_client(backends, cache_dir, client_socket);
         LOG_INFO("Client connection closed\n");
     }
+    server_running = false;
+    if (heartbeat_thread.joinable()) heartbeat_thread.join();
     rpc_transport_shutdown();
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
+    return 0;
 }
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
