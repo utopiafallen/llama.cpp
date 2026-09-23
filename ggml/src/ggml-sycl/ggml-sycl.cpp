@@ -102,18 +102,12 @@ int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
 int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
-int g_ggml_sycl_fa_tile_gqa_min_kv = 8192;
-int g_ggml_sycl_fa_xmx_decode = 1;
 int g_ggml_sycl_enable_vmm = 1;
 int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_q6k_gemv_row = 0;
 int g_ggml_sycl_q80_gemv_esimd = 1;
-int g_ggml_sycl_q6k_mmvq_hoist = 1;
-int g_ggml_sycl_q6k_mmvq_esimd = 1;
-int g_ggml_sycl_q5k_mmvq_esimd = 1;
-int g_ggml_sycl_q80_mmvq_esimd = 1;
 int g_ggml_sycl_fuse_mm_add = 1;
 int g_ggml_sycl_fuse_mm_glu = 1;
 int g_ggml_sycl_fuse_gdn_dt = 1;
@@ -189,7 +183,6 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.devices[i].smpbo = prop.get_local_mem_size();
         info.devices[i].warp_size = WARP_SIZE;
         info.devices[i].usm_system_support = device.has(sycl::aspect::usm_system_allocations);
-        info.devices[i].has_xmx = gpu_has_xmx(device);
 
         info.max_work_group_sizes[i] = prop.get_max_work_group_size();
         info.devices[i].max_wg_per_cu = info.max_work_group_sizes[i] / prop.get_max_compute_units();
@@ -260,9 +253,9 @@ static void print_device_detail(int id, sycl::device &device, std::string device
 static void print_device_opt_feature(int device_count) {
     GGML_LOG_INFO("SYCL Optimization Feature:\n");
     GGML_LOG_INFO(
-        "|ID|        Device Type|Reorder|XMX|\n");
+        "|ID|        Device Type|Reorder|\n");
     GGML_LOG_INFO(
-        "|--|-------------------|-------|---|\n");
+        "|--|-------------------|-------|\n");
     std::map<std::string, size_t> DeviceNums;
     for (int id = 0; id < device_count; ++id) {
       sycl::device device = dpct::dev_mgr::instance().get_device(id);
@@ -273,9 +266,8 @@ static void print_device_opt_feature(int device_count) {
                   << "]";
       std::string device_type_s = device_type.str();
       device_type_s = std::regex_replace(device_type_s, std::regex("ext_oneapi_"), "");
-      GGML_LOG_INFO("|%2d|%19s|%7s|%3s|\n", id, device_type_s.c_str(),
-        ggml_sycl_info().devices[id].opt_feature.reorder ? "Y": "N",
-        ggml_sycl_info().devices[id].has_xmx ? "Y" : "N");
+      GGML_LOG_INFO("|%2d|%19s|%7s|\n", id, device_type_s.c_str(),
+        ggml_sycl_info().devices[id].opt_feature.reorder ? "Y": "N");
     }
 
 }
@@ -371,19 +363,12 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
-        g_ggml_sycl_fa_tile_gqa_min_kv = ggml_sycl_get_env("GGML_SYCL_FA_TILE_GQA_MIN_KV", 8192);
-        g_ggml_sycl_fa_xmx_decode = ggml_sycl_get_env("GGML_SYCL_FA_XMX_DECODE", 1);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_q6k_gemv_row = ggml_sycl_get_env("GGML_SYCL_Q6K_GEMV_ROW", 0);
         g_ggml_sycl_q80_gemv_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_GEMV_ESIMD", 1);
-        // hoist the shared Q6_K weight dequant out of the small-batch (ncols 2-8) per-token loop
-        g_ggml_sycl_q6k_mmvq_hoist = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_HOIST", 1);
-        g_ggml_sycl_q6k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_ESIMD", 1);
-        g_ggml_sycl_q5k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q5K_MMVQ_ESIMD", 1);
-        g_ggml_sycl_q80_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_MMVQ_ESIMD", 1);
         g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
         g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
         g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
@@ -476,8 +461,6 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_MKL_FA: %d\n", g_ggml_sycl_enable_mkl_fa);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE_STEP: %d\n", g_ggml_sycl_memtrace_step);
-        GGML_LOG_INFO("  GGML_SYCL_FA_TILE_GQA_MIN_KV: %d\n", g_ggml_sycl_fa_tile_gqa_min_kv);
-        GGML_LOG_INFO("  GGML_SYCL_FA_XMX_DECODE: %d\n", g_ggml_sycl_fa_xmx_decode);
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
 #else
@@ -512,10 +495,6 @@ static void ggml_check_sycl() try {
 #if defined(__INTEL_LLVM_COMPILER)
         GGML_LOG_INFO("  GGML_SYCL_Q6K_GEMV_ROW: %d\n", g_ggml_sycl_q6k_gemv_row);
         GGML_LOG_INFO("  GGML_SYCL_Q80_GEMV_ESIMD: %d\n", g_ggml_sycl_q80_gemv_esimd);
-        GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_HOIST: %d\n", g_ggml_sycl_q6k_mmvq_hoist);
-        GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q6k_mmvq_esimd);
-        GGML_LOG_INFO("  GGML_SYCL_Q5K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q5k_mmvq_esimd);
-        GGML_LOG_INFO("  GGML_SYCL_Q80_MMVQ_ESIMD: %d\n", g_ggml_sycl_q80_mmvq_esimd);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_ADD: %d\n", g_ggml_sycl_fuse_mm_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_GLU: %d\n", g_ggml_sycl_fuse_mm_glu);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_GDN_DT: %d\n", g_ggml_sycl_fuse_gdn_dt);
