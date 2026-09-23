@@ -72,7 +72,10 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                         const int32_t ne33,
                         const int32_t nb31,
                         const int32_t nb32,
-                        const int64_t nb33) {
+                        const int64_t nb33,
+                        const bool q8_input,
+                        const bool q8_soa,
+                        const int32_t kv_row_ne) {
 
 #ifdef SYCL_FLASH_ATTN
     // Skip unused kernel variants for faster compilation:
