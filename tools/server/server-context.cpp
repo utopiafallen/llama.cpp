@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-ckpt-sidecar.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1414,6 +1415,10 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        queue_tasks.on_heartbeat([this]() {
+            // Touch GPU backends to prevent driver VRAM eviction
+            llama_synchronize(ctx_tgt);
+        });
 
         metrics.init();
 
@@ -2579,6 +2584,12 @@ private:
                         break;
                     }
 
+                    const size_t nsidecar = server_ckpt_sidecar_write(
+                        server_ckpt_sidecar_path(filepath), slot->prompt.checkpoints);
+
+                    SLT_TRC(*slot, "saved checkpoint sidecar: %zu checkpoints, %.3f MiB\n",
+                            slot->prompt.checkpoints.size(), nsidecar / (1024.0 * 1024.0));
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2588,7 +2599,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nsidecar;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2636,8 +2647,16 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
+                        // Read checkpoints from sidecar before clear() deletes them
+                        std::list<common_prompt_checkpoint> sidecar_checkpoints;
+                        server_ckpt_sidecar_read(server_ckpt_sidecar_path(filepath), sidecar_checkpoints);
+
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->prompt.checkpoints = std::move(sidecar_checkpoints);
+
+                        SLT_TRC(*slot, "restored checkpoint sidecar: %zu checkpoints\n",
+                                slot->prompt.checkpoints.size());
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -4163,7 +4182,11 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
-    impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    int64_t sleep_ms = params.sleep_idle_seconds * 1000;
+    if (params.gpu_heartbeat_seconds > 0) {
+        sleep_ms = -1;  // --gpu-heartbeat disables idle sleep
+    }
+    impl->queue_tasks.start_loop(sleep_ms, params.gpu_heartbeat_seconds * 1000);
 }
 
 void server_context::terminate() {
