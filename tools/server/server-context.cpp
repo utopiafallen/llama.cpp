@@ -3377,6 +3377,12 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
+                                            // applying this checkpoint would leave the draft context out of sync
+                                            // with the target (the slot was saved without draft state) - reprocess instead
+                                            if (slot.ctx_dft && cur.data_dft.empty()) {
+                                                SLT_WRN(slot, "skipping checkpoint [%d, %d]: no draft state in sidecar - will reprocess\n", cur.pos_min, cur.pos_max);
+                                                return false;
+                                            }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
