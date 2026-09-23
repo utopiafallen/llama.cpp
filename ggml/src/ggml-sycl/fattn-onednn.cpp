@@ -232,6 +232,33 @@ catch (const std::exception & e) {
     return {};
 }
 
+// Dequantize a Q8_0 KV view in the per-head SoA layout to dense F16. Each physical row
+// (root ne[0] elements) holds head segments of [D int8 qs][D/32 half scales] (D + 16 bytes,
+// D = 256 here). `out` follows the view's logical element order: dim fastest, then
+// position, then head -- the same order to_fp16_nc fills it with on the non-SoA paths.
+static void fattn_stage_q8_0_soa(const char * kv, sycl::half * out, const int64_t nelem, const int64_t row_ne, const int64_t n_pos, const int64_t n_heads, const int64_t offset_b, queue_ptr stream) {
+    GGML_ASSERT(nelem % row_ne == 0);
+    const int64_t blk_per_hd = row_ne / (n_heads * QK8_0);   // blocks per head segment (8 for D = 256)
+    const int64_t hd_bytes   = QK8_0 * blk_per_hd + 16;     // segment: [D qs][D/32 half scales]
+    const int64_t row_stride = row_ne + 2 * (row_ne / QK8_0);
+    GGML_ASSERT(offset_b % row_stride == 0);
+    stream->parallel_for(nelem / QK8_0, [=](int64_t b) {
+        // Invert the view enumeration (dim fastest, then position, then head) to physical
+        // (row = position, head segment, block within head).
+        const int64_t dblk = b % blk_per_hd;
+        const int64_t rest = b / blk_per_hd;
+        const int64_t p    = offset_b / row_stride + rest % n_pos;
+        const int64_t h    = rest / n_pos;
+        const char * seg   = kv + p * row_stride + h * hd_bytes;
+        const sycl::half sc = *(const sycl::half *) (seg + QK8_0 * blk_per_hd + 2 * dblk);
+        const float s = (float) sc;
+        const int8_t * qs = (const int8_t *)(seg + dblk * QK8_0);
+        for (int e = 0; e < QK8_0; ++e) {
+            out[b * QK8_0 + e] = (sycl::half)((float) qs[e] * s);
+        }
+    });
+}
+
 void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -304,7 +331,16 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
             const bool k_non_dense = ((int64_t)K->ne[1] * K->nb[1] != K->nb[2]) && K->ne[2] > 1;
             const bool k_gemma = k_non_dense &&
                 ((int64_t)K->nb[2] < (int64_t)K->ne[1] * (int64_t)K->nb[1]);
-            if (ggml_is_contiguously_allocated(K) && !k_non_dense) {
+            if (ggml_sycl_is_q8_0_soa(K)) {
+                static bool soa_logged = false;
+                if (!soa_logged) {
+                    soa_logged = true;
+                    fprintf(stderr, "[SOA] onednn FA: staging K from per-row SoA Q8_0 (ne0=%ld)\n",
+                            (long) ggml_sycl_root_tensor(K)->ne[0]);
+                }
+                fattn_stage_q8_0_soa((const char *) ggml_sycl_root_tensor(K)->data, K_ptr, ggml_nelements(K),
+                                     ggml_sycl_root_tensor(K)->ne[0], K->ne[1], K->ne[2], (int64_t) (K_data - (const char *) ggml_sycl_root_tensor(K)->data), stream);
+            } else if (ggml_is_contiguously_allocated(K) && !k_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
                 to_fp16(K_data, K_ptr, ggml_nelements(K), stream);
             } else {
@@ -338,7 +374,10 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
             const bool v_non_dense = ((int64_t)V->ne[1] * V->nb[1] != V->nb[2]) && V->ne[2] > 1;
             const bool v_gemma = v_non_dense &&
                 ((int64_t)V->nb[2] < (int64_t)V->ne[1] * (int64_t)V->nb[1]);
-            if (ggml_is_contiguously_allocated(V) && !v_non_dense) {
+            if (ggml_sycl_is_q8_0_soa(V)) {
+                fattn_stage_q8_0_soa((const char *) ggml_sycl_root_tensor(V)->data, V_ptr, ggml_nelements(V),
+                                     ggml_sycl_root_tensor(V)->ne[0], V->ne[1], V->ne[2], (int64_t) (V_data - (const char *) ggml_sycl_root_tensor(V)->data), stream);
+            } else if (ggml_is_contiguously_allocated(V) && !v_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(V->type, dst);
                 to_fp16(V_data, V_ptr, ggml_nelements(V), stream);
             } else {
