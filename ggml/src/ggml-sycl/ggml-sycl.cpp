@@ -6388,7 +6388,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
         if (g_ggml_sycl_profile) {
-            op_times[ggml_op_name(node->op)] += ggml_time_us() - t_op_start;
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->stream()->wait()));
+            int64_t dt = ggml_time_us() - t_op_start;
+            op_times[ggml_op_name(node->op)] += dt;
+            if (dt > 50) {
+                ggml_sycl_profile_write("  [%lld] %s: %.1fms ne=[%lld %lld %lld %lld]\n",
+                    i, ggml_op_name(node->op), dt / 1000.0,
+                    (long long)node->ne[0], (long long)node->ne[1],
+                    (long long)node->ne[2], (long long)node->ne[3]);
+            }
         }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
