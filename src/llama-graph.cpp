@@ -3916,23 +3916,27 @@ ggml_tensor * llm_graph_context::build_rs(
     // {state_size, rs_size} -> {state_size, n_rs - i0}
     const int64_t i0 = n_rs - state_copy->ne[0];
 
-    ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+    ggml_tensor * output_states;
+    if (n_seqs == 1 && n_rs == 1 && states->ne[1] == 1) {
+        // single sequence, no RS buffer: state is already in place, skip the copy entirely
+        output_states = states;
+    } else {
+        ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+        output_states = get_state_rows ?
+            get_state_rows(ctx0, states, state_copy_main) :
+            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
 
-    ggml_tensor * output_states = get_state_rows ?
-        get_state_rows(ctx0, states, state_copy_main) :
-        ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+        // copy extra states which won't be changed further (between n_seqs and n_rs)
+        ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0,
+                states_extra,
+                ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    }
     ggml_build_forward_expand(gf, output_states);
-
-    // copy extra states which won't be changed further (between n_seqs and n_rs)
-    ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
-    ggml_build_forward_expand(gf,
-        ggml_cpy(ctx0,
-            states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
 
     return output_states;
 }
-
 static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,

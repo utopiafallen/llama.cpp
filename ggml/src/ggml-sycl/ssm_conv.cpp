@@ -1,6 +1,7 @@
 #include "ssm_conv.hpp"
 #include "common.hpp"
 #include "element_wise.hpp"
+#include "presets.hpp"
 
 #include <cstdio>
 
@@ -358,4 +359,46 @@ void ggml_sycl_ssm_conv_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         bias = static_cast<const float *>(bias_t->data);
     }
     ggml_sycl_op_ssm_conv(ctx, dst, silu_dst, bias);
+}
+
+void ggml_sycl_op_batched_conv_state_cpy(ggml_backend_sycl_context & ctx,
+                                         const ggml_sycl_batched_cpy_params & params) {
+    const int n = params.n_copies;
+    const int rows = params.rows;
+    const int cols = params.cols;
+    const int stride_row = params.stride_row;
+    const int stride_col = params.stride_col;
+
+    try {
+        queue *q = ctx.stream();
+
+        const size_t total_work = (size_t)n * (size_t)rows * (size_t)cols;
+        const size_t block_size = SYCL_CPY_BLOCK_SIZE;
+        const size_t num_blocks = (total_work + block_size - 1) / block_size;
+
+        q->submit([&](handler &h) {
+            h.parallel_for(
+                nd_range<1>(range<1>(num_blocks * block_size), range<1>(block_size)),
+                [=](nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    const size_t idx = (size_t)item.get_local_range(0) * item.get_group(0) + item.get_local_id(0);
+                    if (idx >= total_work) return;
+
+                    const int c = (int)(idx / ((size_t)rows * (size_t)cols));
+                    const int rem = (int)(idx % ((size_t)rows * (size_t)cols));
+                    // ggml column-major: dim0 varies fastest
+                    const int i0 = rem % rows;
+                    const int i1 = rem / rows;
+
+                    const float *src = params.srcs[c];
+                    float *dst = params.dsts[c];
+
+                    dst[rem] = src[i0 * stride_row + i1 * stride_col];
+                }
+            );
+        });
+
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[SYCL-BATCHED_CONV_STATE_CPY] ERROR: %s\n", e.what());
+        throw;
+    }
 }
