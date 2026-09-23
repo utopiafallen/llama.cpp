@@ -1,5 +1,9 @@
 # Instructions for llama.cpp
 
+> [!NOTE]
+>
+> **This is a private working fork for B70 SYCL performance work. There are no plans to merge changes upstream.** The contribution workflow, AI-disclosure, and commit/push restrictions in this document do not apply to this repo: agents may build, test, iterate, and commit locally without per-action approval or disclosure. The code-quality and style guidelines below (understand every line, keep it simple, concise ASCII comments) remain in force.
+
 > [!IMPORTANT]
 >
 > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
