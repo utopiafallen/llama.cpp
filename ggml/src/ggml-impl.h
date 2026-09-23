@@ -599,30 +599,78 @@ static inline int ggml_round_to_nearest_even(float x) {
     return fraction > 0.5f || (fraction == 0.5f && (value & 1)) ? value + 1 : value;
 }
 
-// Supports saturating conversion only; infinities and overflow clamp to +/-448.
-static inline uint8_t ggml_fp32_to_f8_e4m3(float x) {
-    const uint8_t sign = signbit(x) ? 0x80 : 0;
-    x = fabsf(x);
-
-    if (isnan(x)) {
-        // OCP FP8 leaves NaN sign handling to the implementation; use canonical 0x7F.
-        return 0x7F;
+// Round y (in [0, 8)) to the nearest even int (in [0, 8]) by bits, with no
+// external math symbols: the Intel SYCL (Arc B70) driver lacks device images
+// for frexp/floor/etc. Only used by ggml_fp32_to_f8_e4m3 below.
+static inline int ggml_round_nearest_even_0_8(float y) {
+    const uint32_t bits = fp32_to_bits(y);
+    const uint32_t ef   = (bits >> 23) & 0xFF;
+    const uint32_t mf   = bits & 0x7FFFFF;
+    if (ef == 0) {
+        return 0;  // subnormal: y < 2^-126 < 0.5
     }
-    if (x == 0.0f) {
+    if (ef < 127) {
+        // y in [0, 1): 0.5f == 0x3F000000; round-half-to-even -> 1 iff y > 0.5.
+        return bits > 0x3F000000u ? 1 : 0;
+    }
+    // y in [1, 8): ef in [127, 129]; the integer part sits in the upper bits of
+    // (2^23 + mf) once scaled by 2^(ef-150).
+    const uint32_t val   = (1u << 23) | mf;
+    const uint32_t shift = 150u - ef;  // 21..23
+    int intpart = (int) (val >> shift);
+    const uint32_t frac = val & ((1u << shift) - 1u);
+    const uint32_t half = 1u << (shift - 1);
+    if (frac > half || (frac == half && (intpart & 1))) {
+        intpart++;
+    }
+    return intpart;
+}
+
+// Supports saturating conversion only; infinities and overflow clamp to +/-448.
+// Pure bit-manipulation (no external math symbols): the Intel SYCL (Arc B70)
+// driver has no device images for the external frexpf/fabsf/isnan/isinf/floor
+// symbols, which crashed kernels calling this. Equivalent to the original,
+// bit-for-bit.
+static inline uint8_t ggml_fp32_to_f8_e4m3(float x) {
+    const uint32_t bits = fp32_to_bits(x);
+    const uint8_t  sign = (bits >> 31) & 1 ? 0x80 : 0;
+    const uint32_t ab   = bits & 0x7FFFFFFF;  // absolute-value bits
+    const uint32_t ef   = (ab >> 23) & 0xFF;
+    const uint32_t mf   = ab & 0x7FFFFF;
+
+    // NaN (exp==255, mant!=0) -> canonical 0x7F; Inf (exp==255, mant==0) -> sign|0x7E.
+    if (ef == 255) {
+        return mf ? 0x7F : (sign | 0x7E);
+    }
+    // Zero.
+    if (ab == 0) {
         return sign;
     }
-    if (isinf(x) || x >= 448.0f) {
+    // Overflow (x >= 448): 448.0f == 0x43E00000 (non-negative floats order by bits).
+    if (ab >= 0x43E00000u) {
         return sign | 0x7E;
     }
-    if (x < 0.015625f) {
-        // OCP FP8 rev. 1.1, section 5.1: subnormal magnitude = M * 2^(1 - bias - m) = M / 512.
-        return sign | (uint8_t) ggml_round_to_nearest_even(x * 512.0f);
+    // Underflow (x < 0.015625 = 2^-6): 0.015625f == 0x3C800000. OCP FP8 rev 1.1,
+    // section 5.1: subnormal magnitude = M * 2^(1 - bias - m) = M / 512.
+    if (ab < 0x3C800000u) {
+        return sign | (uint8_t) ggml_round_nearest_even_0_8(fp32_from_bits(ab) * 512.0f);
     }
 
-    int exp;
-    const float mantissa = frexpf(x, &exp) * 2.0f;
+    // Normal path: x in [0.015625, 448). Decompose by bits (no frexpf). The
+    // frexp exponent is ef - 126 and (mantissa - 1) * 8 = mf / 2^20; the rounding
+    // to nearest even is done by bits (no floorf).
+    const int exp = (int) ef - 126;
+    const int man_int = (int) (mf >> 20);
+    const uint32_t frac = mf & 0xFFFFF;
+    int encoded_man;
+    if (frac > (1u << 19)) {
+        encoded_man = man_int + 1;
+    } else if (frac == (1u << 19)) {
+        encoded_man = (man_int & 1) ? man_int + 1 : man_int;
+    } else {
+        encoded_man = man_int;
+    }
     int encoded_exp = exp + 6;
-    int encoded_man = ggml_round_to_nearest_even((mantissa - 1.0f) * 8.0f);
     if (encoded_man == 8) {
         encoded_man = 0;
         encoded_exp++;
