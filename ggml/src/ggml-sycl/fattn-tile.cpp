@@ -8,6 +8,8 @@
 #include <float.h>
 namespace syclex = sycl::ext::oneapi::experimental;
 
+bool g_fattn_tile_q8_input = false;
+
 void ggml_sycl_flash_attn_ext_tile(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];

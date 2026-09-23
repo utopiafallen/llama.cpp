@@ -621,6 +621,13 @@ template <int D, int type_K, int type_V>
 void ggml_sycl_flash_attn_ext_vec_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
+    const ggml_tensor * K   = dst->src[1];
+
+    // The vec kernel reads q8 KV as AoS blocks; the per-row SoA KV layout is only supported
+    // by the tile/onednn/XMX paths (unreachable for decode on Xe2, where XMX FA runs).
+    if (K->type == GGML_TYPE_Q8_0 && ggml_sycl_is_q8_0_soa(K)) {
+        GGML_ABORT("SoA q8_0 KV cache not supported by the VEC flash-attention kernel");
+    }
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));

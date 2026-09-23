@@ -21,6 +21,7 @@
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
 #include "fattn-dpas.hpp"
+#include "fattn-xmx-decode.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -175,6 +176,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                 kv_strides_ok = false;
                 break;
             }
+        }
+        if (kv_strides_ok) {
+            // MKL dequants q8 KV as AoS blocks; SoA KV must take the ONEDNN/TILE path.
+            kv_strides_ok = !(K->type == GGML_TYPE_Q8_0 && ggml_sycl_is_q8_0_soa(K));
         }
         if (kv_strides_ok) {
             return BEST_FATTN_KERNEL_MKL;
@@ -342,6 +347,16 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     }
 
     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
+
+    // XMX decode FA: QK^T and PV on the Intel XMX matrix engine (joint_matrix),
+    // split-KV with a combine kernel. falls back to the tile/vec kernel when the
+    // XMX decode kernel does not apply.
+    if (g_ggml_sycl_fa_xmx_decode &&
+        ggml_sycl_flash_attn_ext_xmx_decode_supported(ctx.device, dst)) {
+        ggml_sycl_flash_attn_ext_xmx_decode(ctx, dst);
+        return;
+    }
+
     switch (fk) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("Not support Flash-Attention");
@@ -479,6 +494,20 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     }
     if (tile_needs_V) {
         need_V = std::max(need_V, (size_t) ggml_nelements(V));
+    }
+
+    if (ggml_sycl_get_env("GGML_SYCL_FATTN_DEBUG", 0)) {
+        static int dbg_n = 0;
+        if (dbg_n++ < 48) {
+            fprintf(stderr, "[FATTN-DBG] #%d K=%s soa=%d n_kv=%lld nelements(K)=%lld "
+                    "onednn=%d tileK=%d tileV=%d -> need_K=%.1f MiB need_V=%.1f MiB "
+                    "need_Q=%.1f MiB need_out=%.1f MiB\n",
+                    dbg_n - 1, ggml_type_name(K->type), (int) ggml_sycl_is_q8_0_soa(K),
+                    (long long) K->ne[1], (long long) ggml_nelements(K),
+                    (int) onednn_supported, (int) tile_needs_K, (int) tile_needs_V,
+                    need_K * 2.0 / (1024.0 * 1024.0), need_V * 2.0 / (1024.0 * 1024.0),
+                    need_Q * 2.0 / (1024.0 * 1024.0), need_out * 2.0 / (1024.0 * 1024.0));
+        }
     }
 
     extra.Q_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_Q);

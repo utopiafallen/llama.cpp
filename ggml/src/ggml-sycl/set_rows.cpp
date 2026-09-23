@@ -308,6 +308,109 @@ static void set_rows_sycl(
 }
 
 template<typename TIn, typename TIdx>
+static void set_rows_sycl_q8_0_soa(const char * __restrict__ src0_d,
+                                   const TIdx * __restrict__ src1_d,
+                                   char * __restrict__ dst_d,
+                                   const int64_t ne00,
+                                   const int64_t ne01,
+                                   const int64_t ne02,
+                                   const int64_t ne03,
+                                   const int64_t ne11,
+                                   const int64_t ne12,
+                                   const size_t nb01,
+                                   const size_t nb02,
+                                   const size_t nb03,
+                                   const size_t nb10,
+                                   const size_t nb11,
+                                   const size_t nb12,
+                                   const size_t nb1,
+                                   const size_t nb2,
+                                   const size_t nb3,
+                                   queue_ptr stream) {
+    GGML_ASSERT(ne00 % QK8_0 == 0);
+    const int64_t total_blocks = (ne00 * ne01 * ne02 * ne03) / QK8_0;
+    constexpr int block_size   = 256;
+    const int64_t grid_size    = ceil_div(total_blocks, block_size);
+
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item_ct1) {
+        const int64_t i = item_ct1.get_global_linear_id();
+        if (i >= total_blocks) {
+            return;
+        }
+        const int64_t i_base      = i * QK8_0;
+        const int64_t i03         = i_base / (ne00 * ne01 * ne02);
+        const int64_t rem1        = i_base - i03 * (ne00 * ne01 * ne02);
+        const int64_t i02         = rem1 / (ne00 * ne01);
+        const int64_t rem2        = rem1 - i02 * ne00 * ne01;
+        const int64_t i01         = rem2 / ne00;
+        const int64_t i00         = rem2 - i01 * ne00;
+        const int64_t i12         = i03 % ne12;
+        const int64_t i11         = i02 % ne11;
+        const int64_t i10         = i01;
+        const size_t  src_offset  = calculate_offset<3>({ nb01, nb02, nb03 }, { i01, i02, i03 });
+        const char *  src_block   = src0_d + src_offset + i00 * sizeof(TIn);
+        const size_t  src1_offset = calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 });
+        const int64_t dst_row     = src1_d[src1_offset / sizeof(TIdx)];
+        char * row_base           = (char *) dst_d + calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 });
+        const int64_t b           = i00 / QK8_0;
+
+        block_q8_0 blk;
+        if constexpr (std::is_same_v<TIn, float>) {
+            cpy_blck_f32_q8_0(src_block, (char *) &blk);
+        } else {
+            float src_block_f32[QK8_0];
+            const TIn * src_block_t = reinterpret_cast<const TIn *>(src_block);
+            for (int j = 0; j < QK8_0; ++j) {
+                src_block_f32[j] = (float) src_block_t[j];
+            }
+            cpy_blck_f32_q8_0(reinterpret_cast<const char *>(src_block_f32), (char *) &blk);
+        }
+
+        // SoA per-head row layout: 4 segments of [256 qs][8 half scales] = 1088 B (fits the q8_0 row;
+        // a dense-qs + trailing-scales layout would need 1152 B and overflow into the next row).
+        const int64_t h  = b / 8;   // 8 blocks per head (D = 256)
+        const int64_t bb = b % 8;
+        char * seg       = row_base + h * (8 * QK8_0 + 16);
+        sycl::vec<int8_t, 16> qv[2];
+        for (int j = 0; j < QK8_0; ++j) {
+            qv[j/16][j%16] = blk.qs[j];
+        }
+        *(sycl::vec<int8_t, 16> *) (seg + bb * QK8_0) = qv[0];
+        *(sycl::vec<int8_t, 16> *) (seg + bb * QK8_0 + 16) = qv[1];
+        *(sycl::half *) (seg + 8 * QK8_0 + 2 * bb) = blk.d;
+    });
+    GGML_UNUSED(ne11);
+}
+
+// Debug: dump the first 16 rows of a KV cache root to the host for layout checks.
+// Enable with GGML_SYCL_KV_DUMP=<file prefix>; one dump per tensor (first write wins).
+static void kv_row_dump(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, dpct::queue_ptr & stream) {
+    static bool k_done = false, v_done = false;
+    const char * env = getenv("GGML_SYCL_KV_DUMP");
+    if (!env || !dst->name) return;
+    const bool is_k3 = strncmp(dst->name, "cache_k_l3", 10) == 0;
+    const bool is_v3 = strncmp(dst->name, "cache_v_l3", 10) == 0;
+    if ((!is_k3 && !is_v3) || (is_k3 && k_done) || (is_v3 && v_done)) return;
+
+    const ggml_tensor * root = ggml_sycl_root_tensor(dst);
+    const int rows      = 16;
+    const size_t row_bytes = root->nb[1]; // position stride
+    std::vector<char> buf(rows * row_bytes);
+    stream->memcpy(buf.data(), root->data, buf.size());
+    stream->wait();
+    char fname[256];
+    snprintf(fname, sizeof(fname), "%s_%s.bin", env, dst->name);
+    FILE * f = fopen(fname, "wb");
+    if (f) {
+        fwrite(buf.data(), 1, buf.size(), f);
+        fclose(f);
+    }
+    fprintf(stderr, "[SOA] dumped %d rows x %zu B of '%s' -> %s\n", rows, row_bytes, dst->name, fname);
+    if (is_k3) k_done = true; else v_done = true;
+    GGML_UNUSED(ctx);
+}
+
+template <typename TIn, typename TIdx>
 static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const char * src0_d = (const char *)src0->data;
     const TIdx * src1_d = (const TIdx *)src1->data;
@@ -356,10 +459,23 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
             break;
 #endif
         case GGML_TYPE_Q8_0:
-            set_rows_sycl_q<TIn, TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
-                src0_d, src1_d, (block_q8_0 *) dst->data, ne00, ne01, ne02, ne03,
-                ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            if (ggml_sycl_is_q8_0_soa(dst)) {
+                static bool soa_logged = false;
+                if (!soa_logged) {
+                    soa_logged = true;
+                    fprintf(stderr, "[SOA] set_rows: writing Q8_0 KV in per-row SoA layout (root ne0=%ld)\n",
+                            (long) ggml_sycl_root_tensor(dst)->ne[0]);
+                }
+                set_rows_sycl_q8_0_soa<TIn, TIdx>(
+                    src0_d, src1_d, (char *) dst->data, ne00, ne01, ne02, ne03,
+                    ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                kv_row_dump(ctx, dst, stream);
+            } else {
+                set_rows_sycl_q<TIn, TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
+                    src0_d, src1_d, (block_q8_0 *) dst->data, ne00, ne01, ne02, ne03,
+                    ne10, ne11, ne12, ne13, nb00, nb01,
+                    nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            }
             break;
         case GGML_TYPE_Q1_0:
             set_rows_sycl_q<TIn, TIdx, block_q1_0, QK1_0, cpy_blck_f32_q1_0>(
