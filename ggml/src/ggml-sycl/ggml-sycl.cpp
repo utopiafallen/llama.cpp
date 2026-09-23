@@ -372,6 +372,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
+        fprintf(stderr, "[SOA] startup: GGML_SYCL_KV_SOA=%d enable_opt=%d\n",
+                ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0), g_ggml_sycl_enable_optimize);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_fa_tile_gqa_min_kv = ggml_sycl_get_env("GGML_SYCL_FA_TILE_GQA_MIN_KV", 8192);
         g_ggml_sycl_fa_xmx_decode = ggml_sycl_get_env("GGML_SYCL_FA_XMX_DECODE", 1);
@@ -687,14 +689,48 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);
+        if (tensor->type == GGML_TYPE_Q8_0) {
+            static bool view_dump = false;
+            if (!view_dump) {
+                view_dump = true;
+                fprintf(stderr, "[SOA] view q8_0 first: '%s' ne=%ldx%ldx%ld root='%s' (further views suppressed)\n",
+                        tensor->name, (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2],
+                        tensor->view_src->name);
+            }
+        }
         return GGML_STATUS_SUCCESS;
     }
 
     if (g_ggml_sycl_enable_optimize) {
         // set reorder extra buffer based on supported type
         switch (tensor->type) {
+            case GGML_TYPE_Q8_0: {
+                // 3D Q8_0 = KV cache tensor. Opt-in per-row SoA layout (GGML_SYCL_KV_SOA=1) for
+                // aligned FA loads; weights are 2D and keep the standard layout here.
+                int rank = 0;
+                for (int i = 0; i < GGML_MAX_DIMS && tensor->ne[i] > 0; ++i) {
+                    ++rank;
+                }
+                static bool q8_dump = false;
+                if (!q8_dump) {
+                    q8_dump = true;
+                    fprintf(stderr, "[SOA] init_tensor q8_0 first: '%s' ne=%ldx%ldx%ld rank=%d (further q8_0 inits suppressed)\n",
+                            tensor->name, (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], rank);
+                }
+                ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
+                tensor->extra                 = extra;
+                const char * nm = tensor->name;
+                // llama.cpp names KV cache tensors cache_k_l*/cache_v_l* (root); weights never match
+                const bool is_kv = strncmp(nm, "cache_k", 7) == 0 || strncmp(nm, "cache_v", 7) == 0;
+                if (ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0) && is_kv) {
+                    extra->optimized_feature.reorder = true;
+                    fprintf(stderr, "[SOA] tensor '%s' (ne=%ldx%ldx%ld q8_0) -> per-row SoA KV layout\n",
+                            tensor->name, (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2]);
+                }
+                ctx->tensor_extras.push_back(extra);
+                break;
+            }
             case GGML_TYPE_Q4_0:
-            case GGML_TYPE_Q8_0:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:

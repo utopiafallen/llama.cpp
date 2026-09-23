@@ -10,9 +10,13 @@
 
 #include "ggml.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cmath>
 #include <float.h>
+
+extern bool g_fattn_tile_q8_input;
 
 
 #define FATTN_KQ_STRIDE       256
@@ -57,7 +61,10 @@ typedef void (*fattn_kernel_t)(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33);
+    const int64_t nb33,
+    const bool q8_input,
+    const bool q8_soa,
+    const int32_t kv_row_ne);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -874,7 +881,10 @@ static void lauch_kernel(
     const int32_t ne33,
     const int32_t nb31,
     const int32_t nb32,
-    const int64_t nb33) {
+    const int64_t nb33,
+    const bool q8_input,
+    const bool q8_soa,
+    const int32_t kv_row_ne) {
     GGML_UNUSED(local_mem_size);
     q->submit([&](sycl::handler &cgh) {
         cgh.parallel_for(
@@ -887,7 +897,8 @@ static void lauch_kernel(
                              max_bias, m0, m1, n_head_log2, logit_softcap, ne00,
                              ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11,
                              ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
-                             ne31, ne32, ne33, nb31, nb32, nb33);
+                             ne31, ne32, ne33, nb31, nb32, nb33, q8_input,
+                             q8_soa, kv_row_ne);
             });
     });
 }
@@ -942,32 +953,51 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
+    static const bool disable_q8_tile = []() {
+        return ggml_sycl_get_env("GGML_SYCL_FATTN_TILE_Q8", 1) == 0;
+    }();
+
     if (need_f16_K && K->type != GGML_TYPE_F16) {
-        const size_t bs = ggml_blck_size(K->type);
-        const size_t ts = ggml_type_size(K->type);
-
-        sycl::half * K_f16_ptr = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr
-                                                    : K_f16.alloc(ggml_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
-            to_fp16(K_data, K_f16_ptr, ggml_nelements(K), main_stream);
-
-            nb11 = nb11 * bs * sizeof(sycl::half) / ts;
-            nb12 = nb12 * bs * sizeof(sycl::half) / ts;
-            nb13 = nb13 * bs * sizeof(sycl::half) / ts;
+        // SoA roots fail the contiguity check: the FA view is permuted/strided. Their
+        // rows are dense by construction, which the kernel's SoA tile load addresses.
+        if (!disable_q8_tile && K->type == GGML_TYPE_Q8_0 &&
+            (ggml_is_contiguously_allocated(K) || ggml_sycl_is_q8_0_soa(K))) {
+            // Q8_0 fast path: skip conversion, kernel dequants tiles on-the-fly
+            static bool q8fa_logged = false;
+            if (!q8fa_logged) {
+                q8fa_logged = true;
+                fprintf(stderr, "[SOA] tile FA: q8 on-the-fly dequant path (soa=%d)\n",
+                        (int) ggml_sycl_is_q8_0_soa(K));
+            }
+            g_fattn_tile_q8_input = true;
+            // nb11/nb12/nb13 stay as raw byte strides (no scaling)
         } else {
-            GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            const size_t bs = ggml_blck_size(K->type);
+            const size_t ts = ggml_type_size(K->type);
 
-            nb11 = K->ne[0] * sizeof(sycl::half);
-            nb12 = K->ne[1] * nb11;
-            nb13 = K->ne[2] * nb12;
+            sycl::half * K_f16_ptr = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr
+                                                        : K_f16.alloc(ggml_nelements(K));
+            if (ggml_is_contiguously_allocated(K)) {
+                to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
+                to_fp16(K_data, K_f16_ptr, ggml_nelements(K), main_stream);
+
+                nb11 = nb11 * bs * sizeof(sycl::half) / ts;
+                nb12 = nb12 * bs * sizeof(sycl::half) / ts;
+                nb13 = nb13 * bs * sizeof(sycl::half) / ts;
+            } else {
+                GGML_ASSERT(K->nb[0] == ts);
+                to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                to_fp16(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+
+                nb11 = K->ne[0] * sizeof(sycl::half);
+                nb12 = K->ne[1] * nb11;
+                nb13 = K->ne[2] * nb12;
+            }
+            K_data = (char *) K_f16_ptr;
         }
-        K_data = (char *) K_f16_ptr;
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -976,6 +1006,10 @@ void launch_fattn(
             nb21   = nb11;
             nb22   = nb12;
             nb23   = nb13;
+        } else if (!disable_q8_tile && V->type == GGML_TYPE_Q8_0 &&
+                   (ggml_is_contiguously_allocated(V) || ggml_sycl_is_q8_0_soa(V))) {
+            // Q8_0 fast path: skip conversion
+            g_fattn_tile_q8_input = true;
         } else {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
@@ -1095,9 +1129,32 @@ void launch_fattn(
             }
         }
 
+        // Batched GQA config (ntiles_z_gqa == 1): tiny ntiles_total makes the wave
+        // heuristic stop at very few parallel blocks -> long serial K chains per WG.
+        // Measured @152K Q=4 q8: auto PB=4 = 284ms/step, PB=16 = 153ms, PB=32 = 163ms.
+        if (ntiles_z_gqa == 1 && gqa_ratio > 1 && ntiles_KQ >= 16) {
+            parallel_blocks = std::max(parallel_blocks, 16);
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+
+        // A/B override for the KV-split width
+        if (const char * pb_env = getenv("GGML_SYCL_FA_TILE_PB")) {
+            const int pb_override = atoi(pb_env);
+            if (pb_override > 1) {
+                parallel_blocks = std::min(pb_override, ntiles_KQ);
+                blocks_num.y = parallel_blocks;
+            }
+        }
+
+        static std::atomic<bool> fa_tile_cfg_printed(false);
+        if (!fa_tile_cfg_printed.exchange(true)) {
+            fprintf(stderr, "FA-TILE cfg: Q=[%d %d] nbatch_fa=%d PB=%d ntiles_KQ=%d max_wg=%d z=%d\n",
+                    (int) Q->ne[0], (int) Q->ne[1], nbatch_fa, parallel_blocks, ntiles_KQ,
+                    max_blocks_per_sm, (int) blocks_num.z);
+        }
 
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
@@ -1126,6 +1183,37 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const sycl::uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
+    // Per-row SoA q8 KV (env-gated at tensor init): raw strides are unchanged, the kernel
+    // just reads dense int8 + row-tail scales instead of interleaved 34B blocks.
+    const bool    q8_soa    = g_fattn_tile_q8_input && ggml_sycl_is_q8_0_soa(K);
+    const int32_t kv_row_ne = q8_soa ? (int32_t) ggml_sycl_root_tensor(K)->ne[0] : 0;
+
+    // Debug: one-shot host-side replica of the tile SoA K dequant for positions 0..3, all heads.
+    if (q8_soa && getenv("GGML_SYCL_KV_DUMP")) {
+        static bool kvdbg_done = false;
+        if (!kvdbg_done && Q->ne[1] > 1) {
+            kvdbg_done = true;
+            const int64_t DKQv = K->ne[0];
+            std::vector<char> kbuf(4 * (size_t) nb11);
+            main_stream->memcpy(kbuf.data(), K_data, kbuf.size());
+            main_stream->wait();
+            std::vector<float> out(4 * (size_t) K->ne[2] * DKQv);
+            for (int p = 0; p < 4; ++p) {
+                const char * row = kbuf.data() + (int64_t) p * nb11;
+                for (int h = 0; h < K->ne[2]; ++h) {
+                    const char * seg = row + h * (DKQv + 16);
+                    for (int d = 0; d < DKQv; ++d) {
+                        const float s = (float) *(const sycl::half *) (seg + DKQv + 2 * (d / 32));
+                        out[(p * K->ne[2] + h) * DKQv + d] = (float) (int8_t)(seg[d]) * s;
+                    }
+                }
+            }
+            FILE * f = fopen("fa_check_k.bin", "wb");
+            if (f) { fwrite(out.data(), 1, out.size() * 4, f); fclose(f); }
+            fprintf(stderr, "[SOA] fa_check_k.bin written (4 pos x %d heads x %ld dims)\n", K->ne[2], DKQv);
+        }
+    }
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
     lauch_kernel<fattn_kernel, warp_size>(
@@ -1134,9 +1222,10 @@ void launch_fattn(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, (sycl::float2 *)dst_tmp_meta.ptr, scale, max_bias, m0, m1,
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,
-        mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
-        mask ? mask->nb[3] : 0);
+ mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
+ mask ? mask->nb[3] : 0, g_fattn_tile_q8_input, q8_soa, kv_row_ne);
     SYCL_CHECK(0);
+    g_fattn_tile_q8_input = false;
 
     if (stream_k) {
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.

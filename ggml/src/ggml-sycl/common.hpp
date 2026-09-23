@@ -358,6 +358,25 @@ struct ggml_tensor_extra_gpu {
   optimize_feature optimized_feature;
 };
 
+// Base tensor whose allocation holds t's data (follows the view chain).
+static inline const ggml_tensor * ggml_sycl_root_tensor(const ggml_tensor * t) {
+    while (t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// Q8_0 KV cache stored in per-row SoA layout: each ne[0]-row holds [ne[0] int8 qs][ne[0]/32 half scales],
+// same total bytes as standard q8_0 so nb[1] and all row addressing are unchanged.
+static inline bool ggml_sycl_is_q8_0_soa(const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    const ggml_tensor * root = ggml_sycl_root_tensor(t);
+    return root->extra != nullptr &&
+           ((const ggml_tensor_extra_gpu *) root->extra)->optimized_feature.reorder;
+}
+
 extern int g_ggml_sycl_use_level_zero_api;
 void * ggml_sycl_malloc_device(size_t size, sycl::queue &q,
                                ggml_sycl_mem_type type = GGML_SYCL_MEM_DIRECT);
