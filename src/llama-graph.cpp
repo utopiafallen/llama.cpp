@@ -3498,7 +3498,13 @@ ggml_tensor * llm_graph_context::build_rs(
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
     // {state_size, rs_size} -> {state_size, n_seqs}
-    ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
+    ggml_tensor * output_states;
+    if (n_seqs == 1 && n_rs == 1 && states->ne[1] == 1) {
+        // single sequence, no RS buffer: state is already in place, skip get_rows
+        output_states = states;
+    } else {
+        output_states = get_state_rows(ctx0, states, state_copy_main);
+    }
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
