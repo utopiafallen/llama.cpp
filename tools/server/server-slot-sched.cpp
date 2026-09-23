@@ -10,7 +10,7 @@
 // server_prompt
 //
 
-server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const {
+server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min, bool has_draft) const {
     server_prompt_reuse res;
     res.n_past   = n_prefix;
     res.pos_next = tokens.pos_next(n_prefix);
@@ -36,6 +36,12 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
             SRV_TRC("checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
             if (cur.pos_max > res.pos_next) {
+                return false;
+            }
+            // applying this checkpoint would leave the draft context out of sync
+            // with the target (the slot was saved without draft state) - reprocess instead
+            if (has_draft && cur.data_dft.empty()) {
+                SRV_WRN("skipping checkpoint [%d, %d]: no draft state - will reprocess\n", cur.pos_min, cur.pos_max);
                 return false;
             }
             return cur.pos_min < pos_min_thold || cur.pos_min == 0;

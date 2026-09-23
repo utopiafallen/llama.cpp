@@ -4228,7 +4228,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa_reuse, pos_min);
+                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa_reuse, pos_min, ctx_dft != nullptr);
 
                                 if (reuse.ckpt) {
                                     const auto & cur = *reuse.ckpt;
