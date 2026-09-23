@@ -142,6 +142,11 @@ static int ggml_sycl_get_env_precision(const char * name, int def) {
     GGML_LOG_WARN("%s: unknown %s=%s, using %s\n", __func__, name, env, ggml_sycl_dynamic_precision_names[def]);
     return def;
 }
+int g_ggml_sycl_q6k_gemv_row = 0;
+int g_ggml_sycl_q80_gemv_esimd = 1;
+int g_ggml_sycl_fuse_mm_add = 1;
+int g_ggml_sycl_fuse_mm_glu = 1;
+int g_ggml_sycl_fuse_gdn_dt = 1;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -459,6 +464,11 @@ static void ggml_check_sycl() try {
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
         g_ggml_sycl_dynamic_required_precision =
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_REQUIRED_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_F32);
+        g_ggml_sycl_q6k_gemv_row = ggml_sycl_get_env("GGML_SYCL_Q6K_GEMV_ROW", 0);
+        g_ggml_sycl_q80_gemv_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_GEMV_ESIMD", 1);
+        g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
+        g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
+        g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -605,6 +615,14 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_XMX_GLU_MAX_COLS: %d\n", g_ggml_sycl_xmx_glu_max_cols);
 
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+
+#if defined(__INTEL_LLVM_COMPILER)
+        GGML_LOG_INFO("  GGML_SYCL_Q6K_GEMV_ROW: %d\n", g_ggml_sycl_q6k_gemv_row);
+        GGML_LOG_INFO("  GGML_SYCL_Q80_GEMV_ESIMD: %d\n", g_ggml_sycl_q80_gemv_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_ADD: %d\n", g_ggml_sycl_fuse_mm_add);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_GLU: %d\n", g_ggml_sycl_fuse_mm_glu);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_GDN_DT: %d\n", g_ggml_sycl_fuse_gdn_dt);
+#endif
 
         g_ggml_sycl_use_async_mem_op_requested = ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
         GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
@@ -5583,6 +5601,60 @@ static int ggml_sycl_l2_norm_batch_fused(ggml_backend_sycl_context & ctx, ggml_c
 }
 
 
+
+
+// Fused mat-vec + residual add for the {mul_mat, add} chain at node_idx: the DMMV
+// kernel stores dst = w @ x + res. Returns false if it declined, in which case the
+// caller runs the two nodes normally.
+static bool ggml_sycl_mul_mat_add_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_fuse_mm_add || !g_ggml_sycl_enable_esimd) {
+        return false;
+    }
+    if (node_idx + 1 >= cgraph->n_nodes || cgraph->nodes[node_idx + 1]->op != GGML_OP_ADD) {
+        return false;
+    }
+
+    ggml_tensor *       mm  = cgraph->nodes[node_idx];
+    ggml_tensor *       add = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * res = (add->src[0] == mm) ? add->src[1] : add->src[0];
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+
+    if (!ggml_sycl_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_ADD }, {})) {
+        return false;
+    }
+
+    // only the reordered ESIMD DMMV path carries this epilogue
+    if (src0->type != GGML_TYPE_Q6_K || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        res->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // mat-vec only, one residual value per output row
+    if (src1->ne[1] != 1 || mm->ne[1] != 1 || !ggml_is_contiguous(res) || ggml_nelements(res) != mm->ne[0]) {
+        return false;
+    }
+    // mm is written directly rather than stitched back per device, so it cannot serve split weights
+    if (ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        return false;
+    }
+    // the row kernel has no add epilogue; keep the two q6_K paths exclusive
+    if (g_ggml_sycl_q6k_gemv_row) {
+        return false;
+    }
+
+    opt_for_reorder(&ctx, src0, src1, mm, mul_mat_algo::DMMV);
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra || !extra->optimized_feature.reorder) {
+        return false;
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, mm, /*num_src=*/2, " : fused with residual add");
+
+    ggml_sycl_q6_k_dmmv_reorder_esimd_add(src0->data, (const float *) src1->data, (const float *) res->data,
+                                          (float *) mm->data, (int) src0->ne[0], (int) mm->ne[0], ctx.stream());
+    return true;
+}
+
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
     const mmid_row_mapping *__restrict__ row_mapping,
@@ -6824,6 +6896,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
             continue;
+        }
+
+
+        if (node->op == GGML_OP_MUL_MAT) {
+            // dispatches internally when the pattern matches
+            if (ggml_sycl_mul_mat_add_fused(*sycl_ctx, cgraph, i)) {
+                if (g_ggml_sycl_profile) {
+                    op_times["mul_mat_add_fused"] += ggml_time_us() - t_op_start;
+                }
+                i += 1;
+                continue;
+            }
         }
 
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);

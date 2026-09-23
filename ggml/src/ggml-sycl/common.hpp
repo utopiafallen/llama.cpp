@@ -133,6 +133,11 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
     return g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
            (src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_F16);
 }
+extern int g_ggml_sycl_q6k_gemv_row;
+extern int g_ggml_sycl_q80_gemv_esimd;
+extern int g_ggml_sycl_fuse_mm_add;
+extern int g_ggml_sycl_fuse_mm_glu;
+extern int g_ggml_sycl_fuse_gdn_dt;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
