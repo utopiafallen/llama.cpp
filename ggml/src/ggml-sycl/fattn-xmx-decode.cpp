@@ -60,6 +60,7 @@ static void xmx_decode_main(
         const int v_pos_stride_b, const int v_head_stride_b,
         const float scale, const bool q8_input, const int f16_lds, const bool q8_soa, const int ne_row_b,
         const int gqa_r, const int n_hg, // real GQA ratio and head-groups per kv head (1 = dense)
+        const bool p1only, // diagnostic: skip the PV section (QK+softmax cost probe), output invalid
         const sycl::nd_item<3> & it) {
     constexpr int D    = 256;
     constexpr int ROWS = GQA * MQ; // live rows
@@ -257,7 +258,8 @@ static void xmx_decode_main(
     }
     sg.barrier();
 
-    // 4. PV: O = P @ V, per 16-dim chunk
+    // 4. PV: O = P @ V, per 16-dim chunk (skipped by the P1ONLY diagnostic)
+    if (!p1only) {
     mx::joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::row_major> B_v;
     mx::joint_matrix<sycl::sub_group, float, use::accumulator, M, 16> O_jm[NCHUNK];
     for (int dc = 0; dc < D/16; dc++) {
@@ -339,6 +341,7 @@ static void xmx_decode_main(
                 D, layout::row_major);
         }
     }
+    } // !p1only
 }
 
 // Combine the per-split partials (flash-decoding merge) into the final output.
@@ -737,6 +740,15 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
 
     // Optional per-kernel wall timing (serializes the stream; debug only): [XMQ-T] lines on stderr
     static int xmx_t = ggml_sycl_get_env("GGML_SYCL_XMX_TIMING", 0);
+    // Diagnostic: skip the PV section of the main kernel (QK+softmax-only wall, two-phase-P probe).
+    // Output is INVALID while on - timing only.
+    static int xmx_p1 = ggml_sycl_get_env("GGML_SYCL_XMX_P1ONLY", 0);
+    const bool p1only = xmx_p1 != 0;
+    static bool p1_warned = false;
+    if (p1only && !p1_warned) {
+        p1_warned = true;
+        fprintf(stderr, "[XMQ-P1] P1ONLY diagnostic ON: FA output INVALID, main-kernel timing only\n");
+    }
     // Combine kernel variant: default 4 = two-phase chunked merge (faster at long context:
     // combine 1.50->1.22ms/node @152K MQ=5, 0.55->0.17 @MQ=1, output-equivalent f32 reassociation;
     // wall A/B parity-to-better vs scalar 63.2 vs 64.4 avg). Env: 0 = scalar single-phase, 2 = vec4.
@@ -849,7 +861,7 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
                     n_kv, n_kv_heads, n_q_heads, n_splits_l, q_pos_stride, q_head_stride, k_pos_stride, \
                     k_head_stride, v_pos_stride, v_head_stride, mask_head_stride, mask_ne1, \
                     k_pos_stride_b, k_head_stride_b, v_pos_stride_b, v_head_stride_b, \
-                    scale, q8_input, xmx_f16_lds, q8_soa, ne_row_b, gqa, n_hg_l, it); \
+                    scale, q8_input, xmx_f16_lds, q8_soa, ne_row_b, gqa, n_hg_l, p1only, it); \
             }); \
         SYCL_CHECK(0)
 
