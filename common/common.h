@@ -373,6 +373,10 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // MTP: accept draft tokens by Leviathan ratio test with mirrored draft sampling instead of
+    // exact prefix match. off = classic path, bit-identical
+    bool rejection_sampling = true;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 

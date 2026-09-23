@@ -718,6 +718,10 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
 
+bool common_sampler_has_grammar(const struct common_sampler * gsmpl) {
+    return gsmpl && gsmpl->grmr != nullptr;
+}
+
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return false;

@@ -4194,6 +4194,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.synth_rates = std::move(rates);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
+    add_opt(common_arg(
+        {"--spec-rejection-sampling"},
+        {"--no-spec-rejection-sampling"},
+        string_format("MTP: accept draft tokens by Leviathan ratio test with mirrored draft sampling (default: %s)",
+                      params.speculative.rejection_sampling ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.rejection_sampling = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_REJECTION_SAMPLING"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

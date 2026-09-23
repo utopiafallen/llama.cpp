@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -83,6 +84,119 @@ static std::vector<llama_token> server_sample_and_accept_synth(
             common_sampler_accept(smpl, draft[i], is_replay_target);
             result.push_back(draft[i]);
             continue;
+        }
+
+        common_sampler_accept(smpl, id, true);
+        result.push_back(id);
+        return result;
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
+    return result;
+}
+
+// rejection-sampling acceptance for MTP drafts (Leviathan et al.): accept the draft token at
+// position i when u < min(1, p(x)/q(x)), where p is the target temperature-scaled softmax and
+// q is the mirrored draft distribution captured at draft time; on rejection, resample once from
+// the normalized residual [p - q]+ and stop. output marginally ~ p. v1 caveats: target
+// penalties are not mirrored (small bias toward used tokens) and grammar is not supported
+// (the caller falls back to exact prefix match when a grammar is active)
+static std::vector<llama_token> server_sample_and_accept_rej(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft,
+        const common_speculative_draft_q & q,
+        float temp,
+        std::mt19937 & rng,
+        bool is_replay) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(q.ids.size() >= draft.size());
+    GGML_ASSERT(temp > 0.0f);
+
+    const llama_model * model = llama_get_model(ctx);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    std::vector<float> p(n_vocab);
+    std::vector<float> q_vec(n_vocab);
+
+    llama_synchronize(ctx);
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        if (is_replay) {
+            // the list was already decided before the checkpoint restore - re-emit it
+            // (last entry is from the target and must advance grammar/reasoning state)
+            const bool is_replay_target = i + 1 == draft.size();
+            common_sampler_accept(smpl, draft[i], is_replay_target);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        const float * logits = llama_get_logits_ith(ctx, idxs[i]);
+        GGML_ASSERT(logits != nullptr);
+
+        // p(x) = softmax(logits / temp)
+        float m = -INFINITY;
+        for (int t = 0; t < n_vocab; ++t) {
+            m = std::max(m, logits[t] / temp);
+        }
+        double sumexp = 0.0;
+        for (int t = 0; t < n_vocab; ++t) {
+            p[t] = std::exp(logits[t] / temp - m);
+            sumexp += p[t];
+        }
+        const float inv_sum = 1.0f / (float) sumexp;
+
+        // q is zero outside the captured draft support at this position
+        std::fill(q_vec.begin(), q_vec.end(), 0.0f);
+        const auto & q_ids = q.ids[i];
+        const auto & q_p   = q.p[i];
+        for (size_t k = 0; k < q_ids.size(); ++k) {
+            q_vec[q_ids[k]] = q_p[k];
+        }
+
+        const float p_d = p[draft[i]] * inv_sum;
+        const float q_d = q_vec[draft[i]];
+        if (q_d > 0.0f && dist(rng) < std::min(1.0, (double) p_d / (double) q_d)) {
+            common_sampler_accept(smpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // resample from the normalized residual [p - q]+
+        double r_sum = 0.0;
+        for (int t = 0; t < n_vocab; ++t) {
+            const float r = p[t] * inv_sum - q_vec[t];
+            if (r > 0.0f) {
+                r_sum += r;
+            }
+        }
+
+        llama_token id = LLAMA_TOKEN_NULL;
+        if (r_sum > 1e-9) {
+            double u = dist(rng) * r_sum;
+            for (int t = 0; t < n_vocab; ++t) {
+                const float r = p[t] * inv_sum - q_vec[t];
+                if (r <= 0.0f) {
+                    continue;
+                }
+                u -= r;
+                if (u <= 0.0) {
+                    id = (llama_token) t;
+                    break;
+                }
+            }
+        }
+        if (id == LLAMA_TOKEN_NULL) {
+            // numerical fallback: draw from the target chain directly
+            id = common_sampler_sample(smpl, ctx, idxs[i]);
         }
 
         common_sampler_accept(smpl, id, true);
@@ -1809,11 +1923,15 @@ private:
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
-            if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
+            if (spec && (!common_speculative_get_synth_probs(spec.get()).empty() || params_base.speculative.rejection_sampling)) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
+            }
+
+            if (spec && params_base.speculative.rejection_sampling) {
+                common_speculative_set_draft_sampling(spec.get(), task.params.sampling);
             }
         } else {
             slot.smpl.reset();
@@ -3937,11 +4055,20 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                // ratio test needs a mirrored draft (get_draft_q is null without it) and no grammar
+                const common_speculative_draft_q * draft_q = params_base.speculative.rejection_sampling && synth_probs.empty()
+                    ? common_speculative_get_draft_q(spec.get(), slot.id)
+                    : nullptr;
+                auto accepted = !synth_probs.empty()
+                    ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
+                    : (draft_q != nullptr && !common_sampler_has_grammar(slot.smpl.get())
+                        ? server_sample_and_accept_rej(
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                *draft_q, slot.task->params.sampling.temp, slot.spec_synth_rng,
+                                slot.spec_is_replay)
+                        : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft));
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
