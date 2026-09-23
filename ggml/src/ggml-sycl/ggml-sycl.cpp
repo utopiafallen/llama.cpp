@@ -66,6 +66,7 @@
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
+#include "ggml-sycl/mmvq-xmx-gemm.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
@@ -112,6 +113,8 @@ int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_q6k_gemv_row = 0;
 int g_ggml_sycl_q80_gemv_esimd = 1;
+int g_ggml_sycl_dmmv_ws = 0;
+int g_ggml_sycl_dmmv_rows = 0;
 int g_ggml_sycl_q6k_mmvq_hoist = 1;
 int g_ggml_sycl_q6k_mmvq_esimd = 1;
 int g_ggml_sycl_q5k_mmvq_esimd = 1;
@@ -119,6 +122,7 @@ int g_ggml_sycl_q80_mmvq_esimd = 1;
 int g_ggml_sycl_fuse_mm_add = 1;
 int g_ggml_sycl_fuse_mm_glu = 1;
 int g_ggml_sycl_fuse_gdn_dt = 1;
+int g_ggml_sycl_xmx_gemm = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -383,6 +387,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_q6k_gemv_row = ggml_sycl_get_env("GGML_SYCL_Q6K_GEMV_ROW", 0);
         g_ggml_sycl_q80_gemv_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_GEMV_ESIMD", 1);
+        g_ggml_sycl_dmmv_ws = ggml_sycl_get_env("GGML_SYCL_DMMV_WS", 0);
+        g_ggml_sycl_dmmv_rows = ggml_sycl_get_env("GGML_SYCL_DMMV_ROWS", 0);
         // hoist the shared Q6_K weight dequant out of the small-batch (ncols 2-8) per-token loop
         g_ggml_sycl_q6k_mmvq_hoist = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_HOIST", 1);
         g_ggml_sycl_q6k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_ESIMD", 1);
@@ -391,6 +397,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
         g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
         g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
+        g_ggml_sycl_xmx_gemm    = ggml_sycl_get_env("GGML_SYCL_XMX_GEMM", 0);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -516,6 +523,8 @@ static void ggml_check_sycl() try {
 #if defined(__INTEL_LLVM_COMPILER)
         GGML_LOG_INFO("  GGML_SYCL_Q6K_GEMV_ROW: %d\n", g_ggml_sycl_q6k_gemv_row);
         GGML_LOG_INFO("  GGML_SYCL_Q80_GEMV_ESIMD: %d\n", g_ggml_sycl_q80_gemv_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_DMMV_WS: %d (0 = default)\n", g_ggml_sycl_dmmv_ws);
+        GGML_LOG_INFO("  GGML_SYCL_DMMV_ROWS: %d (0 = auto)\n", g_ggml_sycl_dmmv_rows);
         GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_HOIST: %d\n", g_ggml_sycl_q6k_mmvq_hoist);
         GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q6k_mmvq_esimd);
         GGML_LOG_INFO("  GGML_SYCL_Q5K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q5k_mmvq_esimd);
@@ -4845,6 +4854,26 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * 
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
+// XMX small-M GEMM (env-gated, default off): verify ops with M=2..7 would otherwise land on
+// the generic GEMM; install the MMVQ reorder when missing, then hand the op to the XMX kernel.
+static bool ggml_sycl_try_xmx_gemm(ggml_backend_sycl_context & ctx, bool split, const ggml_tensor * src0,
+                                   const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!g_ggml_sycl_xmx_gemm || split || src1->ne[1] < 2 || src1->ne[1] > 8) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
+        return false;
+    }
+    if (should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type)) {
+        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+    }
+    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra || !extra->optimized_feature.reorder) {
+        return false;
+    }
+    return ggml_sycl_op_mul_mat_xmx_gemm(ctx, src0, src1, dst);
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -4930,6 +4959,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+    } else if (ggml_sycl_try_xmx_gemm(ctx, split, src0, src1, dst)) {
+        return;
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
@@ -4937,6 +4968,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
+            // XMX small-M GEMM (env-gated, default off): M=2..8 on the matrix engine
+            if (ggml_sycl_op_mul_mat_xmx_gemm(ctx, src0, src1, dst)) {
+                return;
+            }
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);

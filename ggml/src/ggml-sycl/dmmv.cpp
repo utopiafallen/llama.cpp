@@ -1873,7 +1873,7 @@ using ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE;
 
 // generic reordered dequantize-matvec: each work-group owns a pair of
 // consecutive output rows and updates one 32-wide accumulator per row
-template <ggml_type T, bool ADD_RES>
+template <ggml_type T, bool ADD_RES, int WS = GGML_SYCL_DMMV_ESIMD_WG_SIZE>
 ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
         const void * vx, const float * y, const float * res, float * dst,
         const int ncols, const int nrows,
@@ -1895,7 +1895,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
     simd<float, 32> acc0 = 0.0f;
     simd<float, 32> acc1 = 0.0f;
 
-    for (int ib = tid; ib < num_blocks_per_row; ib += GGML_SYCL_DMMV_ESIMD_WG_SIZE) {
+    for (int ib = tid; ib < num_blocks_per_row; ib += WS) {
         simd<float, 256> y_vec = block_load<float, 256>(y + (size_t) ib * QK_K);
 
         const size_t bi0 = (size_t) (row0 + 0) * num_blocks_per_row + ib;
@@ -1911,7 +1911,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
     if (tid == 0) {
         float sum0 = 0.0f;
         float sum1 = 0.0f;
-        for (int p = 0; p < GGML_SYCL_DMMV_ESIMD_WG_SIZE; ++p) {
+        for (int p = 0; p < WS; ++p) {
             sum0 += lmem[p * 2 + 0];
             sum1 += lmem[p * 2 + 1];
         }
@@ -1933,7 +1933,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
 // GEMVs (few rows) do not generate enough concurrent subgroups in the 2-row layout to hide
 // the sequential per-subgroup K-load latency, so they under-saturate DRAM; 1-row doubles the
 // subgroup count and pushes them into the saturated regime.
-template <ggml_type T, bool ADD_RES>
+template <ggml_type T, bool ADD_RES, int WS = GGML_SYCL_DMMV_ESIMD_WG_SIZE>
 ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_row1(
         const void * vx, const float * y, const float * res, float * dst,
         const int ncols, const int nrows,
@@ -1952,7 +1952,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_row1(
     simd<float, 32> acc = 0.0f;
     simd<float, 32> acc_b = 0.0f; // has_b=false keeps this at 0
 
-    for (int ib = tid; ib < num_blocks_per_row; ib += GGML_SYCL_DMMV_ESIMD_WG_SIZE) {
+    for (int ib = tid; ib < num_blocks_per_row; ib += WS) {
         simd<float, 256> y_vec = block_load<float, 256>(y + (size_t) ib * QK_K);
         const size_t bi = (size_t) row * num_blocks_per_row + ib;
         traits::mac_pair(ps, bi, ps, bi, /*has_b=*/false, y_vec, acc, acc_b);
@@ -1963,7 +1963,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_row1(
 
     if (tid == 0) {
         float sum = 0.0f;
-        for (int p = 0; p < GGML_SYCL_DMMV_ESIMD_WG_SIZE; ++p) {
+        for (int p = 0; p < WS; ++p) {
             sum += lmem[p];
         }
         if constexpr (ADD_RES) {
@@ -2068,7 +2068,44 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
                                                            const int nrows,
                                                            dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
-    dequantize_mul_mat_vec_reorder_esimd_dispatch<GGML_TYPE_Q8_0>(vx, y, dst, ncols, nrows, stream);
+    if (g_ggml_sycl_dmmv_ws == 0 && g_ggml_sycl_dmmv_rows == 0) {
+        dequantize_mul_mat_vec_reorder_esimd_dispatch<GGML_TYPE_Q8_0>(vx, y, dst, ncols, nrows, stream);
+        return;
+    }
+
+    // launch-shape sweep (GGML_SYCL_DMMV_WS / GGML_SYCL_DMMV_ROWS): same math, different
+    // work partition. ws = WG size (blocks/thread stride), rows = output rows per WG.
+    const int rows = g_ggml_sycl_dmmv_rows != 0 ? g_ggml_sycl_dmmv_rows :
+                     (nrows <= GGML_SYCL_DMMV_ESIMD_ROW1_MAX_NROWS ? 1 : 2);
+    const int ws   = g_ggml_sycl_dmmv_ws;
+
+    if (rows == 1) {
+        const int workgroups = nrows;
+        stream->submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> lmem(sycl::range<1>(ws), h);
+            h.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * ws), sycl::range<1>(ws)),
+                [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                    if (ws == 2)      dequantize_mul_mat_vec_reorder_esimd_row1<GGML_TYPE_Q8_0, false, 2>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    else if (ws == 8) dequantize_mul_mat_vec_reorder_esimd_row1<GGML_TYPE_Q8_0, false, 8>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    else if (ws == 16) dequantize_mul_mat_vec_reorder_esimd_row1<GGML_TYPE_Q8_0, false, 16>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    else               dequantize_mul_mat_vec_reorder_esimd_row1<GGML_TYPE_Q8_0, false, 4>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                });
+        });
+    } else {
+        const int workgroups = (nrows + 1) / 2;
+        stream->submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> lmem(sycl::range<1>(ws * 2), h);
+            h.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * ws), sycl::range<1>(ws)),
+                [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                    if (ws == 2)      dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q8_0, false, 2>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    else if (ws == 8) dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q8_0, false, 8>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    else if (ws == 16) dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q8_0, false, 16>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                    else               dequantize_mul_mat_vec_reorder_esimd<GGML_TYPE_Q8_0, false, 4>(vx, y, nullptr, dst, ncols, nrows, lmem, it);
+                });
+        });
+    }
 }
 
 // small-batch (M tokens, 2..8) eSIMD Q6_K GEMV (MTP verify): dequant the weight block once
@@ -2079,7 +2116,8 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_m(
         const void * vx, const float * y, float * dst,
         const int ncols, const int nrows, const int dst_col_stride,
         sycl::local_accessor<float, 1> lmem,
-        const sycl::nd_item<1> & it) {
+        const sycl::nd_item<1> & it,
+        const int WS) {
     using namespace sycl::ext::intel::esimd;
     using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
 
@@ -2095,7 +2133,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_m(
     #pragma unroll
     for (int m = 0; m < M; ++m) acc[m] = 0.0f;
 
-    for (int ib = tid; ib < num_blocks_per_row; ib += GGML_SYCL_DMMV_ESIMD_WG_SIZE) {
+    for (int ib = tid; ib < num_blocks_per_row; ib += WS) {
         simd<float, 32> deq[8];
         traits::dequant_block(ps, (size_t) row * num_blocks_per_row + ib, deq);
         #pragma unroll
@@ -2110,15 +2148,15 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_m(
 
     #pragma unroll
     for (int m = 0; m < M; ++m) {
-        lmem[m * GGML_SYCL_DMMV_ESIMD_WG_SIZE + tid] = reduce<float>(acc[m], std::plus<>{});
+        lmem[m * WS + tid] = reduce<float>(acc[m], std::plus<>{});
     }
     it.barrier(sycl::access::fence_space::local_space);
     if (tid == 0) {
         #pragma unroll
         for (int m = 0; m < M; ++m) {
             float sum = 0.0f;
-            for (int p = 0; p < GGML_SYCL_DMMV_ESIMD_WG_SIZE; ++p) {
-                sum += lmem[m * GGML_SYCL_DMMV_ESIMD_WG_SIZE + p];
+            for (int p = 0; p < WS; ++p) {
+                sum += lmem[m * WS + p];
             }
             dst[m * dst_col_stride + row] = sum;
         }
@@ -2131,12 +2169,14 @@ static void dequantize_mul_mat_vec_sycl_reorder_esimd_m(const void *vx, const fl
                                                        const int nrows, const int dst_col_stride,
                                                        dpct::queue_ptr stream) {
     const int workgroups = nrows;
+    // launch-shape sweep: GGML_SYCL_DMMV_WS overrides the WG size (0 = default)
+    const int ws = g_ggml_sycl_dmmv_ws != 0 ? g_ggml_sycl_dmmv_ws : GGML_SYCL_DMMV_ESIMD_WG_SIZE;
     stream->submit([&](sycl::handler &h) {
-        sycl::local_accessor<float, 1> lmem(sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE * M), h);
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(ws * M), h);
         h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * GGML_SYCL_DMMV_ESIMD_WG_SIZE), sycl::range<1>(GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
+            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * ws), sycl::range<1>(ws)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_reorder_esimd_m<T, M>(vx, y, dst, ncols, nrows, dst_col_stride, lmem, it);
+                dequantize_mul_mat_vec_reorder_esimd_m<T, M>(vx, y, dst, ncols, nrows, dst_col_stride, lmem, it, ws);
             });
     });
 }
