@@ -24,13 +24,18 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
-// ESIMD q6_K DMMV variants with a store epilogue for graph fusion; f32 activation
+// Fused dense-FFN mat-vec: writes glu(gate . y, up . y) for same-type reordered
+// weights (Q2_K..Q6_K, Q8_0) and a single F32 activation column, using the ESIMD DMMV kernels.
+// vx is the up weight, vgate the gate weight. Only defined when GGML_SYCL_DMMV_HAS_ESIMD;
+// returns false if the type is unhandled.
+bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(
+    enum ggml_type src0_type, enum ggml_glu_op glu_op,
+    const void * vx, const void * vgate, const float * y,
+    float * dst, int ncols, int nrows, dpct::queue_ptr stream);
+
+// ESIMD q6_K DMMV variant with a residual-add store epilogue for the {mul_mat, add} fusion
 void ggml_sycl_q6_k_dmmv_reorder_esimd_add(const void * vx, const float * y, const float * res, float * dst,
                                            const int ncols, const int nrows, dpct::queue_ptr stream);
-
-bool ggml_sycl_dmmv_reorder_esimd_glu(const void * vx_up, const void * vx_gate, const float * y, float * dst,
-                                      const enum ggml_glu_op glu_op, ggml_type wtype, const int ncols, const int nrows,
-                                      dpct::queue_ptr stream);
 
 // small-batch (M=2..8) eSIMD Q6_K GEMV for the MTP verify; f32 activation
 void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,

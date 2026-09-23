@@ -135,6 +135,8 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
 }
 extern int g_ggml_sycl_q6k_gemv_row;
 extern int g_ggml_sycl_q80_gemv_esimd;
+extern int g_ggml_sycl_dmmv_ws;    // 0 = default (4); sweep {2,4,8,16} - DMMV eSIMD WG size
+extern int g_ggml_sycl_dmmv_rows;  // 0 = auto (1 small N / 2 large N); force {1,2} rows per WG
 extern int g_ggml_sycl_q6k_mmvq_hoist;
 extern int g_ggml_sycl_q6k_mmvq_esimd;
 extern int g_ggml_sycl_q5k_mmvq_esimd;
