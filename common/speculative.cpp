@@ -21,6 +21,7 @@
 #include <map>
 #include <random>
 #include <cinttypes>
+#include <random>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1524,6 +1525,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // rejection sampling: mirror the target sampler onto the draft head (set per task by the
+    // server) and capture per-position proposal distributions for the ratio test at acceptance
+    bool rejection = false;
+    bool mirroring = false;
+    std::vector<llama_sampler *> probe_chains;
+    std::vector<common_speculative_draft_q> draft_q;
+    std::vector<llama_token_data> probe_buf;
+    std::mt19937 probe_rng; // task-seeded, draws the draft tokens in mirroring mode
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1557,6 +1567,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
+
+        rejection = params.rejection_sampling;
+        probe_chains.assign(n_seq, nullptr);
+        draft_q.resize(n_seq);
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -1612,6 +1626,152 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+    }
+
+    // rebuild the draft sampler from the target's sampling params so the proposal distribution
+    // q mirrors p (temp/top-k/top-p/min-p; penalties are not mirrored in v1).
+    // temp <= 0 keeps the legacy greedy top-k draft: argmax draft + exact-match acceptance is
+    // today's path, so temp-0 runs stay bit-identical
+    void set_draft_sampling(const common_params_sampling & s) {
+        if (!rejection) {
+            return;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * model   = llama_get_model(ctx_dft);
+
+        for (auto & bch : probe_chains) {
+            if (bch != nullptr) {
+                llama_sampler_free(bch);
+                bch = nullptr;
+            }
+        }
+
+        mirroring = s.temp > 0.0f;
+        if (!mirroring) {
+            SPC_TRC("%s: rejection sampling inactive for this task (temp <= 0)\n", __func__);
+            for (auto & smpl : smpls) {
+                common_params_sampling sparams;
+                sparams.no_perf  = false;
+                sparams.top_k    = 10;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+                smpl.reset(common_sampler_init(model, sparams));
+            }
+            return;
+        }
+
+        probe_rng.seed(s.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : s.seed);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            common_params_sampling mp;
+            mp.seed     = s.seed;
+            mp.temp     = s.temp;
+            mp.top_k    = s.top_k;
+            mp.top_p    = s.top_p;
+            mp.min_p    = s.min_p;
+            mp.min_keep = s.min_keep;
+            mp.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+            if (s.top_k > 0) {
+                mp.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_K);
+            }
+            if (s.top_p < 1.0f) {
+                mp.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_P);
+            }
+            if (s.min_p > 0.0f) {
+                mp.samplers.push_back(COMMON_SAMPLER_TYPE_MIN_P);
+            }
+            smpls[seq_id].reset(common_sampler_init(model, mp));
+
+            // probe chain: same transforms without the terminal dist, to capture the support
+            llama_sampler * bch = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(bch, llama_sampler_init_temp(s.temp));
+            if (s.top_k > 0) {
+                llama_sampler_chain_add(bch, llama_sampler_init_top_k(s.top_k));
+            }
+            if (s.top_p < 1.0f) {
+                llama_sampler_chain_add(bch, llama_sampler_init_top_p(s.top_p, s.min_keep));
+            }
+            if (s.min_p > 0.0f) {
+                llama_sampler_chain_add(bch, llama_sampler_init_min_p(s.min_p, s.min_keep));
+            }
+            probe_chains[seq_id] = bch;
+
+            if (this->params.backend_sampling) {
+                llama_sampler * old = backend_chains[seq_id];
+                if (old != nullptr) {
+                    llama_set_sampler(ctx_dft, seq_id, nullptr);
+                    llama_sampler_free(old);
+                }
+                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(chain, llama_sampler_init_temp(s.temp));
+                if (s.top_k > 0) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(s.top_k));
+                }
+                if (s.top_p < 1.0f) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_top_p(s.top_p, s.min_keep));
+                }
+                if (s.min_p > 0.0f) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_min_p(s.min_p, s.min_keep));
+                }
+                llama_sampler_chain_add(chain, llama_sampler_init_dist(s.seed));
+                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                    SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+                    llama_sampler_free(chain);
+                    chain = nullptr;
+                }
+                backend_chains[seq_id] = chain;
+            }
+        }
+
+        SPC_TRC("%s: mirrored draft sampling (temp=%.2f top_k=%d top_p=%.2f min_p=%.2f)\n",
+                __func__, s.temp, s.top_k, s.top_p, s.min_p);
+    }
+
+    // one probe-chain pass per position: apply the mirrored transforms to the head logits, draw
+    // from the filtered list with the task-seeded rng, and capture the renormalized proposal q
+    std::pair<llama_token, float> draft_sample_mirrored(llama_context * ctx_dft, int i_batch_idx, llama_seq_id seq_id) {
+        GGML_ASSERT(probe_chains[seq_id] != nullptr);
+
+        llama_synchronize(ctx_dft); // logits are read on the host
+
+        const float * logits = llama_get_logits_ith(ctx_dft, i_batch_idx);
+        GGML_ASSERT(logits != nullptr);
+
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+        probe_buf.resize((size_t) n_vocab);
+        for (int t = 0; t < n_vocab; ++t) {
+            probe_buf[t] = { (llama_token) t, logits[t], 0.0f };
+        }
+
+        llama_token_data_array arr{ probe_buf.data(), n_vocab, -1, false };
+        llama_sampler_apply(probe_chains[seq_id], &arr);
+
+        double z = 0.0;
+        for (int k = 0; k < arr.size; ++k) {
+            z += arr.data[k].p;
+        }
+        GGML_ASSERT(z > 1e-9);
+
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        double u = dist(probe_rng) * z;
+        int i_pick = arr.size - 1;
+        for (int k = 0; k < arr.size; ++k) {
+            u -= arr.data[k].p;
+            if (u <= 0.0) {
+                i_pick = k;
+                break;
+            }
+        }
+
+        auto & dq = draft_q[seq_id];
+        dq.ids.emplace_back();
+        dq.p.emplace_back();
+        for (int k = 0; k < arr.size; ++k) {
+            dq.ids.back().push_back(arr.data[k].id);
+            dq.p.back().push_back((float) (arr.data[k].p / z));
+        }
+
+        return { arr.data[i_pick].id, (float) (arr.data[i_pick].p / z) };
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1910,6 +2070,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (mirroring) {
+                    draft_q[seq_id].ids.clear();
+                    draft_q[seq_id].p.clear();
+                }
             }
         }
     }
@@ -2626,6 +2790,31 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec) {
     GGML_ASSERT(spec);
     return spec->synth_probs;
+}
+
+const common_speculative_draft_q * common_speculative_get_draft_q(const common_speculative * spec, llama_seq_id seq_id) {
+    GGML_ASSERT(spec);
+    for (auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            continue;
+        }
+        auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
+        if (!mtp->mirroring || seq_id < 0 || seq_id >= (llama_seq_id) mtp->draft_q.size()) {
+            return nullptr;
+        }
+        return &mtp->draft_q[seq_id];
+    }
+    return nullptr;
+}
+
+void common_speculative_set_draft_sampling(common_speculative * spec, const common_params_sampling & s) {
+    GGML_ASSERT(spec);
+    for (auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            continue;
+        }
+        static_cast<common_speculative_impl_draft_mtp *>(impl.get())->set_draft_sampling(s);
+    }
 }
 
 common_params common_base_params_to_speculative(const common_params & params) {

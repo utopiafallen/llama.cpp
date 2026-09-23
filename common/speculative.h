@@ -35,6 +35,21 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
+// per-position draft proposal distribution for rejection sampling: for each drafted position,
+// the draft sampler candidates with their renormalized probabilities, parallel to the tokens
+// returned by _draft()
+struct common_speculative_draft_q {
+    std::vector<std::vector<llama_token>> ids;
+    std::vector<std::vector<float>> p;
+};
+
+// nullptr unless the implementation captures proposal probabilities (MTP with mirrored draft sampling)
+const common_speculative_draft_q * common_speculative_get_draft_q(const common_speculative * spec, llama_seq_id seq_id);
+
+// rebuild the MTP draft sampler from the target's sampling params (temperature/top_k/top_p/min_p).
+// no-op for other implementations
+void common_speculative_set_draft_sampling(common_speculative * spec, const common_params_sampling & s);
+
 common_params common_base_params_to_speculative(const common_params & params);
 
 struct common_speculative_output_limits {
