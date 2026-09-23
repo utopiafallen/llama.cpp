@@ -70,6 +70,10 @@ extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_q6k_gemv_row;
 extern int g_ggml_sycl_q80_gemv_esimd;
+extern int g_ggml_sycl_q6k_mmvq_hoist;
+extern int g_ggml_sycl_q6k_mmvq_esimd;
+extern int g_ggml_sycl_q5k_mmvq_esimd;
+extern int g_ggml_sycl_q80_mmvq_esimd;
 extern int g_ggml_sycl_fuse_mm_add;
 extern int g_ggml_sycl_fuse_mm_glu;
 extern int g_ggml_sycl_fuse_gdn_dt;
@@ -80,6 +84,8 @@ extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_memtrace;
 extern int g_ggml_sycl_memtrace_step;
+extern int g_ggml_sycl_fa_tile_gqa_min_kv;
+extern int g_ggml_sycl_fa_xmx_decode;
 
 
 // Profiling output to file -- avoids stdout interference with model output
@@ -264,6 +270,7 @@ struct sycl_device_info {
     sycl_hw_info hw_info;
     optimize_feature opt_feature;
     bool    usm_system_support; // support for USM system allocations
+    bool    has_xmx;            // Intel XMX matrix engine (joint_matrix) support
 };
 
 

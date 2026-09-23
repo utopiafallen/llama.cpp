@@ -24,6 +24,8 @@
 #include <optional>
 #include <stdint.h>
 #include <stdio.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cmath>
 #include <iostream>
@@ -102,12 +104,18 @@ int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
 int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
+int g_ggml_sycl_fa_tile_gqa_min_kv = 8192;
+int g_ggml_sycl_fa_xmx_decode = 1;
 int g_ggml_sycl_enable_vmm = 1;
 int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_q6k_gemv_row = 0;
 int g_ggml_sycl_q80_gemv_esimd = 1;
+int g_ggml_sycl_q6k_mmvq_hoist = 1;
+int g_ggml_sycl_q6k_mmvq_esimd = 1;
+int g_ggml_sycl_q5k_mmvq_esimd = 1;
+int g_ggml_sycl_q80_mmvq_esimd = 1;
 int g_ggml_sycl_fuse_mm_add = 1;
 int g_ggml_sycl_fuse_mm_glu = 1;
 int g_ggml_sycl_fuse_gdn_dt = 1;
@@ -183,6 +191,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.devices[i].smpbo = prop.get_local_mem_size();
         info.devices[i].warp_size = WARP_SIZE;
         info.devices[i].usm_system_support = device.has(sycl::aspect::usm_system_allocations);
+        info.devices[i].has_xmx = gpu_has_xmx(device);
 
         info.max_work_group_sizes[i] = prop.get_max_work_group_size();
         info.devices[i].max_wg_per_cu = info.max_work_group_sizes[i] / prop.get_max_compute_units();
@@ -253,9 +262,9 @@ static void print_device_detail(int id, sycl::device &device, std::string device
 static void print_device_opt_feature(int device_count) {
     GGML_LOG_INFO("SYCL Optimization Feature:\n");
     GGML_LOG_INFO(
-        "|ID|        Device Type|Reorder|\n");
+        "|ID|        Device Type|Reorder|XMX|\n");
     GGML_LOG_INFO(
-        "|--|-------------------|-------|\n");
+        "|--|-------------------|-------|---|\n");
     std::map<std::string, size_t> DeviceNums;
     for (int id = 0; id < device_count; ++id) {
       sycl::device device = dpct::dev_mgr::instance().get_device(id);
@@ -266,8 +275,9 @@ static void print_device_opt_feature(int device_count) {
                   << "]";
       std::string device_type_s = device_type.str();
       device_type_s = std::regex_replace(device_type_s, std::regex("ext_oneapi_"), "");
-      GGML_LOG_INFO("|%2d|%19s|%7s|\n", id, device_type_s.c_str(),
-        ggml_sycl_info().devices[id].opt_feature.reorder ? "Y": "N");
+      GGML_LOG_INFO("|%2d|%19s|%7s|%3s|\n", id, device_type_s.c_str(),
+        ggml_sycl_info().devices[id].opt_feature.reorder ? "Y": "N",
+        ggml_sycl_info().devices[id].has_xmx ? "Y" : "N");
     }
 
 }
@@ -363,12 +373,19 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
+        g_ggml_sycl_fa_tile_gqa_min_kv = ggml_sycl_get_env("GGML_SYCL_FA_TILE_GQA_MIN_KV", 8192);
+        g_ggml_sycl_fa_xmx_decode = ggml_sycl_get_env("GGML_SYCL_FA_XMX_DECODE", 1);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_q6k_gemv_row = ggml_sycl_get_env("GGML_SYCL_Q6K_GEMV_ROW", 0);
         g_ggml_sycl_q80_gemv_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_GEMV_ESIMD", 1);
+        // hoist the shared Q6_K weight dequant out of the small-batch (ncols 2-8) per-token loop
+        g_ggml_sycl_q6k_mmvq_hoist = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_HOIST", 1);
+        g_ggml_sycl_q6k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q6K_MMVQ_ESIMD", 1);
+        g_ggml_sycl_q5k_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q5K_MMVQ_ESIMD", 1);
+        g_ggml_sycl_q80_mmvq_esimd = ggml_sycl_get_env("GGML_SYCL_Q80_MMVQ_ESIMD", 1);
         g_ggml_sycl_fuse_mm_add = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_ADD", 1);
         g_ggml_sycl_fuse_mm_glu = ggml_sycl_get_env("GGML_SYCL_FUSE_MM_GLU", 1);
         g_ggml_sycl_fuse_gdn_dt = ggml_sycl_get_env("GGML_SYCL_FUSE_GDN_DT", 1);
@@ -461,6 +478,8 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_MKL_FA: %d\n", g_ggml_sycl_enable_mkl_fa);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE_STEP: %d\n", g_ggml_sycl_memtrace_step);
+        GGML_LOG_INFO("  GGML_SYCL_FA_TILE_GQA_MIN_KV: %d\n", g_ggml_sycl_fa_tile_gqa_min_kv);
+        GGML_LOG_INFO("  GGML_SYCL_FA_XMX_DECODE: %d\n", g_ggml_sycl_fa_xmx_decode);
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
 #else
@@ -495,6 +514,10 @@ static void ggml_check_sycl() try {
 #if defined(__INTEL_LLVM_COMPILER)
         GGML_LOG_INFO("  GGML_SYCL_Q6K_GEMV_ROW: %d\n", g_ggml_sycl_q6k_gemv_row);
         GGML_LOG_INFO("  GGML_SYCL_Q80_GEMV_ESIMD: %d\n", g_ggml_sycl_q80_gemv_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_HOIST: %d\n", g_ggml_sycl_q6k_mmvq_hoist);
+        GGML_LOG_INFO("  GGML_SYCL_Q6K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q6k_mmvq_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_Q5K_MMVQ_ESIMD: %d\n", g_ggml_sycl_q5k_mmvq_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_Q80_MMVQ_ESIMD: %d\n", g_ggml_sycl_q80_mmvq_esimd);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_ADD: %d\n", g_ggml_sycl_fuse_mm_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_MM_GLU: %d\n", g_ggml_sycl_fuse_mm_glu);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_GDN_DT: %d\n", g_ggml_sycl_fuse_gdn_dt);
@@ -6165,12 +6188,74 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
 
+    // batched conv-state CPY: group of 5 per GDN layer, dispatched in-place
+    std::unordered_set<const ggml_tensor *> batched_cpy_done;
+    int n_cpy_saved = 0;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (g_ggml_sycl_enable_fusion && node->op == GGML_OP_CPY &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32) {
+            const int64_t rows = node->src[0]->ne[0];
+            const int64_t cols = node->src[0]->ne[1];
+            if (rows >= 2 && cols >= 1000 && node->src[1]->ne[0] == rows * cols) {
+                const int stride_row = (int)(node->src[0]->nb[0] / sizeof(float));
+                const int stride_col = (int)(node->src[0]->nb[1] / sizeof(float));
+                if (stride_row == 1 && stride_col > (int)rows) {
+                    // collect this CPY + up to 4 matching CPYs within next 15 nodes
+                    ggml_sycl_batched_cpy_params bp = {};
+                    bp.rows = (int) rows;
+                    bp.cols = (int) cols;
+                    bp.stride_row = stride_row;
+                    bp.stride_col = stride_col;
+                    bp.srcs[0] = (const float *) node->src[0]->data;
+                    bp.dsts[0] = (float *) node->src[1]->data;
+                    bp.n_copies = 1;
+                    batched_cpy_done.insert(node);
+
+                    for (int j = i + 1; j < cgraph->n_nodes && j < i + 15 && bp.n_copies < GGML_SYCL_MAX_CONV_STATE_BATCH; j++) {
+                        const ggml_tensor * m = cgraph->nodes[j];
+                        if (m->op != GGML_OP_CPY) continue;
+                        if (m->src[0]->type != GGML_TYPE_F32 || m->src[1]->type != GGML_TYPE_F32) continue;
+                        if (m->src[0]->ne[0] != rows || m->src[0]->ne[1] != cols) continue;
+                        if (m->src[1]->ne[0] != rows * cols) continue;
+                        const int sr = (int)(m->src[0]->nb[0] / sizeof(float));
+                        const int sc = (int)(m->src[0]->nb[1] / sizeof(float));
+                        if (sr != stride_row || sc != stride_col) continue;
+                        bp.srcs[bp.n_copies] = (const float *) m->src[0]->data;
+                        bp.dsts[bp.n_copies] = (float *) m->src[1]->data;
+                        bp.n_copies++;
+                        batched_cpy_done.insert(m);
+                    }
+
+                    if (bp.n_copies > 1) {
+                        int64_t t_bc = ggml_time_us();
+                        ggml_sycl_op_batched_conv_state_cpy(*sycl_ctx, bp);
+                        if (g_ggml_sycl_profile) {
+                            op_times["batched_conv_state_cpy"] += ggml_time_us() - t_bc;
+                        }
+                        n_cpy_saved += bp.n_copies - 1;
+                    } else {
+                        // single copy, use normal path
+                        int64_t t_op_start = ggml_time_us();
+                        bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+                        if (g_ggml_sycl_profile) op_times[ggml_op_name(node->op)] += ggml_time_us() - t_op_start;
+                        GGML_ASSERT(ok);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // skip already-batched CPYs
+        if (batched_cpy_done.count(node)) {
             continue;
         }
 
@@ -6310,6 +6395,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
+
     int64_t t_graph_end = ggml_time_us();
     if (g_ggml_sycl_profile) {
         std::vector<std::pair<std::string, int64_t>> sorted_ops(op_times.begin(), op_times.end());

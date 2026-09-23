@@ -32,4 +32,40 @@ bool ggml_sycl_dmmv_reorder_esimd_glu(const void * vx_up, const void * vx_gate, 
                                       const enum ggml_glu_op glu_op, ggml_type wtype, const int ncols, const int nrows,
                                       dpct::queue_ptr stream);
 
+// small-batch (M=2..8) eSIMD Q6_K GEMV for the MTP verify; f32 activation
+void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,
+                                                                 float *dst, const int ncols, const int nrows,
+                                                                 const int M, const int dst_col_stride,
+                                                                 dpct::queue_ptr stream);
+
+#ifdef GGML_SYCL_F16
+// fp16 variant: MAC in half (lower register pressure, more WGs per EU)
+void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_f16_dispatch(const void *vx, const float *y,
+                                                                     float *dst, const int ncols, const int nrows,
+                                                                     const int M, const int dst_col_stride,
+                                                                     dpct::queue_ptr stream);
+
+void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_f16_dispatch(const void *vx, const float *y,
+                                                                    float *dst, const int ncols, const int nrows,
+                                                                    const int M, const int dst_col_stride,
+                                                                    dpct::queue_ptr stream);
+
+void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd_m_f16_dispatch(const void *vx, const float *y,
+                                                                    float *dst, const int ncols, const int nrows,
+                                                                    const int M, const int dst_col_stride,
+                                                                    dpct::queue_ptr stream);
+#endif // GGML_SYCL_F16
+
+// small-batch (M=2..8) eSIMD Q5_K GEMV for the MTP verify; f32 activation
+void dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,
+                                                                float *dst, const int ncols, const int nrows,
+                                                                const int M, const int dst_col_stride,
+                                                                dpct::queue_ptr stream);
+
+// small-batch (M=2..8) eSIMD Q8_0 GEMV (lm_head) for the MTP verify; f32 activation
+void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd_m_dispatch(const void *vx, const float *y,
+                                                                float *dst, const int ncols, const int nrows,
+                                                                const int M, const int dst_col_stride,
+                                                                dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_DMMV_HPP

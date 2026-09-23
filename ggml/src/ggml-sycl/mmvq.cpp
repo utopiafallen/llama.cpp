@@ -5,6 +5,7 @@
 #include "element_wise.hpp"
 #include "quants.hpp"
 #include "vecdotq.hpp"
+#include "dmmv.hpp"
 
 // Minimum weight-row count at which the Q4_K multi-column MMVQ kernel handles two output rows per
 // subgroup (rows_per_sg == 2) instead of one, when ncols_dst == 2.
@@ -219,6 +220,93 @@ static void mul_mat_vec_q_reorder_ncols(const void * __restrict__ vx, const void
             if (sg.leader() && row0 + r < nrows) {
                 dst[j * stride_col_dst + row0 + r] = sum;
             }
+        }
+    }
+}
+
+// Q6_K small-batch (ncols 2-8) reorder path. The generic kernel re-runs the shared weight
+// dequant once per token; here vi0/vi1 are computed once per (block, elem) and reused across
+// the ncols_dst tokens, which is compute-bound at N>1
+template <int ncols_dst>
+static void mul_mat_vec_q_reorder_ncols_q6_k(const void * __restrict__ vx, const void * __restrict__ vy,
+                                             float * __restrict__ dst, const int ncols, const int nrows,
+                                             const int stride_col_y_bytes, const int stride_col_dst,
+                                             const sycl::nd_item<3> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg           = nd_item.get_sub_group();
+    const int  sg_range     = sg.get_group_linear_range();
+    const int  workgroup_id = nd_item.get_group_linear_id();
+    const int  sg_id        = sg.get_group_linear_id();
+    const int  row          = workgroup_id * sg_range + sg_id;
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    float partial_sum[ncols_dst] = { 0.0f };
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx = row * blocks_per_row + i;
+
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby       = i * block_type::block_to_q8_1_ratio();
+
+        const uint8_t * base   = static_cast<const uint8_t *>(vx);
+        const uint8_t * ql     = base + bx_offset.first;
+        const uint8_t * qh     = base + bx_offset.second;
+        const int8_t *  scales = reinterpret_cast<const int8_t *>(base + d_offset.first);
+        const float     d      = ((const ggml_half *) (base + d_offset.second))[0];
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+
+            const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+            const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+            const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+
+            const int vl = get_int_from_uint8(ql, iqs);
+            const int vh = get_int_from_uint8(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+            const int8_t sc0 = scales[scale_offset + 0];
+            const int8_t sc1 = scales[scale_offset + 4];
+
+            const int vi0 = byte_sub_4(((vl >> 0) & 0x0F0F0F0F) | (((vh >> 0) << 4) & 0x30303030), 0x20202020);
+            const int vi1 = byte_sub_4(((vl >> 4) & 0x0F0F0F0F) | (((vh >> 4) << 4) & 0x30303030), 0x20202020);
+
+            // fold the shared weight scales (d * sc) once; the per-token tail then drops
+            // the sc int-multiply and the final d multiply
+            const float w0 = d * (float) sc0;
+            const float w1 = d * (float) sc1;
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const char        * vy_j           = (const char *) vy + j * stride_col_y_bytes;
+                const int8_t      * q8_1_quant_ptr = (const int8_t *) vy_j + iby * QK8_1;
+                const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) (vy_j + ncols + iby * sizeof(sycl::half2));
+
+                const int u0 = get_int_from_int8_aligned(q8_1_quant_ptr + bq8_offset * QK8_1, iqs % QI8_1);
+                const int u1 = get_int_from_int8_aligned(q8_1_quant_ptr + (bq8_offset + 2) * QK8_1, iqs % QI8_1);
+                const float d80 = (*(q8_1_ds_ptr + bq8_offset + 0))[0];
+                const float d81 = (*(q8_1_ds_ptr + bq8_offset + 2))[0];
+
+                partial_sum[j] += d80 * dpct::dp4a(vi0, u0, 0) * w0 + d81 * dpct::dp4a(vi1, u1, 0) * w1;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float sum = sycl::reduce_over_group(nd_item.get_sub_group(), partial_sum[j], std::plus<>());
+
+        if (sg.leader()) {
+            dst[j * stride_col_dst + row] = sum;
         }
     }
 }
@@ -1974,13 +2062,19 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl_ncols(
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
+    const int hoist = g_ggml_sycl_q6k_mmvq_hoist;
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>, ncols_dst>(
-                                 vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
-                                 /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
-                         });
+                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                              if (hoist) {
+                                  mul_mat_vec_q_reorder_ncols_q6_k<ncols_dst>(
+                                      vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, nd_item);
+                              } else {
+                                  mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>, ncols_dst>(
+                                      vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                      /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
+                              }
+                          });
     });
 }
 
@@ -2327,6 +2421,52 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
     const size_t q8_1_ts = sizeof(block_q8_1);
     const size_t q8_1_bs = QK8_1;
+
+    // small-batch Q6_K (MTP verify): eSIMD wide-SIMD M-kernel, gated
+    if (g_ggml_sycl_q6k_mmvq_esimd && src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_F32 &&
+        src1_ncols > 1 && src1_ncols <= 8 &&
+        (ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+        ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+#ifdef GGML_SYCL_F16
+        dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_f16_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, (int) dst->ne[0], stream);
+#else
+        dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd_m_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                   (int) src1_ncols, (int) dst->ne[0], stream);
+#endif
+        return;
+    }
+
+    // small-batch Q5_K (MTP verify): eSIMD wide-SIMD M-kernel, gated
+    if (g_ggml_sycl_q5k_mmvq_esimd && src0->type == GGML_TYPE_Q5_K && src1->type == GGML_TYPE_F32 &&
+        src1_ncols > 1 && src1_ncols <= 8 &&
+        (ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+        ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+#ifdef GGML_SYCL_F16
+        dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_f16_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, (int) dst->ne[0], stream);
+#else
+        dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd_m_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                   (int) src1_ncols, (int) dst->ne[0], stream);
+#endif
+        return;
+    }
+
+    // small-batch Q8_0 (lm_head, MTP verify): eSIMD wide-SIMD M-kernel, gated
+    if (g_ggml_sycl_q80_mmvq_esimd && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 &&
+        src1_ncols > 1 && src1_ncols <= 8 &&
+        (ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+        ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+#ifdef GGML_SYCL_F16
+        dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd_m_f16_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                       (int) src1_ncols, (int) dst->ne[0], stream);
+#else
+        dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd_m_dispatch(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff,
+                                                                   (int) src1_ncols, (int) dst->ne[0], stream);
+#endif
+        return;
+    }
+
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the kernel writes into
 
