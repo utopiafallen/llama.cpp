@@ -400,8 +400,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
                         s01, s02, s03, stream);
             }
         }
+
+        static bool q8_staged_dbg = false;
+        if (!q8_staged_dbg) {
+            q8_staged_dbg = true;
+            fprintf(stderr, "[SOA] onednn FA: staged full K+V to f16 (nelements=%ld)\n",
+                    (long) ggml_nelements(K));
+        }
     } else {
-        // F32: strided copy to dense F16 via cont_to_f16_sycl<float>.
+        // F32: strided copy to dense F16 via cont_to_fp16_sycl<float>.
         K_ptr = stage_k((size_t) ggml_nelements(K));
         cont_to_f16_sycl<float>((const char *) K->data, K_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3],
                                 K->nb[1], K->nb[2], K->nb[3], stream);

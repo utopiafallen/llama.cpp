@@ -975,6 +975,12 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(K->type);
             const size_t ts = ggml_type_size(K->type);
 
+            static bool k_f16_dbg = false;
+            if (!k_f16_dbg) {
+                k_f16_dbg = true;
+                fprintf(stderr, "[SOA] tile FA: K f16 staging path used (nelements=%ld)\n",
+                        (long) ggml_nelements(K));
+            }
             sycl::half * K_f16_ptr = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr
                                                         : K_f16.alloc(ggml_nelements(K));
             if (ggml_is_contiguously_allocated(K)) {

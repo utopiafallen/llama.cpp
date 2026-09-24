@@ -450,6 +450,20 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
         need_V = std::max(need_V, (size_t) ggml_nelements(V));
     }
 
+    if (ggml_sycl_get_env("GGML_SYCL_FATTN_DEBUG", 0)) {
+        static int dbg_n = 0;
+        if (dbg_n++ < 48) {
+            fprintf(stderr, "[FATTN-DBG] #%d K=%s soa=%d n_kv=%lld nelements(K)=%lld "
+                    "onednn=%d tileK=%d tileV=%d -> need_K=%.1f MiB need_V=%.1f MiB "
+                    "need_Q=%.1f MiB need_out=%.1f MiB\n",
+                    dbg_n - 1, ggml_type_name(K->type), (int) ggml_sycl_is_q8_0_soa(K),
+                    (long long) K->ne[1], (long long) ggml_nelements(K),
+                    (int) onednn_supported, (int) tile_needs_K, (int) tile_needs_V,
+                    need_K * 2.0 / (1024.0 * 1024.0), need_V * 2.0 / (1024.0 * 1024.0),
+                    need_Q * 2.0 / (1024.0 * 1024.0), need_out * 2.0 / (1024.0 * 1024.0));
+        }
+    }
+
     extra.Q_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_Q);
     extra.K_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_K);
     extra.V_buffer_ptr = (V_is_K_view && !onednn_supported && need_V)
