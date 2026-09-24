@@ -26,6 +26,8 @@ extern "C" {
         size_t                (*get_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)       (ggml_backend_buffer_type_t buft);
+        // (optional) buft whose compute buffers are shared across contexts of the same device (or NULL)
+        ggml_backend_buffer_type_t (*get_shared_compute)(ggml_backend_buffer_type_t buft);
     };
 
     struct ggml_backend_buffer_type {

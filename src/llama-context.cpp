@@ -640,7 +640,14 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // let the backend swap in a shared-compute buft variant if it offers one (GGML_COMPUTE_BUF_CTX_REUSE)
+    std::vector<ggml_backend_buffer_type_t> sched_bufts(backend_buft.size());
+    for (size_t i = 0; i < backend_buft.size(); ++i) {
+        ggml_backend_buffer_type_t sb = ggml_backend_buft_get_shared_compute(backend_buft[i]);
+        sched_bufts[i] = sb ? sb : backend_buft[i];
+    }
+
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), sched_bufts.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -679,7 +686,12 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                std::vector<ggml_backend_buffer_type_t> sched_bufts(backend_buft.size());
+                for (size_t i = 0; i < backend_buft.size(); ++i) {
+                    ggml_backend_buffer_type_t sb = ggml_backend_buft_get_shared_compute(backend_buft[i]);
+                    sched_bufts[i] = sb ? sb : backend_buft[i];
+                }
+                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), sched_bufts.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {

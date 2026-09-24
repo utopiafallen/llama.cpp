@@ -632,6 +632,25 @@ inline void free_aligned_mem_host(void * memblock) {
 
 // sycl buffer
 
+// With GGML_COMPUTE_BUF_CTX_REUSE, compute buffers of contexts on one device (eg. MTP target
+// + draft) alias a single device allocation ("slab"). Safe because all work on the device is
+// ordered by its single in-order queue and everything in these buffers is transitory per graph;
+// the tripwire in ggml_backend_sycl_graph_compute asserts if that ordering is ever broken.
+struct ggml_sycl_shared_slab {
+    void * base = nullptr;
+    size_t capacity = 0;
+    int refcount = 0;
+    const void * last_owner = nullptr; // sycl context id of the last dispatched graph
+    const void * last_queue = nullptr; // sycl queue the owner dispatched on
+};
+
+static std::mutex g_ggml_sycl_shared_slab_mutex;
+static std::map<int, ggml_sycl_shared_slab> g_ggml_sycl_shared_slabs; // [device]
+
+static bool ggml_sycl_shared_compute_enabled() {
+    return ggml_sycl_get_env("GGML_COMPUTE_BUF_CTX_REUSE", 1) != 0;
+}
+
 struct ggml_backend_sycl_buffer_context {
     int device;
     void * dev_ptr = nullptr;
@@ -640,6 +659,8 @@ struct ggml_backend_sycl_buffer_context {
     optimize_feature opt_feature;
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
     bool is_usm_system;
+    // when >= 0, dev_ptr aliases the shared compute slab of that device - not freed directly
+    int slab_device = -1;
 
     ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
         device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
@@ -649,7 +670,21 @@ struct ggml_backend_sycl_buffer_context {
         }
 
     ~ggml_backend_sycl_buffer_context() {
-        if (dev_ptr != nullptr) {
+        if (slab_device >= 0) {
+            void * base = nullptr;
+            queue_ptr stream = this->stream;
+            {
+                std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
+                auto & slab = g_ggml_sycl_shared_slabs[slab_device];
+                if (--slab.refcount <= 0 && slab.base != nullptr) {
+                    base = slab.base;
+                    slab = {};
+                }
+            }
+            if (base != nullptr) {
+                SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(base, *stream)));
+            }
+        } else if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
             if (is_usm_system)
                 free_aligned_mem_host(dev_ptr);
@@ -1027,6 +1062,12 @@ struct ggml_backend_sycl_buffer_type_context {
     queue_ptr stream = nullptr;
 };
 
+// buffer belongs to an SYCL buft of the given device (primary or shared-compute variant)
+static bool ggml_sycl_buffer_matches_device(ggml_backend_buffer_t buf, int device) {
+    auto * ctx = (ggml_backend_sycl_buffer_type_context *)buf->buft->context;
+    return ctx != nullptr && ctx->device == device;
+}
+
 static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
 
@@ -1096,6 +1137,70 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// compute buffer variant that aliases a per-device shared slab (see ggml_sycl_shared_slab)
+static ggml_backend_buffer_t
+ggml_backend_sycl_buffer_type_alloc_buffer_shared(ggml_backend_buffer_type_t buft,
+                                                  size_t size) try {
+    ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
+    ggml_sycl_set_device(buft_ctx->device);
+    const queue_ptr stream = buft_ctx->stream;
+    size = std::max(size, (size_t)1); // syclMalloc returns null for size 0
+    const size_t alignment = MEM_SIZE_2M;
+    size_t aligned_size = ((size + alignment - 1) / alignment) * alignment;
+
+    void * dev_ptr = nullptr;
+    bool from_slab = false;
+    bool private_alloc = false;
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
+        auto & slab = g_ggml_sycl_shared_slabs[buft_ctx->device];
+        if (slab.base == nullptr) {
+            // first compute buffer on this device: create the slab at full size, up front
+            dev_ptr = (void *) ggml_sycl_malloc_device(aligned_size, *stream, GGML_SYCL_MEM_BUFFER);
+            if (dev_ptr != nullptr) {
+                slab.base = dev_ptr;
+                slab.capacity = aligned_size;
+                from_slab = true;
+                fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: created %8.2f MiB\n",
+                        buft_ctx->device, slab.capacity / 1048576.0);
+            } else {
+                private_alloc = true;
+            }
+        } else if (aligned_size <= slab.capacity) {
+            // alias the same physical bytes; each context's allocator places independently
+            dev_ptr = slab.base;
+            from_slab = true;
+            fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: reusing %8.2f MiB (request %8.2f MiB)\n",
+                    buft_ctx->device, slab.capacity / 1048576.0, aligned_size / 1048576.0);
+        } else {
+            // request exceeds the existing slab; keep this buffer private rather than grow
+            fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: request %8.2f MiB exceeds slab %8.2f MiB, allocating a private compute buffer\n",
+                    buft_ctx->device, aligned_size / 1048576.0, slab.capacity / 1048576.0);
+            private_alloc = true;
+        }
+    }
+    if (private_alloc || dev_ptr == nullptr) {
+        dev_ptr = (void *) ggml_sycl_malloc_device(aligned_size, *stream, GGML_SYCL_MEM_BUFFER);
+        from_slab = false;
+        if (dev_ptr == nullptr) {
+            GGML_LOG_ERROR("%s: can't allocate %zu Bytes of memory on device\n", __func__, aligned_size);
+            return nullptr;
+        }
+    }
+    ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(buft_ctx->device, dev_ptr, stream, false);
+    if (from_slab) {
+        ctx->slab_device = buft_ctx->device;
+        std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
+        g_ggml_sycl_shared_slabs[buft_ctx->device].refcount++;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return SYCL_BUFFER_ALIGNMENT;
     GGML_UNUSED(buft);
@@ -1142,6 +1247,8 @@ static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_t
     GGML_UNUSED(buft);
 }
 
+static ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type_get_shared_compute(ggml_backend_buffer_type_t buft);
+
 static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer,
@@ -1149,6 +1256,7 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface 
     /* .get_max_size     = */ ggml_backend_sycl_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
+    /* .get_shared_compute = */ ggml_backend_sycl_buffer_type_get_shared_compute,
 };
 
 ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
@@ -1180,6 +1288,50 @@ ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
         ggml_backend_sycl_buffer_type_initialized = true;
     }
     return &ggml_backend_sycl_buffer_types[device];
+}
+
+// buft variant whose compute buffers alias the per-device shared slab (GGML_COMPUTE_BUF_CTX_REUSE)
+static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface_shared = {
+    /* .get_name         = */ ggml_backend_sycl_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer_shared,
+    /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_sycl_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .is_host          = */ NULL,
+    /* .get_shared_compute = */ NULL,
+};
+
+static ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type_shared(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    (void) ggml_backend_sycl_buffer_type(device); // validates the device id
+
+    static struct ggml_backend_buffer_type ggml_backend_sycl_shared_buffer_types[GGML_SYCL_MAX_DEVICES];
+    static bool initialized = false;
+
+    if (!initialized) {
+        const int dev_count = ggml_backend_sycl_get_device_count();
+        for (int i = 0; i < dev_count; i++) {
+            auto & device_i = dpct::dev_mgr::instance().get_device(i);
+            queue_ptr stream = &(device_i.default_queue());
+            ggml_backend_sycl_shared_buffer_types[i] = {
+                /* .iface    = */ ggml_backend_sycl_buffer_type_interface_shared,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), i),
+                /* .context  = */ new ggml_backend_sycl_buffer_type_context{i, std::string(GGML_SYCL_NAME) + "-shared-" + std::to_string(i), stream},
+            };
+        }
+        initialized = true;
+    }
+    return &ggml_backend_sycl_shared_buffer_types[device];
+}
+
+ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type_get_shared_compute(ggml_backend_buffer_type_t buft) {
+    if (!ggml_sycl_shared_compute_enabled()) {
+        return nullptr;
+    }
+    ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
+    return ggml_backend_sycl_buffer_type_shared(ctx->device);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(ggml_backend_sycl_context * ctx) {
@@ -6094,7 +6246,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_sycl_buffer_matches_device(buf, sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
@@ -6115,7 +6267,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_sycl_buffer_matches_device(buf, sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
         data, (const char *)tensor->data + offset, size)));
@@ -6130,7 +6282,7 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
                                                const ggml_tensor *src,
                                                ggml_tensor *dst) try {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    bool is_cpy_supported                = dst->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
+    bool is_cpy_supported                = ggml_sycl_buffer_matches_device(dst->buffer, sycl_ctx->device) &&
                             ggml_backend_buffer_is_sycl(src->buffer);
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
@@ -6341,10 +6493,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 #ifndef NDEBUG
-        assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+        assert(ggml_sycl_buffer_matches_device(node->buffer, sycl_ctx->device));
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             if (node->src[j] != nullptr) {
-                assert(node->src[j]->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+                assert(ggml_sycl_buffer_matches_device(node->src[j]->buffer, sycl_ctx->device));
             }
         }
 #endif
@@ -6545,6 +6697,21 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
+    // shared compute slab tripwire: correctness relies on every graph that touches the slab being
+    // enqueued on the device's single in-order queue. If a dispatch lands on any other queue, the
+    // slab can be read while a previous owner's kernels are still running - fail loudly instead of
+    // corrupting shared scratch silently. Same-queue ordering is guaranteed by hardware; no wait.
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
+        auto it = g_ggml_sycl_shared_slabs.find(sycl_ctx->device);
+        if (it != g_ggml_sycl_shared_slabs.end() && it->second.refcount > 0 &&
+            it->second.last_owner != nullptr && it->second.last_owner != sycl_ctx &&
+            it->second.last_queue != nullptr && it->second.last_queue != sycl_ctx->stream()) {
+            GGML_LOG_ERROR("SYCL%d shared compute slab: tripwire - dispatched on a second queue (in-order single-queue assumption broken)\n", sycl_ctx->device);
+            GGML_ASSERT(false && "shared compute slab: second queue detected");
+        }
+    }
+
 #ifdef GGML_SYCL_GRAPH
     bool use_sycl_graph = false;
     if (g_ggml_sycl_enable_graph) {
@@ -6587,6 +6754,14 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 #endif
     {
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
+        auto it = g_ggml_sycl_shared_slabs.find(sycl_ctx->device);
+        if (it != g_ggml_sycl_shared_slabs.end() && it->second.refcount > 0) {
+            it->second.last_owner = sycl_ctx;
+            it->second.last_queue = sycl_ctx->stream();
+        }
     }
     return GGML_STATUS_SUCCESS;
 }

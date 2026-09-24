@@ -91,6 +91,14 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
     return buft->device;
 }
 
+ggml_backend_buffer_type_t ggml_backend_buft_get_shared_compute(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft);
+    if (buft->iface.get_shared_compute) {
+        return buft->iface.get_shared_compute(buft);
+    }
+    return nullptr;
+}
+
 // backend buffer
 
 ggml_backend_buffer_t ggml_backend_buffer_init(
