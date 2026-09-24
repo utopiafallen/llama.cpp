@@ -30,6 +30,7 @@ extern "C" {
         size_t                (*get_alloc_size_n)(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
+        ggml_backend_buffer_type_t (*get_shared_compute)(ggml_backend_buffer_type_t buft);
     };
 
     struct ggml_backend_buffer_type {

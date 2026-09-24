@@ -721,8 +721,15 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
+    // let the backend swap in a shared-compute buft variant if it offers one (GGML_COMPUTE_BUF_CTX_REUSE)
+    std::vector<ggml_backend_buffer_type_t> sched_bufts(backend_buft.size());
+    for (size_t i = 0; i < backend_buft.size(); ++i) {
+        ggml_backend_buffer_type_t sb = ggml_backend_buft_get_shared_compute(backend_buft[i]);
+        sched_bufts[i] = sb ? sb : backend_buft[i];
+    }
+
     sched.reset(ggml_backend_sched_new(
-            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+            backend_ptrs.data(), sched_bufts.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
