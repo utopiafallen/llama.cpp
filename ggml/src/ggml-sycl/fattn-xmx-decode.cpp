@@ -489,9 +489,11 @@ static void xmx_decode_combine2a(
         den += w * l_s[s * sp];
         num += w * O_s[s * sp * D + dim];
     }
-    inter_m[chunk*n_q_heads + q_head] = Mc;
-    inter_l[chunk*n_q_heads + q_head] = den;
-    inter_O[((size_t) chunk*n_q_heads + q_head)*D + dim] = num;
+    // inter layout is [chunk][row] with n_rows = n_q_heads*MQ rows per chunk; using
+    // n_q_heads here (only correct at MQ=1) makes every chunk clobber the others
+    inter_m[chunk*n_rows + q_head] = Mc;
+    inter_l[chunk*n_rows + q_head] = den;
+    inter_O[((size_t) chunk*n_rows + q_head)*D + dim] = num;
 }
 
 static void xmx_decode_combine2b(
@@ -509,15 +511,17 @@ static void xmx_decode_combine2b(
         return;
     }
     const int h = q_head % n_q_heads;
+    // inter layout is [chunk][row] with n_rows rows per chunk (see combine2a)
+    const int n_rows = n_q_heads * MQ;
     float M = -FLT_MAX;
     for (int c = 0; c < n_chunks; c++) {
-        M = std::max(M, inter_m[c*n_q_heads + q_head]);
+        M = std::max(M, inter_m[c*n_rows + q_head]);
     }
     float num = 0.0f, den = 0.0f;
     for (int c = 0; c < n_chunks; c++) {
-        const float w = exp2f((inter_m[c*n_q_heads + q_head] - M) * 1.4426950408889634f);
-        den += w * inter_l[c*n_q_heads + q_head];
-        num += w * inter_O[((size_t) c*n_q_heads + q_head)*D + dim];
+        const float w = exp2f((inter_m[c*n_rows + q_head] - M) * 1.4426950408889634f);
+        den += w * inter_l[c*n_rows + q_head];
+        num += w * inter_O[((size_t) c*n_rows + q_head)*D + dim];
     }
     out[(size_t) (q_head / n_q_heads) * (MQ > 1 ? out_pos_stride : 0) + (size_t) h * out_head_stride + dim] = num / den;
 }
