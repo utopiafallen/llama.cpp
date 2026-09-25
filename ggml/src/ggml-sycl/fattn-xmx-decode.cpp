@@ -86,14 +86,15 @@ static void xmx_decode_main(
 
     // QG=1: no Q16 in LDS (A matrix comes from the global f16 scratch) - frees PSTRIDE*D*2B for
     // higher occupancy at 16-row configs (see the SPLIT/LDS cliff notes in the b70-decode-perf skill)
-    constexpr int LDS_BYTES = (QG == 0 ? PSTRIDE*D*2 : 0) + PSTRIDE*SPLIT*4 + PSTRIDE*SPLIT*2 + 16*16*2
-                              + (F16P ? 16*16*4 : 0); // F16P: O-tile f32 conversion scratch
+    constexpr int LDS_BASE = (QG == 0 ? PSTRIDE*D*2 : 0) + PSTRIDE*SPLIT*4 + PSTRIDE*SPLIT*2 + 16*16*2;
+    constexpr int F16_OFF  = F16P ? (1024 - (LDS_BASE % 1024)) % 1024 : 0; // 1KB-align o_scratch
+    constexpr int LDS_BYTES = LDS_BASE + F16_OFF + (F16P ? 16*32*4 : 0); // F16P: [16][32] f32 scratch
     syclex::work_group_static<char[LDS_BYTES]> lsm;
     sycl::half * Q16    = (sycl::half *)&lsm;                    // [PSTRIDE][D] (QG=0 only)
     float    * scores  = QG == 0 ? (float *)(Q16 + PSTRIDE*D) : (float *)&lsm; // [PSTRIDE][SPLIT]
     sycl::half * P16   = (sycl::half *)(scores + PSTRIDE*SPLIT); // [PSTRIDE][SPLIT]
     sycl::half * tile_buf = (sycl::half *)(P16 + PSTRIDE*SPLIT); // [16][16] staging
-    float    * o_scratch = F16P ? (float *)(tile_buf + 256) : nullptr; // [16][16] f32 (F16P only)
+    float    * o_scratch = F16P ? (float *)(tile_buf + 256) + F16_OFF/4 : nullptr; // [16][32] f32 (F16P only)
 
     // Q F32 -> F16 into LDS, all chunks at once (skipped with QG=1: A comes from global scratch)
     if constexpr (QG == 0) {
@@ -265,6 +266,26 @@ static void xmx_decode_main(
     }
     sg.barrier();
 
+    // diagnostic: P16 rows0-PSTRIDE-1 x cols0-15 + pm/pl for the (split 0, kv_head 0) block
+    if (o_dump && split == 0 && kv_head == 0) {
+        for (int i = lane; i < PSTRIDE*16; i += 16) {
+            ((float *) o_dump)[512 + i] = (float) P16[(i/16)*SPLIT + (i%16)];
+        }
+        if (lane < PSTRIDE) {
+            ((float *) o_dump)[768 + lane] = partial_m[lane];
+            ((float *) o_dump)[784 + lane] = partial_l[lane];
+        }
+        if (lane == 0) {
+            ((float *) o_dump)[799] = (float) ROWS; // compile-time loop bound of the softmax
+            ((float *) o_dump)[798] = (float) SPLIT;
+            ((float *) o_dump)[797] = (float) PSTRIDE;
+            ((float *) o_dump)[796] = (float) M;
+            ((float *) o_dump)[795] = (float) GQA;
+            ((float *) o_dump)[794] = (float) MQ;
+        }
+        sg.barrier();
+    }
+
     // 4. PV: O = P @ V, per 16-dim chunk (skipped by the P1ONLY diagnostic)
     if (!p1only) {
     mx::joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::row_major> B_v;
@@ -353,47 +374,57 @@ static void xmx_decode_main(
                 if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
                     sg.barrier();
                     ((float *) o_dump)[lane] = ((const float *) partial_O)[lane];
+                    ((float *) o_dump)[16 + lane] = 0.0f;
                     int nn = 0;
                     for (int cc = 0; cc < 16; cc++) if (!std::isfinite(((const float *) partial_O)[lane*D + cc])) nn++;
-                    ((float *) o_dump)[16 + lane] = (float) nn;
+                    ((float *) o_dump)[32 + lane] = (float) nn;
                 }
             } else {
-                // f16 partials: joint_matrix cannot store acc->f16 directly, so route through a
-                // 1KB f32 LDS tile (separate instantiation; default path is untouched).
+                // f16 partials: coordinate apply writes f16 straight from the acc registers
+                // (separate instantiation; default f32 path is untouched).
                 if constexpr (NCHUNK == 2) {
                     #pragma unroll
                     for (int qc = 0; qc < 2; qc++) {
-                        mx::joint_matrix_store(sg, O_jm[qc], xmp_l_f(o_scratch), 16, layout::row_major);
+                        mx::joint_matrix_store(sg, O_jm[qc], xmp_l_f(o_scratch), 32, layout::row_major);
                         sg.barrier();
                         sycl::half * od = (sycl::half *) partial_O + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE
                                                                        + a_row(qc))*D + dc*16;
                         #pragma unroll
                         for (int r = 0; r < M; r++) {
-                            od[r*16 + lane] = (sycl::half) o_scratch[r*16 + lane];
+                            od[r*D + lane] = (sycl::half) o_scratch[r*32 + lane];
                         }
-                        sg.barrier(); // o_scratch free for the next dc store
+                        sg.barrier(); // o_scratch free for the next store
                     }
                     if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
-                        ((float *) o_dump)[lane] = o_scratch[lane];
+                        sg.barrier();
+                        const sycl::half * rd = (const sycl::half *) partial_O
+                                              + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE + a_row(0))*D;
+                        ((float *) o_dump)[lane] = (float) rd[lane];
                         int nn = 0;
-                        for (int cc = 0; cc < 16; cc++) if (!std::isfinite(o_scratch[lane*16 + cc])) nn++;
-                        ((float *) o_dump)[16 + lane] = (float) nn;
+                        for (int cc = 0; cc < 16; cc++) if (!std::isfinite((float) rd[lane * D + cc])) nn++;
+                        ((float *) o_dump)[32 + lane] = (float) nn;
                     }
                 } else {
-                    mx::joint_matrix_store(sg, O_jm[0], xmp_l_f(o_scratch), 16, layout::row_major);
+                    // f16 partial: acc -> LDS f32 ([16][32] stride-32, 1KB-aligned) -> f16 global.
+                    // plain [16][16] row-major/col-major LDS stores corrupt rows / are not lowered
+                    // by 2026.1 (2026-09-25 arm dumps + link errors); acc->f16 store unexposed.
+                    mx::joint_matrix_store(sg, O_jm[0], xmp_l_f(o_scratch), 32, layout::row_major);
                     sg.barrier();
                     sycl::half * od = (sycl::half *) partial_O + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE
                                                                    + a_row(0))*D + dc*16;
                     #pragma unroll
                     for (int r = 0; r < M; r++) {
-                        od[r*16 + lane] = (sycl::half) o_scratch[r*16 + lane];
+                        od[r*D + lane] = (sycl::half) o_scratch[r*32 + lane];
                     }
                     sg.barrier(); // o_scratch free for the next dc store
                     if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
-                        ((float *) o_dump)[lane] = o_scratch[lane];
+                        sg.barrier();
+                        const sycl::half * rd = (const sycl::half *) partial_O
+                                              + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE + a_row(0))*D;
+                        ((float *) o_dump)[lane] = (float) rd[lane];
                         int nn = 0;
-                        for (int cc = 0; cc < 16; cc++) if (!std::isfinite(o_scratch[lane*16 + cc])) nn++;
-                        ((float *) o_dump)[16 + lane] = (float) nn;
+                        for (int cc = 0; cc < 16; cc++) if (!std::isfinite((float) rd[lane * D + cc])) nn++;
+                        ((float *) o_dump)[32 + lane] = (float) nn;
                     }
                 }
             }
@@ -414,9 +445,10 @@ static void xmx_decode_main(
         if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
             sg.barrier();
             ((float *) o_dump)[lane] = ((const float *) partial_O)[lane];
+            ((float *) o_dump)[16 + lane] = 0.0f;
             int nn = 0;
             for (int cc = 0; cc < 16; cc++) if (!std::isfinite(((const float *) partial_O)[lane*D + cc])) nn++;
-            ((float *) o_dump)[16 + lane] = (float) nn;
+            ((float *) o_dump)[32 + lane] = (float) nn;
         }
     }
     } // !p1only
@@ -861,8 +893,10 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
     std::optional<ggml_sycl_pool_alloc<float>> odump;
     if (xmx_fd) {
         odump.emplace(pool);
-        odump->alloc(32);
+        odump->alloc(800);
         o_dump_p = odump->ptr;
+        // (source-Q norm check removed 2026-09-25: crashed the server at startup on the
+        //  box; the A-scratch dump below already shows the pos-4 Q rows directly)
     }
 
     // Combine kernel variant: default 4 = two-phase chunked merge (faster at long context:
@@ -921,6 +955,44 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
             int64_t t_main0 = 0, t_main1 = 0, t_comb1 = 0; \
             if (xmx_t) { stream->wait(); t_main0 = ggml_time_us(); } \
             if (f16p) { XMX_DECODE_DISPATCH(1, SPL); } else { XMX_DECODE_DISPATCH(0, SPL); } \
+            if (o_dump_p) { \
+                stream->wait(); \
+                if (f16p && !sf32p) { \
+                    sycl::half * hfb = (sycl::half *) sycl::malloc_host(16*D*sizeof(sycl::half), *stream); \
+                    stream->memcpy(hfb, (sycl::half *) pO_pv, 16*D*sizeof(sycl::half)); \
+                    stream->wait(); \
+                    fprintf(stderr, "[XMQ-HOST] f16 rows0-15 x dims0-15:\n"); \
+                    for (int r = 0; r < 16; r++) { \
+                        fprintf(stderr, "  r%d: ", r); \
+                        for (int i = 0; i < 16; i++) fprintf(stderr, "%.5g ", (float) hfb[r*D+i]); \
+                        fprintf(stderr, "\n"); \
+                    } \
+                    sycl::free(hfb, *stream); \
+                } else { \
+                    float * hff = (float *) sycl::malloc_host(16*D*sizeof(float), *stream); \
+                    stream->memcpy(hff, (float *) pO_pv, 16*D*sizeof(float)); \
+                    stream->wait(); \
+                    fprintf(stderr, "[XMQ-HOST] f32 rows0-15 x dims0-15:\n"); \
+                    for (int r = 0; r < 16; r++) { \
+                        fprintf(stderr, "  r%d: ", r); \
+                        for (int i = 0; i < 16; i++) fprintf(stderr, "%.5g ", hff[r*D+i]); \
+                        fprintf(stderr, "\n"); \
+                    } \
+                    sycl::free(hff, *stream); \
+                } \
+                if (Q16g_p) { \
+                    sycl::half * hqa = (sycl::half *) sycl::malloc_host(16*D*sizeof(sycl::half), *stream); \
+                    stream->memcpy(hqa, (const sycl::half *) Q16g_p, 16*D*sizeof(sycl::half)); \
+                    stream->wait(); \
+                    fprintf(stderr, "[XMQ-HOST] A-scratch rows0-15 x dims0-15:\n"); \
+                    for (int r = 0; r < 16; r++) { \
+                        fprintf(stderr, "  a%d: ", r); \
+                        for (int i = 0; i < 16; i++) fprintf(stderr, "%.5g ", (float) hqa[r*D+i]); \
+                        fprintf(stderr, "\n"); \
+                    } \
+                    sycl::free(hqa, *stream); \
+                } \
+            } \
             if (xmx_t) { stream->wait(); t_main1 = ggml_time_us(); } \
             { \
                 const sycl::range<3> c_local(1, 1, 16); \
@@ -969,8 +1041,8 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
                 if (xmx_t) { stream->wait(); t_comb1 = ggml_time_us(); } \
             } \
             if (o_dump_p) { \
-                o_dump_h = (float *) sycl::malloc_host(32 * sizeof(float), *stream); \
-                stream->memcpy(o_dump_h, o_dump_p, 32 * sizeof(float)); \
+                o_dump_h = (float *) sycl::malloc_host(800 * sizeof(float), *stream); \
+                stream->memcpy(o_dump_h, o_dump_p, 800 * sizeof(float)); \
             } \
             if (xmx_t) { \
                 fprintf(stderr, "[XMQ-T] MQ=%d gqa=%d n_hg=%d SPLIT=%d n_kv=%d n_splits=%d main=%.2fms combine=%.2fms partials_KB=%zu\n", \
@@ -1002,9 +1074,20 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
         stream->wait();
         fprintf(stderr, "[XMQ-DUMP] row0: ");
         for (int i = 0; i < 16; i++) fprintf(stderr, "%.4f ", o_dump_h[i]);
+        fprintf(stderr, "| f16rb: ");
+        for (int i = 16; i < 32; i++) fprintf(stderr, "%.4f ", o_dump_h[i]);
         fprintf(stderr, "| nan-per-row:");
-        for (int i = 0; i < 16; i++) fprintf(stderr, "%d", (int) o_dump_h[16 + i]);
+        for (int i = 32; i < 48; i++) fprintf(stderr, "%d", (int) o_dump_h[i]);
         fprintf(stderr, "\n");
+        for (int r = 0; r < 16; r++) {
+            if (r >= (int) o_dump_h[797]) continue; // PSTRIDE
+            fprintf(stderr, "[XMQ-DUMP] P16 r%2d: ", r);
+            for (int p = 0; p < 16; p++) fprintf(stderr, "%.4g ", o_dump_h[512 + r*16 + p]);
+            fprintf(stderr, "| m=%.4g l=%.4g\n", o_dump_h[768 + r], o_dump_h[784 + r]);
+        }
+        fprintf(stderr, "[XMQ-DUMP] inst M=%d GQA=%d SPLIT=%d PSTRIDE=%d MQ=%d ROWS=%d\n",
+                (int) o_dump_h[796], (int) o_dump_h[795], (int) o_dump_h[798], (int) o_dump_h[797],
+                (int) o_dump_h[794], (int) o_dump_h[799]);
         sycl::free(o_dump_h, *stream);
     }
 
