@@ -1341,6 +1341,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
+void llama_context::set_sampler_draft_prefix(llama_seq_id seq_id, const llama_token * draft, int32_t n_draft) {
+    auto it = sampling.samplers.find(seq_id);
+    if (it == sampling.samplers.end() || it->second == nullptr) {
+        return;
+    }
+
+    if (it->second->iface->backend_set_draft) {
+        it->second->iface->backend_set_draft(it->second, draft, n_draft);
+    }
+}
+
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -4019,6 +4030,14 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+void llama_set_sampler_draft_prefix(llama_context * ctx, llama_seq_id seq_id, const llama_token * draft, int32_t n_draft) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    ctx->set_sampler_draft_prefix(seq_id, draft, n_draft);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

@@ -1319,6 +1319,10 @@ extern "C" {
         // called before graph execution to set inputs for the current ubatch
         void (*backend_set_input)(struct llama_sampler * smpl);
 
+        // sets the draft token prefix for per-row penalty windows; draft must stay valid
+        // until the decode completes; called before .backend_set_input()
+        void (*backend_set_draft)(struct llama_sampler * smpl, const llama_token * draft, int32_t n_draft);
+
         // called before rebuilding a sampling graph to clear any internal sampler state
         void (*backend_reset)(struct llama_sampler * smpl);
 
@@ -1337,6 +1341,12 @@ extern "C" {
     // attach a sampler to the context
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+
+    // [EXPERIMENTAL]
+    // set the draft token prefix used by the per-row penalty windows on the next decode
+    // (row r's penalty window includes draft[0..r-1], as in MTP verify); draft must stay
+    // valid until the decode completes; no-op if the sampler has no backend_set_draft
+    LLAMA_API void llama_set_sampler_draft_prefix(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * draft, int32_t n_draft);
 
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);

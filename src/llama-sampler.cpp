@@ -513,6 +513,7 @@ static struct llama_sampler_i llama_sampler_empty_i = {
     /* .backend_accept    = */ llama_sampler_empty_backend_accept,
     /* .backend_apply     = */ llama_sampler_empty_backend_apply,
     /* .backend_set_input = */ llama_sampler_empty_backend_set_input,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -822,6 +823,23 @@ static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
     }
 }
 
+static void llama_sampler_chain_backend_set_draft(
+        struct llama_sampler * smpl,
+        const llama_token    * draft,
+        int32_t                n_draft) {
+    auto * chain = (llama_sampler_chain *) smpl->ctx;
+
+    for (auto & smpl : chain->samplers) {
+        if (!smpl.is_backend) {
+            break;
+        }
+
+        if (smpl.ptr->iface->backend_set_draft) {
+            smpl.ptr->iface->backend_set_draft(smpl.ptr, draft, n_draft);
+        }
+    }
+}
+
 static void llama_sampler_chain_backend_reset(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
@@ -863,6 +881,7 @@ static struct llama_sampler_i llama_sampler_chain_i = {
     /* .backend_accept    = */ llama_sampler_chain_backend_accept,
     /* .backend_apply     = */ llama_sampler_chain_backend_apply,
     /* .backend_set_input = */ llama_sampler_chain_backend_set_input,
+    /* .backend_set_draft = */ llama_sampler_chain_backend_set_draft,
     /* .backend_reset     = */ llama_sampler_chain_backend_reset,
     /* .copy_state        = */ llama_sampler_chain_copy_state,
 };
@@ -1100,6 +1119,7 @@ static struct llama_sampler_i llama_sampler_greedy_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_greedy_backend_apply,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_greedy>,
 };
@@ -1392,6 +1412,7 @@ static struct llama_sampler_i llama_sampler_dist_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_dist_backend_apply,
     /* .backend_set_input = */ llama_sampler_dist_backend_set_input,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ llama_sampler_dist_backend_reset,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dist>,
 };
@@ -1512,6 +1533,7 @@ static struct llama_sampler_i llama_sampler_top_k_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_top_k_backend_apply,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_top_k>,
 };
@@ -1712,6 +1734,7 @@ static struct llama_sampler_i llama_sampler_top_p_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_top_p_backend_apply,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_top_p>,
 };
@@ -1875,6 +1898,7 @@ static struct llama_sampler_i llama_sampler_min_p_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_min_p_backend_apply,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_min_p>,
 };
@@ -1987,6 +2011,7 @@ static struct llama_sampler_i llama_sampler_typical_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -2097,6 +2122,7 @@ static struct llama_sampler_i llama_sampler_temp_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_temp_backend_apply,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_temp>,
 };
@@ -2300,6 +2326,7 @@ static struct llama_sampler_i llama_sampler_temp_ext_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_temp_ext_backend_apply,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_temp_ext>,
 };
@@ -2409,6 +2436,7 @@ static struct llama_sampler_i llama_sampler_xtc_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -2530,6 +2558,7 @@ static struct llama_sampler_i llama_sampler_mirostat_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -2636,6 +2665,7 @@ static struct llama_sampler_i llama_sampler_mirostat_v2_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -2759,6 +2789,7 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -2872,14 +2903,31 @@ struct llama_sampler_penalties : public llama_sampler_backend {
     // backend helpers
     int32_t n_max   = 0;
     bool has_candidates = false;
+    bool mode_candidates = false;
 
     std::vector<int32_t> host_token_ids;
     std::vector<int32_t> host_counts;
+
+    // per-row penalty windows (MTP verify): the draft prefix is pushed before the decode via
+    // llama_set_sampler_draft_prefix; row r's window = base window (with the oldest entries
+    // evicted) plus draft[0..r-1]. backend_apply runs once per row at graph build time, in
+    // row order; the per-row inputs are filled in backend_set_input before execution
+    std::vector<llama_token> draft;
+    int32_t n_draft_max = 0;
+    struct row_in {
+        ggml_tensor * ids;
+        ggml_tensor * counts;
+        std::vector<int32_t> h_ids;
+        std::vector<int32_t> h_counts;
+    };
+    std::vector<row_in> row_ins;
+    size_t row_cur = 0;
 
     void copy_state(const llama_sampler_penalties & src) {
         // note: inp_token_ids/inp_counts belong to the current sampling graph
         prev        = src.prev;
         token_count = src.token_count;
+        draft.assign(src.draft.begin(), src.draft.begin() + std::min(src.draft.size(), (size_t) n_draft_max));
     }
 
     static bool is_disabled(
@@ -3013,18 +3061,30 @@ static bool llama_sampler_penalties_backend_init(
         struct llama_sampler       * smpl,
         ggml_backend_buffer_type_t   buft,
         uint32_t                     n_outputs_max_per_seq) {
+    GGML_UNUSED(n_outputs_max_per_seq);
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
-
-    if (n_outputs_max_per_seq > 1) {
-        sctx->init(false);
-        return false;
-    }
 
     const bool res = llama_sampler_backend_support(smpl, buft);
 
     sctx->init(res);
 
     return res;
+}
+
+static void llama_sampler_penalties_backend_set_draft(
+        struct llama_sampler * smpl,
+        const llama_token    * draft,
+        int32_t                n_draft) {
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+
+    n_draft = std::max(0, n_draft);
+    sctx->draft.assign(draft, draft + n_draft);
+
+    // grow-only: the per-row input sizes depend on this, and growing forces a one-time
+    // graph rebuild
+    if (n_draft > sctx->n_draft_max) {
+        sctx->n_draft_max = n_draft;
+    }
 }
 
 static void llama_sampler_penalties_backend_apply(
@@ -3042,28 +3102,33 @@ static void llama_sampler_penalties_backend_apply(
 
     GGML_ASSERT(sctx->n_vocab > 0);
 
-    sctx->has_candidates = data->candidates != nullptr;
-    sctx->n_max   = std::min(sctx->penalty_last_n, sctx->n_vocab);
-
-    sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
-    ggml_set_input(sctx->inp_token_ids);
-
-    sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_counts, "penalties_counts");
-    ggml_set_input(sctx->inp_counts);
-
-    if ((int32_t) sctx->host_token_ids.size() != sctx->n_max) {
-        sctx->host_token_ids.assign(sctx->n_max, 0);
-        sctx->host_counts.assign(sctx->n_max, 0);
-    }
+    sctx->has_candidates  = data->candidates != nullptr;
+    sctx->mode_candidates = data->candidates != nullptr;
+    sctx->n_max           = std::min(sctx->penalty_last_n, sctx->n_vocab);
 
     // flatten
     ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
-    ggml_tensor * gathered = logits;
-    ggml_tensor * counts_f32 = ggml_cast(ctx, sctx->inp_counts, GGML_TYPE_F32);
+    ggml_tensor * gathered;
+    ggml_tensor * counts_f32;
 
     if (sctx->has_candidates) {
+        // single-window mode: one penalty window over the flattened candidate list
+        sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
+        ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
+        ggml_set_input(sctx->inp_token_ids);
+
+        sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
+        ggml_set_name(sctx->inp_counts, "penalties_counts");
+        ggml_set_input(sctx->inp_counts);
+
+        if ((int32_t) sctx->host_token_ids.size() != sctx->n_max) {
+            sctx->host_token_ids.assign(sctx->n_max, 0);
+            sctx->host_counts.assign(sctx->n_max, 0);
+        }
+
+        gathered = logits;
+        counts_f32 = ggml_cast(ctx, sctx->inp_counts, GGML_TYPE_F32);
+
         ggml_tensor * candidates = ggml_reshape_1d(
                 ctx, data->candidates, ggml_nelements(data->candidates));
         const int64_t n_candidates = candidates->ne[0];
@@ -3076,9 +3141,31 @@ static void llama_sampler_penalties_backend_apply(
         counts_f32 = ggml_get_rows(ctx, counts_rows, candidates);
         counts_f32 = ggml_reshape_1d(ctx, counts_f32, n_candidates);
     } else {
+        // per-row mode: this call is row row_cur of the current graph (rows are applied in
+        // order at graph build time); row r's penalty window includes draft[0..r-1]
+        // entry capacity per row: every base-window token plus every draft token
+        const int32_t n_entries = sctx->n_max + sctx->n_draft_max;
+
+        if ((int32_t) sctx->row_ins.size() <= (int32_t) sctx->row_cur) {
+            llama_sampler_penalties::row_in ri;
+            ri.ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_entries);
+            ggml_set_name(ri.ids, "penalties_row_ids");
+            ggml_set_input(ri.ids);
+            ri.counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_entries);
+            ggml_set_name(ri.counts, "penalties_row_counts");
+            ggml_set_input(ri.counts);
+            ri.h_ids.assign(n_entries, 0);
+            ri.h_counts.assign(n_entries, 0);
+            sctx->row_ins.push_back(std::move(ri));
+        }
+
+        const auto & in = sctx->row_ins[sctx->row_cur];
+        ++sctx->row_cur;
+
         ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, ggml_nelements(logits));
-        gathered = ggml_get_rows(ctx, logits_rows, sctx->inp_token_ids);
-        gathered = ggml_reshape_1d(ctx, gathered, sctx->n_max);
+        gathered = ggml_get_rows(ctx, logits_rows, in.ids);
+        gathered = ggml_reshape_1d(ctx, gathered, n_entries);
+        counts_f32 = ggml_cast(ctx, in.counts, GGML_TYPE_F32);
     }
 
     ggml_tensor * active_mask = ggml_step(ctx, counts_f32);
@@ -3113,9 +3200,10 @@ static void llama_sampler_penalties_backend_apply(
     if (sctx->has_candidates) {
         data->logits = penalized;
     } else {
+        const auto & in = sctx->row_ins[sctx->row_cur - 1];
         ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, ggml_nelements(logits));
-        ggml_tensor * scatter_rows = ggml_reshape_2d(ctx, penalized, 1, sctx->n_max);
-        logits_rows = ggml_set_rows(ctx, logits_rows, scatter_rows, sctx->inp_token_ids);
+        ggml_tensor * scatter_rows = ggml_reshape_2d(ctx, penalized, 1, in.h_ids.size());
+        logits_rows = ggml_set_rows(ctx, logits_rows, scatter_rows, in.ids);
         data->logits = ggml_reshape_1d(ctx, logits_rows, ggml_nelements(logits));
     }
 }
@@ -3123,66 +3211,140 @@ static void llama_sampler_penalties_backend_apply(
 static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
 
-    if (!sctx->inp_token_ids || !sctx->inp_counts || sctx->n_max <= 0 || sctx->n_vocab <= 0) {
+    if (sctx->is_disabled() || sctx->n_vocab <= 0) {
         return;
     }
 
-    if (sctx->is_disabled()) {
-        return;
-    }
-
-    // fill active entries from the map
-    int32_t n_active = 0;
-
-    for (const auto & it : sctx->token_count) {
-        GGML_ASSERT(n_active < sctx->n_max);
-        sctx->host_token_ids[n_active] = it.first;
-        sctx->host_counts   [n_active] = it.second;
-        ++n_active;
-    }
-
-    // Sorting is required because backend_apply uses ggml_set_rows (a scatter-back operation)
-    std::vector<std::pair<int32_t, int32_t>> entries;
-    entries.reserve(n_active);
-    for (int32_t i = 0; i < n_active; ++i) {
-        entries.emplace_back(sctx->host_token_ids[i], sctx->host_counts[i]);
-    }
-    std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
-        return a.first < b.first;
-    });
-    for (int32_t i = 0; i < n_active; ++i) {
-        sctx->host_token_ids[i] = entries[i].first;
-        sctx->host_counts   [i] = entries[i].second;
-    }
-
-    // Padding: Finds a filler token id that is not present in token_count.
-    // Use it to do padding for the arrays, it avoids resizing every time.
-    // The arrays must always have exactly n_max entries (the GPU tensor is a fixed size).
-    int32_t filler = 0;
-    if (n_active < sctx->n_max) {
-        while (sctx->token_count.find(filler) != sctx->token_count.end()) {
-            ++filler;
+    if (sctx->mode_candidates) {
+        if (!sctx->inp_token_ids || !sctx->inp_counts || sctx->n_max <= 0) {
+            return;
         }
-        GGML_ASSERT(filler < sctx->n_vocab);
+
+        // fill active entries from the map
+        int32_t n_active = 0;
+
+        for (const auto & it : sctx->token_count) {
+            GGML_ASSERT(n_active < sctx->n_max);
+            sctx->host_token_ids[n_active] = it.first;
+            sctx->host_counts   [n_active] = it.second;
+            ++n_active;
+        }
+
+        // Sorting is required because backend_apply uses ggml_set_rows (a scatter-back operation)
+        std::vector<std::pair<int32_t, int32_t>> entries;
+        entries.reserve(n_active);
+        for (int32_t i = 0; i < n_active; ++i) {
+            entries.emplace_back(sctx->host_token_ids[i], sctx->host_counts[i]);
+        }
+        std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
+            return a.first < b.first;
+        });
+        for (int32_t i = 0; i < n_active; ++i) {
+            sctx->host_token_ids[i] = entries[i].first;
+            sctx->host_counts   [i] = entries[i].second;
+        }
+
+        // Padding: Finds a filler token id that is not present in token_count.
+        // Use it to do padding for the arrays, it avoids resizing every time.
+        // The arrays must always have exactly n_max entries (the GPU tensor is a fixed size).
+        int32_t filler = 0;
+        if (n_active < sctx->n_max) {
+            while (sctx->token_count.find(filler) != sctx->token_count.end()) {
+                ++filler;
+            }
+            GGML_ASSERT(filler < sctx->n_vocab);
+        }
+
+        // Fill the rest of the arrays with the filler token id and count 0.
+        // Inactive slots are padded with a unique dummy token ID (count = 0).
+        // The uniqueness matters because ggml_set_rows with duplicate indices can produce non-deterministic or incorrect results.
+        // Using a filler token with count 0 that isn't in the active set is safe, because the active_mask step in backend_apply filters them out via ggml_step(counts_f32)
+        for (int32_t i = n_active; i < sctx->n_max; ++i) {
+            sctx->host_token_ids[i] = filler;
+            sctx->host_counts   [i] = 0;
+        }
+
+        ggml_backend_tensor_set(sctx->inp_token_ids, sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
+        ggml_backend_tensor_set(sctx->inp_counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
+        return;
     }
 
-    // Fill the rest of the arrays with the filler token id and count 0.
-    // Inactive slots are padded with a unique dummy token ID (count = 0).
-    // The uniqueness matters because ggml_set_rows with duplicate indices can produce non-deterministic or incorrect results.
-    // Using a filler token with count 0 that isn't in the active set is safe, because the active_mask step in backend_apply filters them out via ggml_step(counts_f32)
-    for (int32_t i = n_active; i < sctx->n_max; ++i) {
-        sctx->host_token_ids[i] = filler;
-        sctx->host_counts   [i] = 0;
+    // per-row: fill each row's tensors from the base window plus the draft prefix
+    if (sctx->row_ins.empty() || sctx->n_max <= 0) {
+        return;
+    }
+    const int32_t C = sctx->n_max + sctx->n_draft_max;
+
+    // ordered base window (oldest first)
+    std::vector<llama_token> base;
+    base.reserve(sctx->prev.size());
+    for (size_t i = 0; i < sctx->prev.size(); ++i) {
+        base.push_back(sctx->prev.data[(sctx->prev.first + (int32_t) i) % sctx->prev.capacity]);
     }
 
-    ggml_backend_tensor_set(sctx->inp_token_ids, sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
-    ggml_backend_tensor_set(sctx->inp_counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
+    // filler token: not in the base window nor the draft, so its count-0 scatter can
+    // never alias an active entry (duplicate indices in ggml_set_rows are unsafe)
+    int32_t filler = 0;
+    auto in_window = [&](llama_token t) {
+        if (sctx->token_count.find(t) != sctx->token_count.end()) {
+            return true;
+        }
+        for (const auto & d : sctx->draft) {
+            if (d == t) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (in_window(filler)) {
+        ++filler;
+    }
+    GGML_ASSERT(filler < sctx->n_vocab);
+
+    for (size_t r = 0; r < sctx->row_ins.size(); ++r) {
+        auto & in = sctx->row_ins[r];
+
+        // window for row r: the base window with the oldest entries evicted, plus
+        // draft[0..r-1] (which occupies the positions between the base end and row r)
+        const size_t r_new   = std::min(r, sctx->draft.size());
+        const size_t r_evict = std::max<size_t>(0, base.size() + r_new - (size_t) sctx->penalty_last_n);
+        const size_t k_w = std::min(r_evict, base.size());
+        const size_t k_d = r_evict - k_w;
+
+        std::unordered_map<llama_token, int> counts = sctx->token_count;
+        for (size_t i = 0; i < k_w; ++i) {
+            const auto it = counts.find(base[i]);
+            if (it != counts.end() && --it->second <= 0) {
+                counts.erase(it);
+            }
+        }
+        for (size_t i = k_d; i < r_new; ++i) {
+            ++counts[sctx->draft[i]];
+        }
+
+        int32_t n = 0;
+        for (const auto & kv : counts) {
+            GGML_ASSERT(n < C);
+            in.h_ids[n]   = (int32_t) kv.first;
+            in.h_counts[n] = kv.second;
+            ++n;
+        }
+        for (; n < C; ++n) {
+            in.h_ids[n]   = filler;
+            in.h_counts[n] = 0;
+        }
+        ggml_backend_tensor_set(in.ids,    in.h_ids.data(),    0, (size_t) C * sizeof(int32_t));
+        ggml_backend_tensor_set(in.counts, in.h_counts.data(), 0, (size_t) C * sizeof(int32_t));
+    }
 }
 
 static void llama_sampler_penalties_backend_reset(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
     sctx->inp_token_ids = nullptr;
     sctx->inp_counts    = nullptr;
+    sctx->row_ins.clear();
+    sctx->row_cur = 0;
+    sctx->mode_candidates = false;
 }
 
 static struct llama_sampler_i llama_sampler_penalties_i = {
@@ -3196,6 +3358,7 @@ static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_penalties_backend_apply,
     /* .backend_set_input = */ llama_sampler_penalties_backend_set_input,
+    /* .backend_set_draft = */ llama_sampler_penalties_backend_set_draft,
     /* .backend_reset     = */ llama_sampler_penalties_backend_reset,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_penalties>,
 };
@@ -3293,6 +3456,7 @@ static struct llama_sampler_i llama_sampler_top_n_sigma_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -3632,6 +3796,7 @@ static struct llama_sampler_i llama_sampler_dry_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -3853,6 +4018,7 @@ static struct llama_sampler_i llama_sampler_adaptive_p_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
@@ -4036,6 +4202,7 @@ static struct llama_sampler_i llama_sampler_logit_bias_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_logit_bias_backend_apply,
     /* .backend_set_input = */ llama_sampler_logit_bias_backend_set_input,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ llama_sampler_logit_bias_backend_reset,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_logit_bias>,
 };
@@ -4281,6 +4448,7 @@ static struct llama_sampler_i llama_sampler_infill_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_set_draft = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };

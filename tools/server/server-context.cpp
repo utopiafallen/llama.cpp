@@ -19,9 +19,11 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -103,25 +105,52 @@ static std::vector<llama_token> server_sample_and_accept_synth(
 // q is the mirrored draft distribution captured at draft time; on rejection, resample once from
 // the normalized residual [p - q]+ and stop. output marginally ~ p, so the quality matches the
 // non-speculative sampling chain
-// p is computed by applying the shadow sampler (a clone of smpl kept in sync via mirrored
-// accepts) to the raw logits - this carries temperature, penalties, top-k/p, min-p exactly as
-// the slot would sample them. note: chains with stochastic samplers (xtc, mirostat) may
-// diverge slightly between the shadow and the slot rng streams
+//
+// p sources:
+//   packed: the target's backend sampling chain ran on the verify rows, so the per-row packed
+//           (token, prob) list is p itself (renormalized over its support, zero elsewhere).
+//           only a tiny D2H, no host chain apply
+//   host:   apply the shadow sampler (a clone of smpl kept in sync via mirrored accepts) to the
+//           raw logits - this carries temperature, penalties, top-k/p, min-p exactly as the slot
+//           would sample them. note: chains with stochastic samplers (xtc, mirostat) may diverge
+//           slightly between the shadow and the slot rng streams
+// q is zero outside the captured draft support, so the residual [p - q]+ over the union of
+// supports reduces to the p support
 // the caller falls back to exact prefix match when a grammar is active
+static bool rej_p_env(const char * name, int * cache) {
+    if (*cache < 0) {
+        const char * env = getenv(name);
+        *cache = (env && *env != '0') ? 1 : 0;
+    }
+    return *cache;
+}
+
+// GGML_REJ_P_SRC=host forces the host shadow p source even when the target backend chain
+// is active (A/B testing)
+static bool rej_p_src_host() {
+    static int cache = -1;
+    if (cache < 0) {
+        const char * env = getenv("GGML_REJ_P_SRC");
+        cache = (env && !strcmp(env, "host")) ? 1 : 0;
+    }
+    return cache;
+}
+
 static std::vector<llama_token> server_sample_and_accept_rej(
         common_sampler * smpl,
-        common_sampler * smpl_shadow,
+        common_sampler_ptr & smpl_shadow,
         llama_context * ctx,
         const std::vector<int32_t> & idxs,
         const llama_tokens & draft,
         const common_speculative_draft_q & q,
         float temp,
         std::mt19937 & rng,
-        bool is_replay) {
+        bool is_replay,
+        bool use_packed_p) {
     GGML_ASSERT(idxs.size() == draft.size() + 1);
     GGML_ASSERT(q.ids.size() >= draft.size());
     GGML_ASSERT(temp > 0.0f);
-    GGML_ASSERT(smpl_shadow != nullptr);
+    GGML_ASSERT(smpl != nullptr);
 
     const llama_model * model = llama_get_model(ctx);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -137,10 +166,42 @@ static std::vector<llama_token> server_sample_and_accept_rej(
     // keep the shadow state (penalties etc.) in lockstep with smpl
     auto accept = [&](llama_token id, bool is_generated) {
         common_sampler_accept(smpl, id, is_generated);
-        common_sampler_accept(smpl_shadow, id, is_generated);
+        if (smpl_shadow) {
+            common_sampler_accept(smpl_shadow.get(), id, is_generated);
+        }
     };
 
     llama_synchronize(ctx);
+
+    static int env_audit = -1;
+    static int env_timing = -1;
+    static int env_warn  = 0;
+    const bool do_audit  = use_packed_p && rej_p_env("GGML_REJ_P_AUDIT", &env_audit);
+    const bool do_timing = rej_p_env("GGML_REJ_P_TIMING", &env_timing);
+    static double t_p_sum = 0.0;
+    static uint64_t t_p_n = 0;
+    static uint32_t audit_left = 16;
+
+    // apply the shadow chain (state mirrors smpl) to the raw target logits at idxs[i];
+    // returns the surviving support (arr.p is normalized over it)
+    auto probe_host_support = [&](size_t i) {
+        std::vector<std::pair<llama_token, float>> out;
+
+        const float * logits = llama_get_logits_ith(ctx, idxs[i]);
+        GGML_ASSERT(logits != nullptr);
+
+        probe.resize(n_vocab);
+        for (int t = 0; t < n_vocab; ++t) {
+            probe[t] = { (llama_token) t, logits[t], 0.0f };
+        }
+        llama_token_data_array arr{ probe.data(), n_vocab, -1, false };
+        llama_sampler_apply(common_sampler_get(smpl_shadow.get()), &arr);
+
+        for (int k = 0; k < arr.size; ++k) {
+            out.emplace_back(arr.data[k].id, arr.data[k].p);
+        }
+        return out;
+    };
 
     for (size_t i = 0; i < draft.size(); ++i) {
         if (is_replay) {
@@ -152,78 +213,202 @@ static std::vector<llama_token> server_sample_and_accept_rej(
             continue;
         }
 
-        const float * logits = llama_get_logits_ith(ctx, idxs[i]);
-        GGML_ASSERT(logits != nullptr);
+        // p(x) at this position: packed device row (backend sampling) or shadow probe
+        const auto t0 = std::chrono::steady_clock::now();
+        bool packed = false;
+        std::vector<std::pair<llama_token, float>> p_list;
 
-        // p(x) = the task's full target distribution: apply the shadow chain (state mirrors
-        // smpl) to the raw logits; arr.p is normalized over the surviving support
-        probe.resize(n_vocab);
-        for (int t = 0; t < n_vocab; ++t) {
-            probe[t] = { (llama_token) t, logits[t], 0.0f };
-        }
-        llama_token_data_array arr{ probe.data(), n_vocab, -1, false };
-        llama_sampler_apply(common_sampler_get(smpl_shadow), &arr);
-        if (arr.size <= 0) {
-            // a chain configuration wiped the support: fall back to the raw temperature
-            // softmax (pre-fix v1 behavior) instead of sampling from an empty distribution
-            LOG_WRN("rejection sampling: shadow chain emptied the candidate support, falling back to raw softmax\n");
-            float m = -INFINITY;
-            for (int t = 0; t < n_vocab; ++t) {
-                m = std::max(m, logits[t] / temp);
+        if (use_packed_p) {
+            const uint32_t n_p = llama_get_sampled_probs_count_ith(ctx, idxs[i]);
+            if (n_p > 0) {
+                const float * p_row = llama_get_sampled_probs_ith(ctx, idxs[i]);
+                const llama_token * p_ids = p_row ? llama_get_sampled_candidates_ith(ctx, idxs[i]) : nullptr;
+                if (p_row && p_ids) {
+                    packed = true;
+                    p_list.reserve(n_p);
+                    for (uint32_t c = 0; c < n_p; ++c) {
+                        p_list.emplace_back(p_ids[c], p_row[c]);
+                    }
+                }
             }
-            double sumexp = 0.0;
-            for (int t = 0; t < n_vocab; ++t) {
-                p[t] = std::exp(logits[t] / temp - m);
-                sumexp += p[t];
-            }
-            const float inv_sum = 1.0f / (float) sumexp;
-            for (int t = 0; t < n_vocab; ++t) {
-                p[t] *= inv_sum;
-            }
-        } else {
-            std::fill(p.begin(), p.end(), 0.0f);
-            for (int k = 0; k < arr.size; ++k) {
-                p[arr.data[k].id] = arr.data[k].p;
+            if (!packed && !smpl_shadow) {
+                // backend sampling unexpectedly unavailable: degrade this slot to the host probe
+                smpl_shadow.reset(common_sampler_clone(smpl));
+                if (env_warn++ == 0) {
+                    LOG_WRN("rejection sampling: packed target rows missing, falling back to host shadow\n");
+                }
             }
         }
 
-        // q is zero outside the captured draft support at this position
-        std::fill(q_vec.begin(), q_vec.end(), 0.0f);
+        float p_d = 0.0f;
+        float q_d = 0.0f;
         const auto & q_ids = q.ids[i];
         const auto & q_p   = q.p[i];
-        for (size_t k = 0; k < q_ids.size(); ++k) {
-            q_vec[q_ids[k]] = q_p[k];
+
+        if (packed) {
+            for (const auto & e : p_list) {
+                if (e.first == draft[i]) {
+                    p_d = e.second;
+                    break;
+                }
+            }
+            for (size_t k = 0; k < q_ids.size(); ++k) {
+                if (q_ids[k] == draft[i]) {
+                    q_d = q_p[k];
+                    break;
+                }
+            }
+        } else {
+            // p(x) = the task's full target distribution: apply the shadow chain (state mirrors
+            // smpl) to the raw logits; arr.p is normalized over the surviving support
+            probe.resize(n_vocab);
+            const float * logits = llama_get_logits_ith(ctx, idxs[i]);
+            GGML_ASSERT(logits != nullptr);
+            for (int t = 0; t < n_vocab; ++t) {
+                probe[t] = { (llama_token) t, logits[t], 0.0f };
+            }
+            llama_token_data_array arr{ probe.data(), n_vocab, -1, false };
+            llama_sampler_apply(common_sampler_get(smpl_shadow.get()), &arr);
+            if (arr.size <= 0) {
+                // a chain configuration wiped the support: fall back to the raw temperature
+                // softmax (pre-fix v1 behavior) instead of sampling from an empty distribution
+                LOG_WRN("rejection sampling: shadow chain emptied the candidate support, falling back to raw softmax\n");
+                float m = -INFINITY;
+                for (int t = 0; t < n_vocab; ++t) {
+                    m = std::max(m, logits[t] / temp);
+                }
+                double sumexp = 0.0;
+                for (int t = 0; t < n_vocab; ++t) {
+                    p[t] = std::exp(logits[t] / temp - m);
+                    sumexp += p[t];
+                }
+                const float inv_sum = 1.0f / (float) sumexp;
+                for (int t = 0; t < n_vocab; ++t) {
+                    p[t] *= inv_sum;
+                }
+                p_d = p[draft[i]];
+            } else {
+                std::fill(p.begin(), p.end(), 0.0f);
+                for (int k = 0; k < arr.size; ++k) {
+                    p[arr.data[k].id] = arr.data[k].p;
+                }
+                p_d = p[draft[i]];
+            }
+
+            // q is zero outside the captured draft support at this position
+            std::fill(q_vec.begin(), q_vec.end(), 0.0f);
+            for (size_t k = 0; k < q_ids.size(); ++k) {
+                q_vec[q_ids[k]] = q_p[k];
+            }
+            q_d = q_vec[draft[i]];
         }
 
-        const float p_d = p[draft[i]];
-        const float q_d = q_vec[draft[i]];
-        if (q_d > 0.0f && dist(rng) < std::min(1.0, (double) p_d / (double) q_d)) {
+        if (do_timing) {
+            const auto t1 = std::chrono::steady_clock::now();
+            t_p_sum += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (++t_p_n % 128 == 0) {
+                fprintf(stderr, "[REJ-P-T] p_src=%s avg_p_ms=%.3f (n=%llu)\n",
+                        use_packed_p ? "packed" : "host", t_p_sum / (double) t_p_n, (unsigned long long) t_p_n);
+                t_p_sum = 0.0;
+                t_p_n = 0;
+            }
+        }
+
+        if (do_audit && audit_left > 0) {
+            // with -bs the raw target logits stay on device (the chain consumed them), so no
+            // host-side p exists to cross-check against; sanity-check the packed row instead:
+            // it must be a proper distribution over the filtered support, and the device
+            // chain's own sampled token must lie in that support (dist samples from it)
+            if (packed) {
+                double p_sum = 0.0;
+                float p_min = 1.0f;
+                float p_max = 0.0f;
+                for (const auto & e : p_list) {
+                    p_sum += e.second;
+                    p_min = std::min(p_min, e.second);
+                    p_max = std::max(p_max, e.second);
+                }
+                // the device chain's own sample at THIS row must lie in this row's support
+                const llama_token row_tok = llama_get_sampled_token_ith(ctx, idxs[i]);
+                bool tok_in_support = false;
+                for (const auto & e : p_list) {
+                    if (e.first == row_tok) {
+                        tok_in_support = true;
+                        break;
+                    }
+                }
+                fprintf(stderr, "[REJ-P-AUDIT] packed pos %zu n %zu sum %.6f p[%.3e,%.3e] tok_in_support %d\n",
+                        i, p_list.size(), p_sum, (double) p_min, (double) p_max, (int) tok_in_support);
+            } else if (smpl_shadow) {
+                // host path (no -bs): the raw logits are on the host; the probe must give a
+                // non-degenerate support (a one-hot means a chain/state problem)
+                const auto sup = probe_host_support(i);
+                fprintf(stderr, "[REJ-P-AUDIT] host pos %zu n_host %zu p_draft %.5f\n",
+                        i, sup.size(), (double) p[draft[i]]);
+            }
+            --audit_left;
+        }
+
+        bool ok = q_d > 0.0f && dist(rng) < std::min(1.0, (double) p_d / (double) q_d);
+
+        if (ok) {
             accept(draft[i], true);
             result.push_back(draft[i]);
             continue;
         }
 
         // resample from the normalized residual [p - q]+
-        double r_sum = 0.0;
-        for (int t = 0; t < n_vocab; ++t) {
-            const float r = p[t] - q_vec[t];
-            if (r > 0.0f) {
-                r_sum += r;
-            }
-        }
-
         llama_token id = LLAMA_TOKEN_NULL;
-        if (r_sum > 1e-9) {
-            double u = dist(rng) * r_sum;
+        double r_sum = 0.0;
+        if (packed) {
+            // p == 0 outside its support, so the residual lives on the p support
+            std::vector<float> r(p_list.size(), 0.0f);
+            for (size_t c = 0; c < p_list.size(); ++c) {
+                float q_c = 0.0f;
+                for (size_t k = 0; k < q_ids.size(); ++k) {
+                    if (q_ids[k] == p_list[c].first) {
+                        q_c = q_p[k];
+                        break;
+                    }
+                }
+                const float rc = p_list[c].second - q_c;
+                if (rc > 0.0f) {
+                    r[c] = rc;
+                    r_sum += rc;
+                }
+            }
+            if (r_sum > 1e-9) {
+                double u = dist(rng) * r_sum;
+                for (size_t c = 0; c < p_list.size(); ++c) {
+                    if (r[c] <= 0.0f) {
+                        continue;
+                    }
+                    u -= r[c];
+                    if (u <= 0.0) {
+                        id = p_list[c].first;
+                        break;
+                    }
+                }
+            }
+        } else {
             for (int t = 0; t < n_vocab; ++t) {
                 const float r = p[t] - q_vec[t];
-                if (r <= 0.0f) {
-                    continue;
+                if (r > 0.0f) {
+                    r_sum += r;
                 }
-                u -= r;
-                if (u <= 0.0) {
-                    id = (llama_token) t;
-                    break;
+            }
+            if (r_sum > 1e-9) {
+                double u = dist(rng) * r_sum;
+                for (int t = 0; t < n_vocab; ++t) {
+                    const float r = p[t] - q_vec[t];
+                    if (r <= 0.0f) {
+                        continue;
+                    }
+                    u -= r;
+                    if (u <= 0.0) {
+                        id = (llama_token) t;
+                        break;
+                    }
                 }
             }
         }
@@ -237,7 +422,16 @@ static std::vector<llama_token> server_sample_and_accept_rej(
         return result;
     }
 
-    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    // all drafts accepted: the bonus token is the target's own draw at the final verify row;
+    // in backend sampling mode the device chain is the authoritative target chain, so use its
+    // sampled token (the host draw would be a different sample of the same distribution)
+    llama_token id = LLAMA_TOKEN_NULL;
+    if (use_packed_p) {
+        id = llama_get_sampled_token_ith(ctx, idxs[draft.size()]);
+    }
+    if (id == LLAMA_TOKEN_NULL) {
+        id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    }
     accept(id, true);
     result.push_back(id);
 
@@ -497,6 +691,9 @@ struct server_slot {
     // shadow of smpl for rejection sampling: mirrors its state so the ratio test can obtain
     // the task's full target distribution (penalties/filters included)
     common_sampler_ptr smpl_shadow;
+    // set when the target's backend sampling chain is active for the current task: its
+    // packed per-verify-row output serves as the p source for rejection sampling
+    bool spec_target_bs = false;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -551,6 +748,7 @@ struct server_slot {
         llama_set_sampler(ctx_tgt, id, nullptr);
 
         smpl_shadow.reset();
+        spec_target_bs = false;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -678,6 +876,12 @@ struct server_slot {
             spec_i_batch.push_back(batch.size());
             for (size_t i = 0; i < spec_draft.size(); i++) {
                 spec_i_batch.push_back(batch.size() + i + 1);
+            }
+
+            // per-row penalty windows for the target's backend sampling chain: row r's
+            // window includes the draft prefix [0..r-1]
+            if (spec_target_bs) {
+                llama_set_sampler_draft_prefix(ctx_tgt, id, spec_draft.data(), (int32_t) spec_draft.size());
             }
 
             auto pos0 = prompt.tokens.pos_next();
@@ -1953,8 +2157,9 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                slot.spec_target_bs = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
+                slot.spec_target_bs = false;
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
 
@@ -4098,10 +4303,14 @@ private:
                     ? common_speculative_get_draft_q(spec.get(), slot.id)
                     : nullptr;
 
+                // GPU shadow: the target's backend chain already ran on the verify rows; its
+                // packed rows give p directly (no full-vocab D2H, no host chain apply)
+                const bool use_gpu_p = draft_q != nullptr && slot.spec_target_bs && !rej_p_src_host();
+
                 // the shadow mirrors slot.smpl so the ratio test uses the task's full target
                 // distribution; it is created on first use (state matches smpl at that point)
                 common_sampler_ptr shadow_save;
-                if (draft_q != nullptr && !common_sampler_has_grammar(slot.smpl.get())) {
+                if (draft_q != nullptr && !use_gpu_p && !common_sampler_has_grammar(slot.smpl.get())) {
                     if (!slot.smpl_shadow) {
                         slot.smpl_shadow.reset(common_sampler_clone(slot.smpl.get()));
                         SLT_INF(slot, "rejection sampling: shadow sampler created, chain: %s\n",
@@ -4116,9 +4325,9 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
                     : (draft_q != nullptr && !common_sampler_has_grammar(slot.smpl.get())
                         ? server_sample_and_accept_rej(
-                                slot.smpl.get(), slot.smpl_shadow.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                slot.smpl.get(), slot.smpl_shadow, slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 *draft_q, slot.task->params.sampling.temp, slot.spec_synth_rng,
-                                slot.spec_is_replay)
+                                slot.spec_is_replay, use_gpu_p)
                         : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft));
                 slot.spec_i_batch.clear();
 
@@ -4155,7 +4364,7 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
-                        if (slot.smpl_shadow) {
+                        if (slot.smpl_shadow && shadow_save) {
                             common_sampler_copy(shadow_save.get(), slot.smpl_shadow.get());
                         }
 
