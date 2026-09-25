@@ -1599,19 +1599,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             probe_buf[t] = { (llama_token) t, logits[t], 0.0f };
         }
 
-        llama_token_data_array arr{ probe_buf.data(), n_vocab, -1, false };
+        llama_token_data_array arr{ probe_buf.data(), (size_t) n_vocab, -1, false };
         llama_sampler_apply(probe_chains[seq_id], &arr);
 
         double z = 0.0;
-        for (int k = 0; k < arr.size; ++k) {
+        for (size_t k = 0; k < arr.size; ++k) {
             z += arr.data[k].p;
         }
         GGML_ASSERT(z > 1e-9);
 
         std::uniform_real_distribution<double> dist(0.0, 1.0);
         double u = dist(probe_rng) * z;
-        int i_pick = arr.size - 1;
-        for (int k = 0; k < arr.size; ++k) {
+        size_t i_pick = arr.size - 1;
+        for (size_t k = 0; k < arr.size; ++k) {
             u -= arr.data[k].p;
             if (u <= 0.0) {
                 i_pick = k;
@@ -1622,7 +1622,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto & dq = draft_q[seq_id];
         dq.ids.emplace_back();
         dq.p.emplace_back();
-        for (int k = 0; k < arr.size; ++k) {
+        for (size_t k = 0; k < arr.size; ++k) {
             dq.ids.back().push_back(arr.data[k].id);
             dq.p.back().push_back((float) (arr.data[k].p / z));
         }
