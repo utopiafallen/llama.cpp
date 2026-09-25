@@ -117,6 +117,12 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
+// hipCUB (the ROCm SDK port of CUB) provides the large-ncols argsort path on HIP;
+// GGML_CUDA_USE_CUB stays undefined so top-k keeps its dedicated radix path
+#if defined(GGML_USE_HIP)
+#    define GGML_HIP_USE_HIPCUB
+#endif  // defined(GGML_USE_HIP)
+
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
 // https://github.com/ggml-org/llama.cpp/pull/22522#discussion_r3302393293
@@ -1206,6 +1212,9 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// the per-device shared stream used by the shared compute slab, nullptr when no slab exists
+cudaStream_t ggml_cuda_shared_compute_stream(int device);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1528,6 +1537,14 @@ struct ggml_backend_cuda_context {
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
+        // when the shared compute slab is enabled for this device, all owners serialize
+        // their stream 0 work on one per-device stream (any of them may use the slab)
+        if (stream == 0) {
+            cudaStream_t shared_stream = ggml_cuda_shared_compute_stream(device);
+            if (shared_stream != nullptr) {
+                return shared_stream;
+            }
+        }
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
