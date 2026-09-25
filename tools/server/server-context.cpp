@@ -194,10 +194,10 @@ static std::vector<llama_token> server_sample_and_accept_rej(
         for (int t = 0; t < n_vocab; ++t) {
             probe[t] = { (llama_token) t, logits[t], 0.0f };
         }
-        llama_token_data_array arr{ probe.data(), n_vocab, -1, false };
+        llama_token_data_array arr{ probe.data(), (size_t) n_vocab, -1, false };
         llama_sampler_apply(common_sampler_get(smpl_shadow.get()), &arr);
 
-        for (int k = 0; k < arr.size; ++k) {
+        for (size_t k = 0; k < arr.size; ++k) {
             out.emplace_back(arr.data[k].id, arr.data[k].p);
         }
         return out;
@@ -267,7 +267,7 @@ static std::vector<llama_token> server_sample_and_accept_rej(
             for (int t = 0; t < n_vocab; ++t) {
                 probe[t] = { (llama_token) t, logits[t], 0.0f };
             }
-            llama_token_data_array arr{ probe.data(), n_vocab, -1, false };
+            llama_token_data_array arr{ probe.data(), (size_t) n_vocab, -1, false };
             llama_sampler_apply(common_sampler_get(smpl_shadow.get()), &arr);
             if (arr.size <= 0) {
                 // a chain configuration wiped the support: fall back to the raw temperature
@@ -289,7 +289,7 @@ static std::vector<llama_token> server_sample_and_accept_rej(
                 p_d = p[draft[i]];
             } else {
                 std::fill(p.begin(), p.end(), 0.0f);
-                for (int k = 0; k < arr.size; ++k) {
+                for (size_t k = 0; k < arr.size; ++k) {
                     p[arr.data[k].id] = arr.data[k].p;
                 }
                 p_d = p[draft[i]];
