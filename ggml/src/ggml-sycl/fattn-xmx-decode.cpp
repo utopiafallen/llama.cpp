@@ -49,6 +49,10 @@ using xmp_l_i32 = sycl::multi_ptr<int32_t, sycl::access::address_space::local_sp
 // acc->f32-tile->f16 conversion, occupancy-safe because it is a separate instantiation).
 // I8P = 1: QK^T via int8 K=32 XMX ops (one per 32-dim SoA block per M=8 tile; Q codes
 // from the global A8g scratch, K codes staged per block, C descaled into scores).
+// I8P = 3: same QK but the per-block mad runs twice and the descale is halved (bit-identical
+// to I8P=1; measures the cost of one extra int8 mad per block, the XMAC cost of a Q-residual
+// variant). The in-register copy/apply descale is not possible on this backend (standalone
+// int32 acc read rejected).
 template <int M, int GQA, int SPLIT, int MQ, int NCHUNK, int QG = 0, int F16P = 0, int I8P = 0>
 static void xmx_decode_main(
         const float * __restrict__ Q,
@@ -98,9 +102,9 @@ static void xmx_decode_main(
     constexpr int F16_SZ   = F16P ? F16_OFF + 16*32*4 : 0;
     constexpr int I8B_SZ   = (I8P == 2) ? 32*16 : 0; // I8P mode 2: B tile [32 dims][16 pos] int8
     constexpr int I8_OFF   = I8P ? (1024 - ((LDS_BASE + F16_SZ + I8B_SZ) % 1024)) % 1024 : 0;
-    // C store: mode 1 ldm=16 = 1KB, mode 2 ldm=32 = 2KB. Kept small: crossing the ~8KB/WG LDS
+    // C store: mode 1/3 ldm=16 = 1KB, mode 2 ldm=32 = 2KB. Kept small: crossing the ~8KB/WG LDS
     // cliff costs ~+50% FA (b70-decode-perf skill) - mode 1 v2 also loads B from global (no b_l)
-    constexpr int I8C_SZ   = I8P ? (I8P == 1 ? 2*8*16*4 : 2*8*32*4) : 0;
+    constexpr int I8C_SZ   = I8P ? ((I8P == 1 || I8P == 3) ? 2*8*16*4 : 2*8*32*4) : 0;
     constexpr int LDS_BYTES = LDS_BASE + F16_SZ + I8B_SZ + I8_OFF + I8C_SZ;
     syclex::work_group_static<char[LDS_BYTES]> lsm;
     sycl::half * Q16    = (sycl::half *)&lsm;                    // [PSTRIDE][D] (QG=0 only)
@@ -180,6 +184,37 @@ static void xmx_decode_main(
                 #pragma unroll
                 for (int r = 0; r < PSTRIDE; r++) {
                     const float v = sQg[(size_t) kv_head*128 + r*8 + blk] * sk
+                                  * (float) c_l[(r >> 3)*128 + (r & 7)*16 + lane];
+                    if (blk == 0) { scores[r*SPLIT + c*16 + lane] = v; }
+                    else          { scores[r*SPLIT + c*16 + lane] += v; }
+                }
+            }
+        } else if (I8P == 3 && q8_input && q8_soa) {
+            // int8 QK, double-mad probe: mode 1 with the per-block mad run twice (C8 = 2*(A*B))
+            // and the descale halved (sQ*0.5). Bit-identical to mode 1: 2*C is exact in int32,
+            // sQ*0.5 is exact in f32, and (fl(sQ*sk)/2)*(2*C) rounds to the same f32 as
+            // fl(sQ*sk)*C. Measures exactly the cost of one extra int8 mad per block - the
+            // XMAC cost of a Q-residual (two-level Q) variant. The in-register copy/apply
+            // descale is not possible: the backend rejects the standalone int32 acc read
+            // ("load matrix C <8x16 i32> packed layout" unsupported; the C store is the only exit).
+            const char * k_blk = K_q8 + (pos_base + c*16)*k_pos_stride_b;
+            for (int blk = 0; blk < 8; blk++) {
+                const int dim0 = blk * 32;
+                const float sk = (float) k_scv[blk];
+                #pragma unroll
+                for (int tile = 0; tile < 2; tile++) {
+                    mx::joint_matrix_load(sg, A8, xmp_g_i8((int8_t *)(A8g + (size_t) kv_head*4096 + (tile*8 + blk)*256)), 32);
+                    mx::joint_matrix_load(sg, B8, xmp_g_i8((int8_t *)(k_blk + kv_real*(D + 16) + dim0)), k_pos_stride_b);
+                    mx::joint_matrix_fill(sg, C8[tile], 0);
+                    mx::joint_matrix_mad(sg, C8[tile], A8, B8, C8[tile]);
+                    mx::joint_matrix_mad(sg, C8[tile], A8, B8, C8[tile]);
+                }
+                mx::joint_matrix_store(sg, C8[0], xmp_l_i32(c_l), 16, layout::row_major);
+                mx::joint_matrix_store(sg, C8[1], xmp_l_i32(c_l + 128), 16, layout::row_major);
+                sg.barrier();
+                #pragma unroll
+                for (int r = 0; r < PSTRIDE; r++) {
+                    const float v = sQg[(size_t) kv_head*128 + r*8 + blk] * 0.5f * sk
                                   * (float) c_l[(r >> 3)*128 + (r & 7)*16 + lane];
                     if (blk == 0) { scores[r*SPLIT + c*16 + lane] = v; }
                     else          { scores[r*SPLIT + c*16 + lane] += v; }
@@ -931,7 +966,9 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
         i8_warned = true;
         fprintf(stderr, "[XMQ-I8] int8 QK %s (mode %d: %s)\n",
                 q8_soa ? "ON" : "OFF (needs q8 SoA KV)", xmx_i8,
-                xmx_i8 == 2 ? "row/pos scale, cross-block accum" : "per-block scale, K bit-exact");
+                xmx_i8 == 2 ? "row/pos scale, cross-block accum"
+                : xmx_i8 == 3 ? "per-block scale, in-register copy/apply descale"
+                              : "per-block scale, K bit-exact");
     }
 
     // QG=1 A-matrix scratch for the GQA head-group verify path: Q pre-converted to f16 in the
@@ -1155,9 +1192,9 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
             float * pm_p = pm.ptr; float * pl_p = pl.ptr; \
             int64_t t_main0 = 0, t_main1 = 0, t_comb1 = 0; \
             if (xmx_t) { stream->wait(); t_main0 = ggml_time_us(); } \
-            if (f16p && i8p) { if (xmx_i8 == 2) { XMX_DECODE_DISPATCH(1, 2, SPL); } else { XMX_DECODE_DISPATCH(1, 1, SPL); } } \
+            if (f16p && i8p) { if (xmx_i8 == 2) { XMX_DECODE_DISPATCH(1, 2, SPL); } else if (xmx_i8 == 3) { XMX_DECODE_DISPATCH(1, 3, SPL); } else { XMX_DECODE_DISPATCH(1, 1, SPL); } } \
             else if (f16p) { XMX_DECODE_DISPATCH(1, 0, SPL); } \
-            else if (i8p) { if (xmx_i8 == 2) { XMX_DECODE_DISPATCH(0, 2, SPL); } else { XMX_DECODE_DISPATCH(0, 1, SPL); } } \
+            else if (i8p) { if (xmx_i8 == 2) { XMX_DECODE_DISPATCH(0, 2, SPL); } else if (xmx_i8 == 3) { XMX_DECODE_DISPATCH(0, 3, SPL); } else { XMX_DECODE_DISPATCH(0, 1, SPL); } } \
             else { XMX_DECODE_DISPATCH(0, 0, SPL); } \
             if (o_dump_p) { \
                 stream->wait(); \
