@@ -34,6 +34,9 @@ using xmp_g_h = sycl::multi_ptr<sycl::half, sycl::access::address_space::global_
 using xmp_g_f = sycl::multi_ptr<float,  sycl::access::address_space::global_space, sycl::access::decorated::legacy>;
 using xmp_l_h = sycl::multi_ptr<sycl::half, sycl::access::address_space::local_space,  sycl::access::decorated::legacy>;
 using xmp_l_f = sycl::multi_ptr<float,  sycl::access::address_space::local_space,  sycl::access::decorated::legacy>;
+using xmp_g_i8  = sycl::multi_ptr<int8_t,  sycl::access::address_space::global_space, sycl::access::decorated::legacy>;
+using xmp_l_i8  = sycl::multi_ptr<int8_t,  sycl::access::address_space::local_space,  sycl::access::decorated::legacy>;
+using xmp_l_i32 = sycl::multi_ptr<int32_t, sycl::access::address_space::local_space,  sycl::access::decorated::legacy>;
 
 // One work-group (one 16-lane sub_group) handles one KV split and one KV head.
 // MQ query positions are batched into M XMX rows:
@@ -42,9 +45,17 @@ using xmp_l_f = sycl::multi_ptr<float,  sycl::access::address_space::local_space
 // All LDS buffers and the per-split global partial storage use row stride PSTRIDE
 // (>= M + padding) so full-tile joint_matrix_store writes never cross block bounds.
 // D is fixed at 256 by the dispatch gate; SPLIT/MQ/NCHUNK are compile-time.
-// F16P = 1: O partials stored as f16 (halves partials traffic; +1KB LDS for the
-// acc->f32-tile->f16 conversion, occupancy-safe because it is a separate instantiation).
-template <int M, int GQA, int SPLIT, int MQ, int NCHUNK, int QG = 0, int F16P = 0>
+// I8P = 10 (GGML_SYCL_INT8_FA_KERNEL): QK^T via dual-plane int8 K=32 XMX ops (two M=8
+// tiles per 16-pos chunk). Q = s_row*(qhi + qlo/16), ~15-bit effective Q, in two int8
+// planes (A8g scratch); K stays bit-exact to the SoA cache. Per 32-dim block: hi/lo int32
+// mads per tile, and the f32 Csc acc is applied directly from the int32 C8/C8l accs
+// (mixed f32-acc / int32-src joint_matrix_apply - no int32->f32 copy). The row scale sQg
+// is applied on the single per-chunk C round-trip. Only error vs f16 QK: the Q
+// quantization (~1e-3 logit, invisible at production sampling temperature).
+// NOTE: joint_matrix_apply lambdas must take elements BY REFERENCE and mutate in place
+// (x += ...); the return value is discarded (sycl_ext_oneapi_matrix spec). A by-value
+// lambda that returns is a silent no-op.
+template <int M, int GQA, int SPLIT, int MQ, int NCHUNK, int QG = 0, int I8P = 0>
 static void xmx_decode_main(
         const float * __restrict__ Q,
         const sycl::half * __restrict__ Q16g, // [n_wg_heads][PSTRIDE][D] f16 A-matrix scratch (QG=1 only)
@@ -53,7 +64,7 @@ static void xmx_decode_main(
         const char  * __restrict__ K_q8,
         const char  * __restrict__ V_q8,
         const sycl::half * __restrict__ mask,
-        void * __restrict__ partial_O, // f32 or f16 depending on f16p (XMQ_PART_F16)
+        void * __restrict__ partial_O, // f32 partial
         float * __restrict__ partial_m,
         float * __restrict__ partial_l,
         const int n_kv, const int n_kv_heads, const int n_q_heads, const int n_splits,
@@ -61,11 +72,10 @@ static void xmx_decode_main(
         const int v_pos_stride, const int v_head_stride, const int mask_head_stride, const int mask_ne1,
         const int k_pos_stride_b, const int k_head_stride_b,
         const int v_pos_stride_b, const int v_head_stride_b,
-        const float scale, const bool q8_input, const int f16_lds, const bool q8_soa, const int ne_row_b,
+        const float scale, const bool q8_input, const bool q8_soa, const int ne_row_b,
         const int gqa_r, const int n_hg, // real GQA ratio and head-groups per kv head (1 = dense)
-        const bool p1only, // diagnostic: skip the PV section (QK+softmax cost probe), output invalid
-        const bool sf32p,  // F16P diagnostic: use baseline f32 store despite the F16P instantiation
-        void * __restrict__ o_dump, // diagnostic: first-tile dump buffer (row0 acc + f16 glob readback)
+        const int8_t * __restrict__ A8g, // [n_wg_heads][2 tiles][8 blk][8 rows][32] int8 Q codes (I8P only)
+        const float  * __restrict__ sQg, // [n_wg_heads][16 rows][8 blk] f32 Q block scales (I8P only)
         const sycl::nd_item<3> & it) {
     constexpr int D    = 256;
     constexpr int ROWS = GQA * MQ; // live rows
@@ -87,17 +97,21 @@ static void xmx_decode_main(
     // QG=1: no Q16 in LDS (A matrix comes from the global f16 scratch) - frees PSTRIDE*D*2B for
     // higher occupancy at 16-row configs (see the SPLIT/LDS cliff notes in the b70-decode-perf skill)
     constexpr int LDS_BASE = (QG == 0 ? PSTRIDE*D*2 : 0) + PSTRIDE*SPLIT*4 + PSTRIDE*SPLIT*2 + 16*16*2;
-    constexpr int F16_OFF  = F16P ? (1024 - (LDS_BASE % 1024)) % 1024 : 0; // 1KB-align o_scratch
-    constexpr int LDS_BYTES = LDS_BASE + F16_OFF + (F16P ? 16*32*4 : 0); // F16P: [16][32] f32 scratch
+    // I8P C store: ldm=16 int32/f32 acc stores = 2KB/WG. Kept small: crossing the ~8KB/WG LDS
+    // cliff costs ~+50% FA (b70-decode-perf skill).
+    constexpr int I8C_SZ   = I8P ? 2*8*16*4 : 0;
+    constexpr int LDS_BYTES = LDS_BASE + I8C_SZ;
     syclex::work_group_static<char[LDS_BYTES]> lsm;
     sycl::half * Q16    = (sycl::half *)&lsm;                    // [PSTRIDE][D] (QG=0 only)
     float    * scores  = QG == 0 ? (float *)(Q16 + PSTRIDE*D) : (float *)&lsm; // [PSTRIDE][SPLIT]
     sycl::half * P16   = (sycl::half *)(scores + PSTRIDE*SPLIT); // [PSTRIDE][SPLIT]
     sycl::half * tile_buf = (sycl::half *)(P16 + PSTRIDE*SPLIT); // [16][16] staging
-    float    * o_scratch = F16P ? (float *)(tile_buf + 256) + F16_OFF/4 : nullptr; // [16][32] f32 (F16P only)
+    int32_t  * c_l  = I8P ? (int32_t *)(tile_buf + 256) : nullptr; // [2][8][16] ldm=16 (I8P only)
+    float    * c_lf = I8P ? (float *) c_l : nullptr; // f32 view of the same 2KB (Csc store)
 
-    // Q F32 -> F16 into LDS, all chunks at once (skipped with QG=1: A comes from global scratch)
-    if constexpr (QG == 0) {
+    // Q F32 -> F16 into LDS, all chunks at once (skipped with QG=1: A comes from global scratch;
+    // also skipped with I8P: A comes from the global int8 Q-code scratch)
+    if constexpr (QG == 0 && I8P == 0) {
         for (int i = lane; i < PSTRIDE*D; i += 16) {
             const int r = i / D, dim = i % D;
             float val = 0.0f;
@@ -122,18 +136,21 @@ static void xmx_decode_main(
     mx::joint_matrix<sycl::sub_group, sycl::half, use::a, M, 16, layout::row_major> A_jm;
     mx::joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::col_major> B_k;
     mx::joint_matrix<sycl::sub_group, float, use::accumulator, M, 16> C_jm[NCHUNK];
+    // I8P: int8 QK operands (M=8 tiles; K=32 = one SoA 32-dim block, no zero padding)
+    mx::joint_matrix<sycl::sub_group, int8_t, use::a, 8, 32, layout::row_major> A8;
+    mx::joint_matrix<sycl::sub_group, int8_t, use::a, 8, 32, layout::row_major> A8l; // lo plane
+    mx::joint_matrix<sycl::sub_group, int8_t, use::b, 32, 16, layout::col_major> B8;
+    mx::joint_matrix<sycl::sub_group, int32_t, use::accumulator, 8, 16> C8[2];
+    mx::joint_matrix<sycl::sub_group, float, use::accumulator, 8, 16> Csc[2]; // cross-block f32 sum
+    // lo-plane int32 acc (C8 doubles as the hi-plane acc; after the int32 combine
+    // C8 = 16*C_hi + C_lo, exact)
+    mx::joint_matrix<sycl::sub_group, int32_t, use::accumulator, 8, 16> C8l[2];
 
     // A-chunk base row in the [PSTRIDE] buffers
     const auto a_row = [](int qc) { return NCHUNK == 2 ? qc*M : 0; };
 
     // 2. QK^T: scores = Q @ K^T, per 16-pos chunk
     for (int c = 0; c < SPLIT/16; c++) {
-        if constexpr (NCHUNK == 2) {
-            mx::joint_matrix_fill(sg, C_jm[0], 0.0f);
-            mx::joint_matrix_fill(sg, C_jm[1], 0.0f);
-        } else {
-            mx::joint_matrix_fill(sg, C_jm[0], 0.0f);
-        }
         // SoA: this lane's position row and its head scales (all 8 blocks) for the dc loop
         const char * k_row = nullptr;
         sycl::vec<sycl::half, 8> k_scv;
@@ -141,6 +158,49 @@ static void xmx_decode_main(
             k_row = K_q8 + (pos_base + c*16 + lane)*k_pos_stride_b;
             // per-head segment: [D qs][D/32 half scales]; scales start at seg_start + D
             k_scv = *(const sycl::vec<sycl::half, 8> *)(k_row + kv_real*(D + 16) + D);
+        }
+        if (I8P == 10 && q8_input && q8_soa) {
+            // INT8 FA: the f32 Csc acc is applied directly from the int32 C8/C8l accs
+            // (mixed f32-acc / int32-src apply) - no int32->f32 copies. See the I8P note
+            // above the template.
+            const char * k_blk = K_q8 + (pos_base + c*16)*k_pos_stride_b;
+            mx::joint_matrix_fill(sg, Csc[0], 0.0f);
+            mx::joint_matrix_fill(sg, Csc[1], 0.0f);
+            for (int blk = 0; blk < 8; blk++) {
+                const int dim0 = blk * 32;
+                const float sk   = (float) k_scv[blk];
+                const float sk16 = (float) k_scv[blk] * 0.0625f;
+                // B is tile-invariant (both tiles share the same K tile): load once per block
+                mx::joint_matrix_load(sg, B8, xmp_g_i8((int8_t *)(k_blk + kv_real*(D + 16) + dim0)), k_pos_stride_b);
+                #pragma unroll
+                for (int tile = 0; tile < 2; tile++) {
+                    int8_t * ah = (int8_t *)(A8g + (size_t) kv_head*8192 + (tile*8 + blk)*256);
+                    mx::joint_matrix_load(sg, A8, xmp_g_i8(ah), 32);
+                    mx::joint_matrix_load(sg, A8l, xmp_g_i8(ah + 4096), 32);
+                    mx::joint_matrix_fill(sg, C8[tile], 0);
+                    mx::joint_matrix_fill(sg, C8l[tile], 0);
+                    mx::joint_matrix_mad(sg, C8[tile], A8, B8, C8[tile]);
+                    mx::joint_matrix_mad(sg, C8l[tile], A8l, B8, C8l[tile]);
+                    // no C8f copies: read the int32 accs straight, convert in the lambda
+                    mx::joint_matrix_apply(sg, Csc[tile], C8[tile],  [sk](float &x, int32_t &y) { x += (float) y * sk; });
+                    mx::joint_matrix_apply(sg, Csc[tile], C8l[tile], [sk16](float &x, int32_t &y) { x += (float) y * sk16; });
+                }
+            }
+            mx::joint_matrix_store(sg, Csc[0], xmp_l_f(c_lf), 16, layout::row_major);
+            mx::joint_matrix_store(sg, Csc[1], xmp_l_f(c_lf + 128), 16, layout::row_major);
+            sg.barrier();
+            #pragma unroll
+            for (int r = 0; r < PSTRIDE; r++) {
+                const float v = sQg[(size_t) kv_head*16 + r]
+                              * (float) c_lf[(r >> 3)*128 + (r & 7)*16 + lane];
+                scores[r*SPLIT + c*16 + lane] = v;
+            }
+        } else {
+        if constexpr (NCHUNK == 2) {
+            mx::joint_matrix_fill(sg, C_jm[0], 0.0f);
+            mx::joint_matrix_fill(sg, C_jm[1], 0.0f);
+        } else {
+            mx::joint_matrix_fill(sg, C_jm[0], 0.0f);
         }
         for (int dc = 0; dc < D/16; dc++) {
             const int dim0 = dc * 16;
@@ -167,7 +227,7 @@ static void xmx_decode_main(
                         tile_buf[d + lane*16] = (sycl::half)((float)qs[off+d] * s);
                     }
                 }
-            } else if (f16_lds == 0 && NCHUNK == 1) {
+            } else if (NCHUNK == 1) {
                 // f16 K tile: direct global B load for the single-chunk path
                 sg.barrier();
                 mx::joint_matrix_load(sg, B_k,
@@ -181,7 +241,7 @@ static void xmx_decode_main(
                 mx::joint_matrix_mad(sg, C_jm[0], A_jm, B_k, C_jm[0]);
                 continue;
             } else {
-                // f16 K staged through LDS (diagnostic path and NCHUNK==2 source)
+                // f16 K staged through LDS (NCHUNK==2 source)
                 const sycl::half * krow = K + kv_real*k_head_stride + (pos_base + c*16 + lane)*k_pos_stride + dc*16;
                 #pragma unroll
                 for (int d = 0; d < 16; d++) {
@@ -214,6 +274,7 @@ static void xmx_decode_main(
             }
         } else {
             mx::joint_matrix_store(sg, C_jm[0], xmp_l_f(scores + (a_row(0)*16 + c*16)), SPLIT, layout::row_major);
+        }
         }
         sg.barrier();
         // scale + causal + mask -> -FLT_MAX (each element handled by one lane)
@@ -266,28 +327,7 @@ static void xmx_decode_main(
     }
     sg.barrier();
 
-    // diagnostic: P16 rows0-PSTRIDE-1 x cols0-15 + pm/pl for the (split 0, kv_head 0) block
-    if (o_dump && split == 0 && kv_head == 0) {
-        for (int i = lane; i < PSTRIDE*16; i += 16) {
-            ((float *) o_dump)[512 + i] = (float) P16[(i/16)*SPLIT + (i%16)];
-        }
-        if (lane < PSTRIDE) {
-            ((float *) o_dump)[768 + lane] = partial_m[lane];
-            ((float *) o_dump)[784 + lane] = partial_l[lane];
-        }
-        if (lane == 0) {
-            ((float *) o_dump)[799] = (float) ROWS; // compile-time loop bound of the softmax
-            ((float *) o_dump)[798] = (float) SPLIT;
-            ((float *) o_dump)[797] = (float) PSTRIDE;
-            ((float *) o_dump)[796] = (float) M;
-            ((float *) o_dump)[795] = (float) GQA;
-            ((float *) o_dump)[794] = (float) MQ;
-        }
-        sg.barrier();
-    }
-
-    // 4. PV: O = P @ V, per 16-dim chunk (skipped by the P1ONLY diagnostic)
-    if (!p1only) {
+    // 4. PV: O = P @ V, per 16-dim chunk
     mx::joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::row_major> B_v;
     mx::joint_matrix<sycl::sub_group, float, use::accumulator, M, 16> O_jm[NCHUNK];
     for (int dc = 0; dc < D/16; dc++) {
@@ -323,7 +363,7 @@ static void xmx_decode_main(
                         tile_buf[lane*16 + d] = (sycl::half)((float)qs[off+d] * s);
                     }
                 }
-            } else if (f16_lds == 0 && NCHUNK == 1) {
+            } else if (NCHUNK == 1) {
                 // f16 V tile: direct global B load for the single-chunk path
                 sg.barrier();
                 mx::joint_matrix_load(sg, B_v,
@@ -333,7 +373,7 @@ static void xmx_decode_main(
                 mx::joint_matrix_mad(sg, O_jm[0], A_jm, B_v, O_jm[0]);
                 continue;
             } else {
-                // f16 V staged through LDS (diagnostic path and NCHUNK==2 source)
+                // f16 V staged through LDS (NCHUNK==2 source)
                 const sycl::half * vrow = V + kv_real*v_head_stride + (pos_base + c*16 + lane)*v_pos_stride + dc*16;
                 #pragma unroll
                 for (int d = 0; d < 16; d++) {
@@ -354,81 +394,7 @@ static void xmx_decode_main(
                 mx::joint_matrix_mad(sg, O_jm[0], A_jm, B_v, O_jm[0]);
             }
         }
-        if constexpr (F16P) {
-            if (sf32p) {
-                // diagnostic: baseline f32 store from the F16P instantiation (isolates instantiation effects)
-                if constexpr (NCHUNK == 2) {
-                    #pragma unroll
-                    for (int qc = 0; qc < 2; qc++) {
-                        mx::joint_matrix_store(sg, O_jm[qc],
-                            xmp_g_f((float *) partial_O + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE
-                                                            + a_row(qc))*D + dc*16),
-                            D, layout::row_major);
-                    }
-                } else {
-                    mx::joint_matrix_store(sg, O_jm[0],
-                        xmp_g_f((float *) partial_O + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE
-                                                        + a_row(0))*D + dc*16),
-                        D, layout::row_major);
-                }
-                if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
-                    sg.barrier();
-                    ((float *) o_dump)[lane] = ((const float *) partial_O)[lane];
-                    ((float *) o_dump)[16 + lane] = 0.0f;
-                    int nn = 0;
-                    for (int cc = 0; cc < 16; cc++) if (!std::isfinite(((const float *) partial_O)[lane*D + cc])) nn++;
-                    ((float *) o_dump)[32 + lane] = (float) nn;
-                }
-            } else {
-                // f16 partials: coordinate apply writes f16 straight from the acc registers
-                // (separate instantiation; default f32 path is untouched).
-                if constexpr (NCHUNK == 2) {
-                    #pragma unroll
-                    for (int qc = 0; qc < 2; qc++) {
-                        mx::joint_matrix_store(sg, O_jm[qc], xmp_l_f(o_scratch), 32, layout::row_major);
-                        sg.barrier();
-                        sycl::half * od = (sycl::half *) partial_O + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE
-                                                                       + a_row(qc))*D + dc*16;
-                        #pragma unroll
-                        for (int r = 0; r < M; r++) {
-                            od[r*D + lane] = (sycl::half) o_scratch[r*32 + lane];
-                        }
-                        sg.barrier(); // o_scratch free for the next store
-                    }
-                    if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
-                        sg.barrier();
-                        const sycl::half * rd = (const sycl::half *) partial_O
-                                              + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE + a_row(0))*D;
-                        ((float *) o_dump)[lane] = (float) rd[lane];
-                        int nn = 0;
-                        for (int cc = 0; cc < 16; cc++) if (!std::isfinite((float) rd[lane * D + cc])) nn++;
-                        ((float *) o_dump)[32 + lane] = (float) nn;
-                    }
-                } else {
-                    // f16 partial: acc -> LDS f32 ([16][32] stride-32, 1KB-aligned) -> f16 global.
-                    // plain [16][16] row-major/col-major LDS stores corrupt rows / are not lowered
-                    // by 2026.1 (2026-09-25 arm dumps + link errors); acc->f16 store unexposed.
-                    mx::joint_matrix_store(sg, O_jm[0], xmp_l_f(o_scratch), 32, layout::row_major);
-                    sg.barrier();
-                    sycl::half * od = (sycl::half *) partial_O + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE
-                                                                   + a_row(0))*D + dc*16;
-                    #pragma unroll
-                    for (int r = 0; r < M; r++) {
-                        od[r*D + lane] = (sycl::half) o_scratch[r*32 + lane];
-                    }
-                    sg.barrier(); // o_scratch free for the next dc store
-                    if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
-                        sg.barrier();
-                        const sycl::half * rd = (const sycl::half *) partial_O
-                                              + (((size_t)split * n_wg_heads + kv_head) * PSTRIDE + a_row(0))*D;
-                        ((float *) o_dump)[lane] = (float) rd[lane];
-                        int nn = 0;
-                        for (int cc = 0; cc < 16; cc++) if (!std::isfinite((float) rd[lane * D + cc])) nn++;
-                        ((float *) o_dump)[32 + lane] = (float) nn;
-                    }
-                }
-            }
-        } else if constexpr (NCHUNK == 2) {
+        if constexpr (NCHUNK == 2) {
             #pragma unroll
             for (int qc = 0; qc < 2; qc++) {
                 mx::joint_matrix_store(sg, O_jm[qc],
@@ -442,148 +408,37 @@ static void xmx_decode_main(
                                                 + a_row(0))*D + dc*16),
                 D, layout::row_major);
         }
-        if (o_dump && split == 0 && kv_head == 0 && dc == 0) {
-            sg.barrier();
-            ((float *) o_dump)[lane] = ((const float *) partial_O)[lane];
-            ((float *) o_dump)[16 + lane] = 0.0f;
-            int nn = 0;
-            for (int cc = 0; cc < 16; cc++) if (!std::isfinite(((const float *) partial_O)[lane*D + cc])) nn++;
-            ((float *) o_dump)[32 + lane] = (float) nn;
-        }
     }
-    } // !p1only
 }
 
 // Combine the per-split partials (flash-decoding merge) into the final output.
 // out[q][q_head][dim] = sum_split e^{m_s-M} O_s[dim] / sum_split e^{m_s-M} l_s, M = max_s m_s.
 // Per-split storage is local: p_stride rows, row rr = q*rows_per_q + (h % gqa)
 // (dense GQA packing when the tile fits all rows, chunk-padded otherwise).
-static void xmx_decode_combine(
-        const void * __restrict__ partial_O, // f32 or f16 (f16p)
-        const float * __restrict__ partial_m,
-        const float * __restrict__ partial_l,
-        float * __restrict__ out,
-        const int n_q_heads, const int n_kv_heads, const int MQ, const int m_tile, const int n_hg,
-        const int D, const int n_splits, const int p_stride, const bool f16p,
-        const int out_head_stride, const int out_pos_stride, const sycl::nd_item<3> & it) {
-    const int q_head = it.get_group(0);
-    const int dim    = it.get_group(1)*16 + it.get_local_id(2);
-    if (dim >= D) {
-        return;
-    }
-    const int gqa   = n_q_heads / n_kv_heads;
-    const int gqa_a = (n_hg > 1) ? gqa / n_hg : gqa; // heads per WG block
-    const int rows_per_q = (m_tile >= gqa_a * MQ) ? gqa_a : m_tile;
-    const int q = q_head / n_q_heads;
-    const int h = q_head % n_q_heads;
-    // per-split layout: n_kv_heads*n_hg blocks of p_stride rows; this head's block is (kv, group)
-    const int kv  = h / gqa;
-    const int hg  = (h % gqa) / gqa_a;
-    const int rr  = q * rows_per_q + (h % gqa_a); // row within the WG block
-    const size_t blk = ((size_t) kv * n_hg + hg) * p_stride;
-    const float * m_s = partial_m + blk + rr;
-    const float * l_s = partial_l + blk + rr;
-    const float * O_s = (const float *) partial_O + (blk + rr) * D;
-    const sycl::half * O_sh = (const sycl::half *) partial_O + (blk + rr) * D;
-    const size_t sp = (size_t) n_kv_heads * n_hg * p_stride; // rows per split
-    float M = -FLT_MAX;
-    for (int s = 0; s < n_splits; s++) {
-        M = std::max(M, m_s[s * sp]);
-    }
-    float num = 0.0f, den = 0.0f;
-    for (int s = 0; s < n_splits; s++) {
-        const float w = exp2f((m_s[s * sp] - M) * 1.4426950408889634f);
-        den += w * l_s[s * sp];
-        num += w * (f16p ? (float) O_sh[s * sp * D + dim] : O_s[s * sp * D + dim]);
-    }
-    out[(size_t) q * (MQ > 1 ? out_pos_stride : 0) + (size_t) h * out_head_stride + dim] = num / den;
-}
 
-// Vectorized combine: each lane owns VEC contiguous dims and loads/stores them as one vector
-// per split - 4x the bytes in flight per instruction vs the scalar version (DRAM saturation at
-// long context, where the partials stream is read exactly once).
+// Vectorized two-phase phase-A: chunked split merge with VEC-wide O loads per thread.
+// Scalar 2a reaches only ~200 GB/s on the partials stream @143K; wide loads raise the
+// in-flight bytes per instruction on the same 128KB-strided per-split reads.
 template<int VEC>
-static void xmx_decode_combine_vec(
-        const void * __restrict__ partial_O, // f32 or f16 (f16p)
-        const float * __restrict__ partial_m,
-        const float * __restrict__ partial_l,
-        float * __restrict__ out,
-        const int n_q_heads, const int n_kv_heads, const int MQ, const int m_tile, const int n_hg,
-        const int D, const int n_splits, const int p_stride, const bool f16p,
-        const int out_head_stride, const int out_pos_stride, const sycl::nd_item<3> & it) {
-    const int q_head = it.get_group(0);
-    const int dim0   = it.get_group(1)*(16*VEC) + it.get_local_id(2)*VEC;
-    if (dim0 >= D) {
-        return;
-    }
-    const int gqa   = n_q_heads / n_kv_heads;
-    const int gqa_a = (n_hg > 1) ? gqa / n_hg : gqa; // heads per WG block
-    const int rows_per_q = (m_tile >= gqa_a * MQ) ? gqa_a : m_tile;
-    const int q = q_head / n_q_heads;
-    const int h = q_head % n_q_heads;
-    const int kv  = h / gqa;
-    const int hg  = (h % gqa) / gqa_a;
-    const int rr  = q * rows_per_q + (h % gqa_a);
-    const size_t blk = ((size_t) kv * n_hg + hg) * p_stride;
-    const float * m_s = partial_m + blk + rr;
-    const float * l_s = partial_l + blk + rr;
-    const float * O_s = (const float *) partial_O + (blk + rr) * D;
-    const sycl::half * O_sh = (const sycl::half *) partial_O + (blk + rr) * D;
-    const size_t sp = (size_t) n_kv_heads * n_hg * p_stride; // rows per split
-    float M = -FLT_MAX;
-    for (int s = 0; s < n_splits; s++) {
-        M = std::max(M, m_s[s * sp]);
-    }
-    sycl::vec<float, VEC> num_v = sycl::vec<float, VEC>(0.0f);
-    float den = 0.0f;
-    for (int s = 0; s < n_splits; s++) {
-        const float w = exp2f((m_s[s * sp] - M) * 1.4426950408889634f);
-        den += w * l_s[s * sp];
-        if (f16p) {
-            for (int v = 0; v < VEC; v++) {
-                num_v[v] += w * (float) O_sh[s * sp * D + dim0 + v];
-            }
-        } else {
-            const sycl::vec<float, VEC> o = *(const sycl::vec<float, VEC> *)(O_s + s * sp * D + dim0);
-            for (int v = 0; v < VEC; v++) {
-                num_v[v] += w * o[v];
-            }
-        }
-    }
-    float * out_p = out + (size_t) q * (MQ > 1 ? out_pos_stride : 0) + (size_t) h * out_head_stride + dim0;
-    for (int v = 0; v < VEC; v++) {
-        if (dim0 + v < D) {
-            out_p[v] = num_v[v] / den;
-        }
-    }
-}
-
-// Two-phase combine (two launches, no cross-kernel sync needed): phase A chunks the split
-// range into n_chunks independent merge streams, each computing a chunk-level m/l/O partial
-// (flash-decoding associativity: exp2(m_s-M) = exp2(m_s-m_c)*exp2(m_c-M)); phase B merges the
-// chunk partials. The single-phase loop is serial over all splits with few threads - at long
-// context it only reaches ~200 GB/s on the partials stream; chunking raises in-flight bytes
-// until the read saturates DRAM. Intermediates: [n_chunks][n_q_rows][D] f32 O + m,l.
-static void xmx_decode_combine2a(
-        const void * __restrict__ partial_O, // f32 or f16 (f16p)
+static void xmx_decode_combine2a_vec(
+        const void * __restrict__ partial_O, // f32 partials
         const float * __restrict__ partial_m,
         const float * __restrict__ partial_l,
         float * __restrict__ inter_O,      // [n_chunks][n_q_rows][D]
         float * __restrict__ inter_m,      // [n_chunks][n_q_rows]
         float * __restrict__ inter_l,      // [n_chunks][n_q_rows]
         const int n_q_heads, const int n_kv_heads, const int MQ, const int m_tile, const int n_hg,
-        const int D, const int n_splits, const int p_stride, const int n_chunks, const bool f16p,
+        const int D, const int n_splits, const int p_stride, const int n_chunks,
         const sycl::nd_item<3> & it) {
-    // grid: (n_q_rows * n_chunks, D/16, 16); row index spans all output rows (heads x MQ)
     const int n_rows = n_q_heads * MQ;
     const int q_head = it.get_group(0) % n_rows;
     const int chunk  = it.get_group(0) / n_rows;
-    const int dim    = it.get_group(1)*16 + it.get_local_id(2);
-    if (dim >= D) {
+    const int dim0   = it.get_group(1)*(16*VEC) + it.get_local_id(2)*VEC;
+    if (dim0 >= D) {
         return;
     }
     const int gqa   = n_q_heads / n_kv_heads;
-    const int gqa_a = (n_hg > 1) ? gqa / n_hg : gqa; // heads per WG block
+    const int gqa_a = (n_hg > 1) ? gqa / n_hg : gqa;
     const int rows_per_q = (m_tile >= gqa_a * MQ) ? gqa_a : m_tile;
     const int h  = q_head % n_q_heads;
     const int kv = h / gqa;
@@ -593,8 +448,7 @@ static void xmx_decode_combine2a(
     const float * m_s = partial_m + blk + rr;
     const float * l_s = partial_l + blk + rr;
     const float * O_s = (const float *) partial_O + (blk + rr) * D;
-    const sycl::half * O_sh = (const sycl::half *) partial_O + (blk + rr) * D;
-    const size_t sp = (size_t) n_kv_heads * n_hg * p_stride; // rows per split
+    const size_t sp = (size_t) n_kv_heads * n_hg * p_stride;
     const int csz = (n_splits + n_chunks - 1) / n_chunks;
     const int s0 = chunk * csz;
     const int s1 = std::min(s0 + csz, n_splits);
@@ -602,17 +456,24 @@ static void xmx_decode_combine2a(
     for (int s = s0; s < s1; s++) {
         Mc = std::max(Mc, m_s[s * sp]);
     }
-    float num = 0.0f, den = 0.0f;
+    sycl::vec<float, VEC> num_v = sycl::vec<float, VEC>(0.0f);
+    float den = 0.0f;
     for (int s = s0; s < s1; s++) {
         const float w = exp2f((m_s[s * sp] - Mc) * 1.4426950408889634f);
         den += w * l_s[s * sp];
-        num += w * (f16p ? (float) O_sh[s * sp * D + dim] : O_s[s * sp * D + dim]);
+        const sycl::vec<float, VEC> o = *(const sycl::vec<float, VEC> *)(O_s + s * sp * D + dim0);
+        for (int v = 0; v < VEC; v++) {
+            num_v[v] += w * o[v];
+        }
     }
-    // inter layout is [chunk][row] with n_rows = n_q_heads*MQ rows per chunk; using
-    // n_q_heads here (only correct at MQ=1) makes every chunk clobber the others
     inter_m[chunk*n_rows + q_head] = Mc;
     inter_l[chunk*n_rows + q_head] = den;
-    inter_O[((size_t) chunk*n_rows + q_head)*D + dim] = num;
+    float * io = inter_O + ((size_t) chunk*n_rows + q_head)*D + dim0;
+    for (int v = 0; v < VEC; v++) {
+        if (dim0 + v < D) {
+            io[v] = num_v[v];
+        }
+    }
 }
 
 static void xmx_decode_combine2b(
@@ -805,7 +666,6 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
     const int out_head_stride = (int) (dst->nb[1] / sizeof(float));
     const int out_pos_stride  = (int) (dst->nb[2] / sizeof(float));
 
-    static int xmx_dbg = ggml_sycl_get_env("GGML_SYCL_XMX_DECODE_DEBUG", 0);
     // head-group split for deep verify (MQ 3..5, gqa % 3 == 0): one M=16 tile per 3-head group
     const int n_hg_l = (MQ >= 3 && xmx_decode_verify3() == 1) ? gqa / 3 : 1;
     static bool v3_printed = false;
@@ -814,20 +674,20 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
         fprintf(stderr, "[XMQ-V3] deep verify: MQ=%d gqa=%d n_hg=%d M=16 NCHUNK=1 SPLIT=%d n_kv=%d n_kv_heads=%d q8_soa=%d\n",
                 MQ, gqa, n_hg_l, SPLIT, n_kv, n_kv_heads, (int) q8_soa);
     }
-    // Diagnostic: force f16 K/V tiles through LDS staging (1 = with barrier, 2 = no barrier)
-    const int xmx_f16_lds = ggml_sycl_get_env("GGML_SYCL_XMX_FA_LDS_F16", 0);
-    static bool xmx_dbg_printed = false;
-    if (xmx_dbg && !xmx_dbg_printed) {
-        xmx_dbg_printed = true;
-        fprintf(stderr, "[XMX-DECODE] n_kv=%d n_kv_heads=%d n_q_heads=%d gqa=%d D=%d mask=%s "
-                "mask_ne=%dx%d mask_nb=%lld/%lld stride_mask=%d MQ=%d SPLIT=%d v2=%d\n",
-                n_kv, n_kv_heads, n_q_heads, gqa, D, mask ? "yes" : "no",
-                mask ? (int) mask->ne[0] : 0, mask ? (int) mask->ne[1] : 0,
-                mask ? (long long) mask->nb[0] : 0, mask ? (long long) mask->nb[1] : 0,
-                mask_head_stride, MQ, SPLIT, xmx_decode_verify2());
-    }
 
     const sycl::range<3> wg_local(1, 1, 16);
+
+    // INT8 FA kernel (GGML_SYCL_INT8_FA_KERNEL, default off): dual-plane row-scale QK -
+    // Q = s*(qhi + qlo/16) (~15-bit effective Q), K bit-exact to the SoA cache.
+    // Gated on a q8 SoA KV cache (falls back to the f16 QK path otherwise).
+    static int xmx_i8fa = ggml_sycl_get_env("GGML_SYCL_INT8_FA_KERNEL", 0);
+    const bool i8p = xmx_i8fa != 0 && q8_soa;
+    static bool i8_warned = false;
+    if (xmx_i8fa != 0 && !i8_warned) {
+        i8_warned = true;
+        fprintf(stderr, "[XMQ-I8] int8 FA kernel %s (dual-plane row-scale Q, K bit-exact)\n",
+                q8_soa ? "ON" : "OFF (needs q8 SoA KV)");
+    }
 
     // QG=1 A-matrix scratch for the GQA head-group verify path: Q pre-converted to f16 in the
     // per-WG block layout ([n_wg_heads][PSTRIDE][D]) so the main kernel loads A from global and
@@ -861,76 +721,109 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
         SYCL_CHECK(0);
     }
 
-    // Optional per-kernel wall timing (serializes the stream; debug only): [XMQ-T] lines on stderr
-    static int xmx_t = ggml_sycl_get_env("GGML_SYCL_XMX_TIMING", 0);
-    // Diagnostic: skip the PV section of the main kernel (QK+softmax-only wall, two-phase-P probe).
-    // Output is INVALID while on - timing only.
-    static int xmx_p1 = ggml_sycl_get_env("GGML_SYCL_XMX_P1ONLY", 0);
-    const bool p1only = xmx_p1 != 0;
-    static bool p1_warned = false;
-    if (p1only && !p1_warned) {
-        p1_warned = true;
-        fprintf(stderr, "[XMQ-P1] P1ONLY diagnostic ON: FA output INVALID, main-kernel timing only\n");
-    }
-    // f16 O partials (precision probe, default off): halves the partial_O store+combine
-    // traffic; output differs from the f32 path by ~5e-4 rel rounding on the split partials.
-    static int xmx_pf16 = ggml_sycl_get_env("GGML_SYCL_XMQ_PART_F16", 0);
-    const bool f16p = xmx_pf16 != 0;
-    // F16P diagnostic: keep the F16P instantiation (+1KB LDS) but baseline f32 store/read.
-    static int xmx_sf32 = ggml_sycl_get_env("GGML_SYCL_XMQ_F16P_STOREF32", 0);
-    const bool sf32p = xmx_sf32 != 0 && f16p;
-    static bool pf16_warned = false;
-    if ((f16p || sf32p) && !pf16_warned) {
-        pf16_warned = true;
-        fprintf(stderr, "[XMQ-PF16] %s\n", sf32p ? "F16P instantiation + f32 store diagnostic"
-                                                : "f16 O partials ON: FA output differs from f32 by ~5e-4 rel");
-    }
-    // Diagnostic: dump the first partial_O tile (row 0, dc=0) to verify the f16 conversion path.
-    // The kernel writes a device buffer; it is copied to host after the main kernel.
-    static int xmx_fd = ggml_sycl_get_env("GGML_SYCL_XMQ_F16P_DUMP", 0);
-    float * o_dump_h = nullptr;
-    void * o_dump_p = nullptr;
-    std::optional<ggml_sycl_pool_alloc<float>> odump;
-    if (xmx_fd) {
-        odump.emplace(pool);
-        odump->alloc(800);
-        o_dump_p = odump->ptr;
-        // (source-Q norm check removed 2026-09-25: crashed the server at startup on the
-        //  box; the A-scratch dump below already shows the pos-4 Q rows directly)
+    // I8P: int8 Q-code scratch per (virtual) kv head: [b][tile r/8][blk][row r%8][32] int8
+    // + per (row, blk) f32 scale. Row->(q, qh) mapping mirrors the XMX_DECODE_DISPATCH shape.
+    ggml_sycl_pool_alloc<int8_t> i8a_scratch(pool);
+    ggml_sycl_pool_alloc<float> sQ_scratch(pool);
+    int8_t * A8_p = nullptr;
+    float * sQ_p = nullptr;
+    if (i8p) {
+        const int i8_M   = (MQ >= 3 && xmx_decode_verify3() == 1) ? 16
+                     : (MQ == 1) ? gqa
+                     : (xmx_decode_verify2() == 1 ? 8 : 16);
+        const int i8_GQA = (MQ >= 3 && xmx_decode_verify3() == 1) ? 3 : gqa;
+        const int i8_NCH = (i8_M >= i8_GQA * MQ) ? 1 : 2;
+        const size_t n_b = (size_t) n_kv_heads * n_hg_l;
+        i8a_scratch.alloc(n_b * 2*8*8*32 * 2); // two planes: hi + lo
+        sQ_scratch.alloc(n_b * 16*8);
+        A8_p = i8a_scratch.ptr;
+        sQ_p = sQ_scratch.ptr;
+
+            // Dual-plane row-scale Q: q = s*(qhi + qlo/16), one s per row. qhi = nearint(q/s)
+            // (|.| <= 127), qlo = nearint(16*(q - s*qhi)/s) (|.| <= 8, no overflow). Two int8
+            // planes: A8_p[b][plane][tile][blk][row][32]; sQ_p[b*16 + r] = s.
+            stream->parallel_for(sycl::range<1>(n_b * 16),
+                [=](sycl::item<1> it2) {
+                    const int i = (int) it2.get_linear_id();
+                    const int r = i % 16, b = i / 16;
+                    const int kv2 = b / n_hg_l, hg2 = b % n_hg_l;
+                    const int qh_base = kv2*gqa + hg2*i8_GQA;
+                    const int q  = (i8_NCH == 2) ? r / i8_M : r / i8_GQA;
+                    const int qi = (i8_NCH == 2) ? r % i8_M : r % i8_GQA;
+                    const bool live = (i8_NCH == 2) ? (qi < i8_GQA) : (r < i8_GQA*MQ);
+                    const float * qv = Q_h + q*q_pos_stride + (qh_base + qi)*q_head_stride;
+                    float s = 0.0f;
+                    if (live) {
+                        #pragma unroll
+                        for (int k = 0; k < D; k++) s = std::max(s, std::fabsf(qv[k]));
+                        s /= 127.0f;
+                        if (s == 0.0f) s = 1.0f;
+                    }
+                    int8_t * base_h = A8_p + (size_t)b*8192 + (r >> 3)*2048;
+                    int8_t * base_l = base_h + 4096;
+                    #pragma unroll
+                    for (int blk = 0; blk < 8; blk++) {
+                        sycl::vec<int8_t, 16> v0, v1, w0, w1;
+                        if (live) {
+                            #pragma unroll
+                            for (int k = 0; k < 16; k++) {
+                                const float q0 = qv[blk*32 + k], q1 = qv[blk*32 + 16 + k];
+                                const int hi0 = (int) std::nearbyint(q0 / s);
+                                const int hi1 = (int) std::nearbyint(q1 / s);
+                                v0[k] = (int8_t) hi0;
+                                v1[k] = (int8_t) hi1;
+                                w0[k] = (int8_t) std::nearbyint((q0 - s*(float)hi0) / s * 16.0f);
+                                w1[k] = (int8_t) std::nearbyint((q1 - s*(float)hi1) / s * 16.0f);
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int k = 0; k < 16; k++) { v0[k] = w0[k] = 0; v1[k] = w1[k] = 0; }
+                        }
+                        int8_t * dh = base_h + blk*256 + (r & 7)*32;
+                        int8_t * dl = base_l + blk*256 + (r & 7)*32;
+                        *(sycl::vec<int8_t, 16> *)dh = v0;
+                        *(sycl::vec<int8_t, 16> *)(dh + 16) = v1;
+                        *(sycl::vec<int8_t, 16> *)dl = w0;
+                        *(sycl::vec<int8_t, 16> *)(dl + 16) = w1;
+                    }
+                    sQ_p[(size_t)b*16 + r] = s;
+                });
+        SYCL_CHECK(0);
     }
 
-    // Combine kernel variant: default 4 = two-phase chunked merge (faster at long context:
-    // combine 1.50->1.22ms/node @152K MQ=5, 0.55->0.17 @MQ=1, output-equivalent f32 reassociation;
-    // wall A/B parity-to-better vs scalar 63.2 vs 64.4 avg). Env: 0 = scalar single-phase, 2 = vec4.
-    static int xmx_c = ggml_sycl_get_env("GGML_SYCL_XMQ_COMBINE", 4);
+    // Combine: two-phase chunked merge, vec4 phase A. Single-phase is serial over all splits
+    // with few threads (~200 GB/s on the partials stream at long context); chunking lifts
+    // in-flight bytes and vec4 doubles the streaming rate (~420 GB/s: combine 1.45->0.69ms,
+    // FA node -19%, wall -8.4% @143K MQ=5, 2026-10-07; vec8 measured equal). Same f32
+    // reassociation as a scalar merge; below 16 splits it degenerates to a single chunk.
 
     // M = XMX tile rows; NCHUNK = A-chunks per position chunk (2 when M < GQA*MQ)
-    #define XMX_DECODE_DISPATCH(F16V, SPL) \
+    #define XMX_DECODE_DISPATCH(I8V, SPL) \
         if (MQ >= 3 && xmx_decode_verify3() == 1) { \
             switch (MQ) { \
-                case 3: XMX_DECODE_LAUNCH(F16V, 16, 3, 3, SPL); break; \
-                case 4: XMX_DECODE_LAUNCH(F16V, 16, 3, 4, SPL); break; \
-                case 5: XMX_DECODE_LAUNCH(F16V, 16, 3, 5, SPL); break; \
+                case 3: XMX_DECODE_LAUNCH(I8V, 16, 3, 3, SPL); break; \
+                case 4: XMX_DECODE_LAUNCH(I8V, 16, 3, 4, SPL); break; \
+                case 5: XMX_DECODE_LAUNCH(I8V, 16, 3, 5, SPL); break; \
             } \
         } else if (MQ == 1) { \
             switch (gqa) { \
-                case 1: XMX_DECODE_LAUNCH(F16V, 1, 1, 1, SPL); break; \
-                case 2: XMX_DECODE_LAUNCH(F16V, 2, 2, 1, SPL); break; \
-                case 3: XMX_DECODE_LAUNCH(F16V, 3, 3, 1, SPL); break; \
-                case 4: XMX_DECODE_LAUNCH(F16V, 4, 4, 1, SPL); break; \
-                case 5: XMX_DECODE_LAUNCH(F16V, 5, 5, 1, SPL); break; \
-                case 6: XMX_DECODE_LAUNCH(F16V, 6, 6, 1, SPL); break; \
-                case 7: XMX_DECODE_LAUNCH(F16V, 7, 7, 1, SPL); break; \
-                case 8: XMX_DECODE_LAUNCH(F16V, 8, 8, 1, SPL); break; \
+                case 1: XMX_DECODE_LAUNCH(I8V, 1, 1, 1, SPL); break; \
+                case 2: XMX_DECODE_LAUNCH(I8V, 2, 2, 1, SPL); break; \
+                case 3: XMX_DECODE_LAUNCH(I8V, 3, 3, 1, SPL); break; \
+                case 4: XMX_DECODE_LAUNCH(I8V, 4, 4, 1, SPL); break; \
+                case 5: XMX_DECODE_LAUNCH(I8V, 5, 5, 1, SPL); break; \
+                case 6: XMX_DECODE_LAUNCH(I8V, 6, 6, 1, SPL); break; \
+                case 7: XMX_DECODE_LAUNCH(I8V, 7, 7, 1, SPL); break; \
+                case 8: XMX_DECODE_LAUNCH(I8V, 8, 8, 1, SPL); break; \
                 default: GGML_ABORT("xmx decode: unsupported gqa %d", gqa); \
             } \
         } else { \
             switch (gqa) { \
-                case 4: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(F16V, 8, 4, 2, SPL); } else { XMX_DECODE_LAUNCH(F16V, 16, 4, 2, SPL); } break; \
-                case 5: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(F16V, 8, 5, 2, SPL); } else { XMX_DECODE_LAUNCH(F16V, 16, 5, 2, SPL); } break; \
-                case 6: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(F16V, 8, 6, 2, SPL); } else { XMX_DECODE_LAUNCH(F16V, 16, 6, 2, SPL); } break; \
-                case 7: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(F16V, 8, 7, 2, SPL); } else { XMX_DECODE_LAUNCH(F16V, 16, 7, 2, SPL); } break; \
-                case 8: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(F16V, 8, 8, 2, SPL); } else { XMX_DECODE_LAUNCH(F16V, 16, 8, 2, SPL); } break; \
+                case 4: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(I8V, 8, 4, 2, SPL); } else { XMX_DECODE_LAUNCH(I8V, 16, 4, 2, SPL); } break; \
+                case 5: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(I8V, 8, 5, 2, SPL); } else { XMX_DECODE_LAUNCH(I8V, 16, 5, 2, SPL); } break; \
+                case 6: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(I8V, 8, 6, 2, SPL); } else { XMX_DECODE_LAUNCH(I8V, 16, 6, 2, SPL); } break; \
+                case 7: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(I8V, 8, 7, 2, SPL); } else { XMX_DECODE_LAUNCH(I8V, 16, 7, 2, SPL); } break; \
+                case 8: if (xmx_decode_verify2() == 1) { XMX_DECODE_LAUNCH(I8V, 8, 8, 2, SPL); } else { XMX_DECODE_LAUNCH(I8V, 16, 8, 2, SPL); } break; \
                 default: GGML_ABORT("xmx decode verify: unsupported gqa %d", gqa); \
             } \
         }
@@ -942,123 +835,52 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
             /* each split holds one p_stride_l-row block per (virtual) kv head */ \
             const size_t rows_l = (size_t) n_splits_l * n_kv_heads * n_hg_l * p_stride_l; \
             std::optional<ggml_sycl_pool_alloc<float>> pOf; \
-            std::optional<ggml_sycl_pool_alloc<sycl::half>> pOh; \
             ggml_sycl_pool_alloc<float> pm(pool); \
             ggml_sycl_pool_alloc<float> pl(pool); \
-            void * pO_pv = nullptr; \
-            if (f16p && !sf32p) { pOh.emplace(pool); pOh->alloc(rows_l * D); pO_pv = pOh->ptr; } \
-            else { pOf.emplace(pool); pOf->alloc(rows_l * D); pO_pv = pOf->ptr; } \
+            pOf.emplace(pool); pOf->alloc(rows_l * D); void * pO_pv = pOf->ptr; \
             pm.alloc(rows_l); \
             pl.alloc(rows_l); \
             const sycl::range<3> wg_global_l(n_splits_l, n_kv_heads * n_hg_l, 16); \
             float * pm_p = pm.ptr; float * pl_p = pl.ptr; \
-            int64_t t_main0 = 0, t_main1 = 0, t_comb1 = 0; \
-            if (xmx_t) { stream->wait(); t_main0 = ggml_time_us(); } \
-            if (f16p) { XMX_DECODE_DISPATCH(1, SPL); } else { XMX_DECODE_DISPATCH(0, SPL); } \
-            if (o_dump_p) { \
-                stream->wait(); \
-                if (f16p && !sf32p) { \
-                    sycl::half * hfb = (sycl::half *) sycl::malloc_host(16*D*sizeof(sycl::half), *stream); \
-                    stream->memcpy(hfb, (sycl::half *) pO_pv, 16*D*sizeof(sycl::half)); \
-                    stream->wait(); \
-                    fprintf(stderr, "[XMQ-HOST] f16 rows0-15 x dims0-15:\n"); \
-                    for (int r = 0; r < 16; r++) { \
-                        fprintf(stderr, "  r%d: ", r); \
-                        for (int i = 0; i < 16; i++) fprintf(stderr, "%.5g ", (float) hfb[r*D+i]); \
-                        fprintf(stderr, "\n"); \
-                    } \
-                    sycl::free(hfb, *stream); \
-                } else { \
-                    float * hff = (float *) sycl::malloc_host(16*D*sizeof(float), *stream); \
-                    stream->memcpy(hff, (float *) pO_pv, 16*D*sizeof(float)); \
-                    stream->wait(); \
-                    fprintf(stderr, "[XMQ-HOST] f32 rows0-15 x dims0-15:\n"); \
-                    for (int r = 0; r < 16; r++) { \
-                        fprintf(stderr, "  r%d: ", r); \
-                        for (int i = 0; i < 16; i++) fprintf(stderr, "%.5g ", hff[r*D+i]); \
-                        fprintf(stderr, "\n"); \
-                    } \
-                    sycl::free(hff, *stream); \
-                } \
-                if (Q16g_p) { \
-                    sycl::half * hqa = (sycl::half *) sycl::malloc_host(16*D*sizeof(sycl::half), *stream); \
-                    stream->memcpy(hqa, (const sycl::half *) Q16g_p, 16*D*sizeof(sycl::half)); \
-                    stream->wait(); \
-                    fprintf(stderr, "[XMQ-HOST] A-scratch rows0-15 x dims0-15:\n"); \
-                    for (int r = 0; r < 16; r++) { \
-                        fprintf(stderr, "  a%d: ", r); \
-                        for (int i = 0; i < 16; i++) fprintf(stderr, "%.5g ", (float) hqa[r*D+i]); \
-                        fprintf(stderr, "\n"); \
-                    } \
-                    sycl::free(hqa, *stream); \
-                } \
-            } \
-            if (xmx_t) { stream->wait(); t_main1 = ggml_time_us(); } \
+            if (i8p) { XMX_DECODE_DISPATCH(10, SPL); } \
+            else { XMX_DECODE_DISPATCH(0, SPL); } \
             { \
                 const sycl::range<3> c_local(1, 1, 16); \
                 /* storage tile rows: matches the XMX_DECODE_LAUNCH(MM, ...) dispatch above */ \
                 const int m_tile_l = (MQ == 1) ? gqa : ((MQ >= 3 && xmx_decode_verify3() == 1) ? 16 : (xmx_decode_verify2() == 1 ? 8 : 16)); \
-                if ((xmx_c & 4) && n_splits_l >= 64) { \
-                    /* two-phase: chunk the split range into independent merge streams */ \
-                    const int n_chunks_l = std::min(64, (n_splits_l + 15) / 16); \
-                    ggml_sycl_pool_alloc<float> iO(pool); \
-                    ggml_sycl_pool_alloc<float> iml(pool); \
-                    iO.alloc((size_t) n_chunks_l * n_q_rows * D); \
-                    iml.alloc((size_t) n_chunks_l * n_q_rows * 2); \
-                    float * iO_p = iO.ptr; float * iml_p = iml.ptr; \
-                    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(n_q_rows * n_chunks_l, (D + 15) / 16, 16), c_local), \
-                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
-                            xmx_decode_combine2a(pO_pv, pm_p, pl_p, iO_p, iml_p, iml_p + (size_t) n_chunks_l * n_q_rows, \
-                                                 n_q_heads, n_kv_heads, MQ, m_tile_l, n_hg_l, \
-                                                 D, n_splits_l, p_stride_l, n_chunks_l, f16p && !sf32p, it); \
-                        }); \
-                    SYCL_CHECK(0); \
-                    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(n_q_rows, (D + 15) / 16, 16), c_local), \
-                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
-                            xmx_decode_combine2b(iO_p, iml_p, iml_p + (size_t) n_chunks_l * n_q_rows, out_f, \
-                                                 n_q_heads, MQ, D, n_chunks_l, out_head_stride, out_pos_stride, it); \
-                        }); \
-                    SYCL_CHECK(0); \
-                } else if (xmx_c & 2) { \
-                    const sycl::range<3> c_global_v(n_q_rows, D / (16*4), 16); \
-                    stream->parallel_for(sycl::nd_range<3>(c_global_v, c_local), \
-                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
-                            xmx_decode_combine_vec<4>(pO_pv, pm_p, pl_p, out_f, n_q_heads, n_kv_heads, MQ, m_tile_l, n_hg_l, \
-                                                      D, n_splits_l, p_stride_l, f16p && !sf32p, \
-                                                      out_head_stride, out_pos_stride, it); \
-                        }); \
-                    SYCL_CHECK(0); \
-                } else { \
-                    const sycl::range<3> c_global(n_q_rows, (D + 15) / 16, 16); \
-                    stream->parallel_for(sycl::nd_range<3>(c_global, c_local), \
-                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
-                            xmx_decode_combine(pO_pv, pm_p, pl_p, out_f, n_q_heads, n_kv_heads, MQ, m_tile_l, n_hg_l, \
-                                               D, n_splits_l, p_stride_l, f16p && !sf32p, \
-                                               out_head_stride, out_pos_stride, it); \
-                        }); \
-                    SYCL_CHECK(0); \
-                } \
-                if (xmx_t) { stream->wait(); t_comb1 = ggml_time_us(); } \
-            } \
-            if (o_dump_p) { \
-                o_dump_h = (float *) sycl::malloc_host(800 * sizeof(float), *stream); \
-                stream->memcpy(o_dump_h, o_dump_p, 800 * sizeof(float)); \
-            } \
-            if (xmx_t) { \
-                fprintf(stderr, "[XMQ-T] MQ=%d gqa=%d n_hg=%d SPLIT=%d n_kv=%d n_splits=%d main=%.2fms combine=%.2fms partials_KB=%zu\n", \
-                        MQ, gqa, n_hg_l, SPL, n_kv, n_splits_l, \
-                        (t_main1 - t_main0) / 1000.0, (t_comb1 - t_main1) / 1000.0, (size_t) rows_l * D * ((f16p && !sf32p) ? 2 : 4) / 1024); \
+                /* two-phase: chunk the split range into independent merge streams */ \
+                const int n_chunks_l = std::min(64, (n_splits_l + 15) / 16); \
+                const int c_dimgrp_l = D / (16*4); \
+                ggml_sycl_pool_alloc<float> iO(pool); \
+                ggml_sycl_pool_alloc<float> iml(pool); \
+                iO.alloc((size_t) n_chunks_l * n_q_rows * D); \
+                iml.alloc((size_t) n_chunks_l * n_q_rows * 2); \
+                float * iO_p = iO.ptr; float * iml_p = iml.ptr; \
+                stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(n_q_rows * n_chunks_l, c_dimgrp_l, 16), c_local), \
+                    [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
+                        xmx_decode_combine2a_vec<4>(pO_pv, pm_p, pl_p, iO_p, iml_p, iml_p + (size_t) n_chunks_l * n_q_rows, \
+                                                  n_q_heads, n_kv_heads, MQ, m_tile_l, n_hg_l, \
+                                                  D, n_splits_l, p_stride_l, n_chunks_l, it); \
+                    }); \
+                SYCL_CHECK(0); \
+                stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(n_q_rows, (D + 15) / 16, 16), c_local), \
+                    [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
+                        xmx_decode_combine2b(iO_p, iml_p, iml_p + (size_t) n_chunks_l * n_q_rows, out_f, \
+                                             n_q_heads, MQ, D, n_chunks_l, out_head_stride, out_pos_stride, it); \
+                    }); \
+                SYCL_CHECK(0); \
             } \
         }
 
-    #define XMX_DECODE_LAUNCH(F16V, MM, GQACT, MQCT, SPLITCT) \
+    #define XMX_DECODE_LAUNCH(I8V, MM, GQACT, MQCT, SPLITCT) \
         stream->parallel_for(sycl::nd_range<3>(wg_global_l, wg_local), \
             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] { \
-                xmx_decode_main<MM, GQACT, SPLITCT, MQCT, (MM >= GQACT*MQCT) ? 1 : 2, (MQCT >= 3) ? 1 : 0, F16V>(Q_h, Q16g_p, K_h, V_h, K_q8_p, V_q8_p, m_h, pO_pv, pm_p, pl_p, \
+                xmx_decode_main<MM, GQACT, SPLITCT, MQCT, (MM >= GQACT*MQCT) ? 1 : 2, \
+                                ((MQCT >= 3) || (I8V != 0)) ? 1 : 0, I8V>(Q_h, Q16g_p, K_h, V_h, K_q8_p, V_q8_p, m_h, pO_pv, pm_p, pl_p, \
                     n_kv, n_kv_heads, n_q_heads, n_splits_l, q_pos_stride, q_head_stride, k_pos_stride, \
                     k_head_stride, v_pos_stride, v_head_stride, mask_head_stride, mask_ne1, \
                     k_pos_stride_b, k_head_stride_b, v_pos_stride_b, v_head_stride_b, \
-                    scale, q8_input, xmx_f16_lds, q8_soa, ne_row_b, gqa, n_hg_l, p1only, sf32p, o_dump_p, it); \
+                    scale, q8_input, q8_soa, ne_row_b, gqa, n_hg_l, A8_p, sQ_p, it); \
             }); \
         SYCL_CHECK(0)
 
@@ -1069,26 +891,6 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
         XMX_DECODE_RUN(64)
     } else {
         XMX_DECODE_RUN(XMX_DECODE_SPLIT)
-    }
-        if (o_dump_h) {
-        stream->wait();
-        fprintf(stderr, "[XMQ-DUMP] row0: ");
-        for (int i = 0; i < 16; i++) fprintf(stderr, "%.4f ", o_dump_h[i]);
-        fprintf(stderr, "| f16rb: ");
-        for (int i = 16; i < 32; i++) fprintf(stderr, "%.4f ", o_dump_h[i]);
-        fprintf(stderr, "| nan-per-row:");
-        for (int i = 32; i < 48; i++) fprintf(stderr, "%d", (int) o_dump_h[i]);
-        fprintf(stderr, "\n");
-        for (int r = 0; r < 16; r++) {
-            if (r >= (int) o_dump_h[797]) continue; // PSTRIDE
-            fprintf(stderr, "[XMQ-DUMP] P16 r%2d: ", r);
-            for (int p = 0; p < 16; p++) fprintf(stderr, "%.4g ", o_dump_h[512 + r*16 + p]);
-            fprintf(stderr, "| m=%.4g l=%.4g\n", o_dump_h[768 + r], o_dump_h[784 + r]);
-        }
-        fprintf(stderr, "[XMQ-DUMP] inst M=%d GQA=%d SPLIT=%d PSTRIDE=%d MQ=%d ROWS=%d\n",
-                (int) o_dump_h[796], (int) o_dump_h[795], (int) o_dump_h[798], (int) o_dump_h[797],
-                (int) o_dump_h[794], (int) o_dump_h[799]);
-        sycl::free(o_dump_h, *stream);
     }
 
 #undef XMX_DECODE_DISPATCH
