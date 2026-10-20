@@ -677,16 +677,18 @@ void ggml_sycl_flash_attn_ext_xmx_decode(ggml_backend_sycl_context & ctx, ggml_t
 
     const sycl::range<3> wg_local(1, 1, 16);
 
-    // INT8 FA kernel (GGML_SYCL_INT8_FA_KERNEL, default off): dual-plane row-scale QK -
+    // INT8 FA kernel (GGML_SYCL_INT8_FA_KERNEL, default on): dual-plane row-scale QK -
     // Q = s*(qhi + qlo/16) (~15-bit effective Q), K bit-exact to the SoA cache.
-    // Gated on a q8 SoA KV cache (falls back to the f16 QK path otherwise).
-    static int xmx_i8fa = ggml_sycl_get_env("GGML_SYCL_INT8_FA_KERNEL", 0);
+    // Gated on a q8 SoA KV cache (falls back to the f16 QK path otherwise);
+    // =0 forces the f16 QK path.
+    static int xmx_i8fa = ggml_sycl_get_env("GGML_SYCL_INT8_FA_KERNEL", 1);
     const bool i8p = xmx_i8fa != 0 && q8_soa;
     static bool i8_warned = false;
     if (xmx_i8fa != 0 && !i8_warned) {
         i8_warned = true;
-        fprintf(stderr, "[XMQ-I8] int8 FA kernel %s (dual-plane row-scale Q, K bit-exact)\n",
-                q8_soa ? "ON" : "OFF (needs q8 SoA KV)");
+        fprintf(stderr, "[XMQ-I8] int8 FA kernel %s\n",
+                q8_soa ? "ON (dual-plane row-scale Q, K bit-exact)"
+                       : "OFF (KV not q8 SoA, using f16 QK)");
     }
 
     // QG=1 A-matrix scratch for the GQA head-group verify path: Q pre-converted to f16 in the
