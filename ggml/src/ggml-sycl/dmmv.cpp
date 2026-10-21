@@ -1998,7 +1998,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd_row1(
     const auto   ps = traits::make_ptrs(policy.w_a(), nb);
 
     const int tid = it.get_local_id(0);
-    const int row = policy.row_a(it.get_group(0)); // one output row per work-group
+    const int row = it.get_group(0); // one output row per work-group (not policy.row_a: that maps pairs)
 
     simd<float, 32> acc = 0.0f;
     simd<float, 32> acc_b = 0.0f; // has_b=false keeps this at 0
