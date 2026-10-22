@@ -1471,6 +1471,54 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     }
 }
 
+void llama_grammar_apply_mask_impl(const struct llama_grammar & grammar, float * mask, int n) {
+    GGML_ASSERT(grammar.vocab != nullptr);
+
+    // start with all tokens allowed
+    for (int i = 0; i < n; ++i) {
+        mask[i] = 1.0f;
+    }
+
+    if (grammar.awaiting_trigger) {
+        return;
+    }
+
+    bool allow_eog = false;
+    for (const auto & stack : grammar.stacks) {
+        if (stack.empty()) {
+            allow_eog = true;
+            break;
+        }
+    }
+
+    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
+    candidates_decoded.reserve(n);
+
+    llama_grammar_candidates candidates_grammar;
+    candidates_grammar.reserve(n);
+
+    for (int i = 0; i < n; ++i) {
+        const llama_token id      = i;
+        const std::string & piece = grammar.vocab->token_to_piece(id);
+
+        if (grammar.vocab->is_eog(id)) {
+            if (!allow_eog) {
+                mask[i] = 0.0f;
+            }
+        } else if (piece.empty() || piece[0] == 0) {
+            mask[i] = 0.0f;
+        } else {
+            candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
+            candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
+        }
+    }
+
+    const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
+    for (const auto & reject : rejects) {
+        mask[reject.index] = 0.0f;
+    }
+}
+
 void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token) {
     GGML_ASSERT(grammar.vocab != nullptr);
 
