@@ -28,6 +28,12 @@ struct llama_sampler_chain {
     // pre-allocated buffer for llama_sampler_sample to avoid repeated allocations
     std::vector<llama_token_data> cur;
 
+    // per-step token constraint (e.g. grammar / reasoning budget) applied to the logits
+    // before backend sampling: the mask is a vocab-sized 0/1 F32 input, and the graph does
+    // logits += log(mask) (log(1)=0 keep, log(0)=-INF discard)
+    struct ggml_tensor * constraint_mask = nullptr;   // GPU input tensor, created in backend_apply
+    std::vector<float>   constraint_mask_buf = {};     // CPU buffer filled per step in backend_set_input
+
     // timing
 
     mutable int64_t t_sample_us;
