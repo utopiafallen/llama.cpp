@@ -1423,6 +1423,15 @@ extern "C" {
         // copy mutable state from src into dst while keeping dst's references to the current sampling graph
         // src and dst must have the same type and configuration
         void (*copy_state)(const struct llama_sampler * src, struct llama_sampler * dst);
+
+        // [EXPERIMENTAL]
+        // per-step token constraint for backend sampling (e.g. GBNF grammar, reasoning budget).
+        // ANDs this sampler's currently-allowed tokens into mask (F32, 0/1, n elements):
+        // mask[i] = 0.0f if token i is disallowed, otherwise unchanged.
+        // the caller combines the masks of all constraint samplers into one 0/1 buffer and
+        // passes it to the owning chain via llama_sampler_chain_set_constraint_mask().
+        // read-only on the sampler state. can be NULL.
+        void (*apply_constraint_mask)(const struct llama_sampler * smpl, float * mask, int n);
     };
 
     struct llama_sampler {
@@ -1467,6 +1476,23 @@ extern "C" {
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
+
+    // [EXPERIMENTAL] backend sampling: per-step token constraint (e.g. grammar, reasoning budget)
+    //
+    // apply the token constraint of smpl into mask (F32, 0/1, n = n_vocab elements).
+    // no-op if smpl is NULL or does not provide a constraint (apply_constraint_mask is NULL).
+    // combine the masks of all constraint samplers (e.g. grammar + reasoning budget) into one
+    // buffer and pass it to the owning chain via llama_sampler_chain_set_constraint_mask().
+    LLAMA_API void llama_sampler_apply_constraint_mask(const struct llama_sampler * smpl, float * mask, int n);
+
+    // set the per-step token constraint mask (0/1, n = n_vocab) for a sampling chain.
+    // when backend sampling is active, the chain applies the mask to the logits on the backend
+    // before sampling (disallowed tokens get an -INF logit bias).
+    // must be called before the sampling graph is built (i.e. before llama_set_sampler / context init)
+    // to include the mask in the graph; it can be updated per step afterwards.
+    // pass mask == NULL to clear the constraint (all tokens allowed).
+    // no-op if chain is not a llama_sampler_chain.
+    LLAMA_API void llama_sampler_chain_set_constraint_mask(struct llama_sampler * chain, const float * mask, int n);
 
     // available samplers:
 

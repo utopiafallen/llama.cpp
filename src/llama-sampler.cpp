@@ -797,6 +797,21 @@ static void llama_sampler_chain_backend_apply(
 
     GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
 
+    // per-step token constraint (grammar / reasoning budget): apply to the logits before
+    // sampling. mask is a 0/1 F32 input; log(1) = 0 (keep), log(0) = -INF (discard).
+    // the buffer is set (size n_vocab) by llama_sampler_chain_set_constraint_mask before
+    // the graph is built; the tensor size matches the logits size (n_vocab).
+    if (!chain->constraint_mask_buf.empty()) {
+        struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+        struct ggml_tensor * mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, logits->ne[0]);
+        ggml_set_input(mask);
+        ggml_set_name(mask, "constraint_mask");
+        chain->constraint_mask = mask;
+
+        data->logits = ggml_add(ctx, logits, ggml_log(ctx, mask));
+        ggml_set_name(data->logits, "constraint_logits");
+    }
+
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {
             break;
@@ -810,6 +825,13 @@ static void llama_sampler_chain_backend_apply(
 
 static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
+
+    // upload the per-step token constraint mask (set by llama_sampler_chain_set_constraint_mask)
+    if (chain->constraint_mask) {
+        const int n = chain->constraint_mask->ne[0];
+        GGML_ASSERT((int) chain->constraint_mask_buf.size() == n && "constraint mask buffer size mismatch");
+        ggml_backend_tensor_set(chain->constraint_mask, chain->constraint_mask_buf.data(), 0, (size_t) n * sizeof(float));
+    }
 
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {
@@ -876,6 +898,8 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
+            /* .constraint_mask      = */ nullptr,
+            /* .constraint_mask_buf  = */ {},
             /* .t_sample_us          = */ 0,
             /* .n_sample             = */ 0,
         }
@@ -1010,6 +1034,28 @@ int32_t llama_sampler_chain_n(const struct llama_sampler * chain) {
     const auto * p = (const llama_sampler_chain *) chain->ctx;
 
     return p->samplers.size();
+}
+
+void llama_sampler_apply_constraint_mask(const struct llama_sampler * smpl, float * mask, int n) {
+    if (smpl == nullptr || smpl->iface->apply_constraint_mask == nullptr) {
+        return;
+    }
+
+    smpl->iface->apply_constraint_mask(smpl, mask, n);
+}
+
+void llama_sampler_chain_set_constraint_mask(struct llama_sampler * chain, const float * mask, int n) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return;
+    }
+
+    auto * p = (llama_sampler_chain *) chain->ctx;
+    if (mask == nullptr) {
+        p->constraint_mask_buf.clear();
+        return;
+    }
+
+    p->constraint_mask_buf.assign(mask, mask + n);
 }
 
 //
@@ -2690,6 +2736,14 @@ static void llama_sampler_grammar_apply(struct llama_sampler * smpl, llama_token
     }
 }
 
+static void llama_sampler_grammar_apply_constraint_mask(const struct llama_sampler * smpl, float * mask, int n) {
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    if (ctx->grammar) {
+        llama_grammar_apply_mask_impl(*ctx->grammar, mask, n);
+    }
+    // no active grammar (or awaiting trigger): all tokens stay allowed (mask unchanged)
+}
+
 // Fwd declare to break reset --> init_impl --> llama_sampler_grammar_i --> reset cycle.
 static struct llama_sampler * llama_sampler_init_grammar_impl(
         const struct llama_vocab * vocab,
@@ -2767,6 +2821,7 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .backend_set_input = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
+    /* .apply_constraint_mask = */ llama_sampler_grammar_apply_constraint_mask,
 };
 
 static struct llama_sampler * llama_sampler_init_grammar_impl(

@@ -167,7 +167,7 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
     if (ctx->state != REASONING_BUDGET_FORCING) {
-        // passthrough — don't modify logits
+        // passthrough - don't modify logits
         return;
     }
 
@@ -182,6 +182,26 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
         if (cur_p->data[i].id != forced) {
             cur_p->data[i].logit = -INFINITY;
         }
+    }
+}
+
+// backend-sampling counterpart of common_reasoning_budget_apply: write a 0/1 mask
+// (allowed=1) for all n tokens instead of mutating cur_p. only the FORCING state
+// constrains (all other states are passthrough, mask left unchanged = all allowed).
+static void common_reasoning_budget_apply_constraint_mask(const struct llama_sampler * smpl, float * mask, int n) {
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+
+    if (ctx->state != REASONING_BUDGET_FORCING) {
+        return;  // passthrough
+    }
+
+    if (ctx->force_pos >= ctx->forced_tokens.size()) {
+        return;
+    }
+
+    const llama_token forced = ctx->forced_tokens[ctx->force_pos];
+    for (int i = 0; i < n; i++) {
+        mask[i] = (i == forced) ? 1.0f : 0.0f;
     }
 }
 
@@ -219,6 +239,7 @@ static struct llama_sampler_i common_reasoning_budget_i = {
     /* .backend_set_input = */ nullptr,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
+    /* .apply_constraint_mask = */ common_reasoning_budget_apply_constraint_mask,
 };
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
