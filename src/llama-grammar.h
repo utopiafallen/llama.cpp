@@ -182,6 +182,14 @@ void llama_grammar_apply_impl(
         const struct llama_grammar & grammar,
             llama_token_data_array * cur_p);
 
+// like llama_grammar_apply_impl, but instead of mutating cur_p it writes a 0/1 mask
+// (mask[i] = 0.0f if token i is disallowed by the grammar, 1.0f otherwise) for all n tokens.
+// read-only on the grammar state (safe to call per step for backend sampling).
+void llama_grammar_apply_mask_impl(
+        const struct llama_grammar & grammar,
+                       float *       mask,
+                       int           n);
+
 void llama_grammar_accept_impl(
               struct llama_grammar & grammar,
                        llama_token   token);

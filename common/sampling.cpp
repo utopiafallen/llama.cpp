@@ -122,6 +122,11 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // backend sampling: per-step token constraint mask (grammar + reasoning budget), uploaded
+    // to the sampling chain. sized n_vocab, reused across steps.
+    int32_t n_vocab = 0;
+    std::vector<float> constraint_mask_buf;
+
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
@@ -167,6 +172,21 @@ struct common_sampler {
 
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
+    }
+
+    // backend sampling: recompute the token constraint mask (grammar + reasoning budget) and
+    // upload it to the sampling chain. no-op if backend sampling is not active, no constraint
+    // sampler is present, or n_vocab is unknown. the mask reflects the current grammar/rbudget
+    // state, so call it after accepting a token (to prepare the next step).
+    void update_constraint_mask() {
+        if (!params.backend_sampling || n_vocab == 0 || (grmr == nullptr && rbudget == nullptr)) {
+            return;
+        }
+
+        std::fill(constraint_mask_buf.begin(), constraint_mask_buf.end(), 1.0f);
+        llama_sampler_apply_constraint_mask(grmr,    constraint_mask_buf.data(), n_vocab);
+        llama_sampler_apply_constraint_mask(rbudget, constraint_mask_buf.data(), n_vocab);
+        llama_sampler_chain_set_constraint_mask(chain, constraint_mask_buf.data(), n_vocab);
     }
 
     mutable int64_t t_total_us = 0;
@@ -419,18 +439,9 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
+    // backend sampling: grammar + reasoning budget are enforced on the backend via the per-step
+    // constraint mask (llama_sampler_chain_set_constraint_mask). set the initial mask now, before
+    // the sampling graph is built, so it is included in the graph.
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -439,9 +450,14 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .n_vocab = */ llama_vocab_n_tokens(vocab),
+        /* .constraint_mask_buf = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
+
+    result->constraint_mask_buf.assign(result->n_vocab, 1.0f);
+    result->update_constraint_mask();
 
     return result;
 }
@@ -505,6 +521,12 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     llama_sampler_accept(gsmpl->chain, token);
 
     gsmpl->prev.push_back(token);
+
+    // backend sampling: update the constraint mask to reflect the new grammar/rbudget state,
+    // so the next step samples from the correct allowed-token set.
+    if (is_generated) {
+        gsmpl->update_constraint_mask();
+    }
 }
 
 void common_sampler_reset(struct common_sampler * gsmpl) {
@@ -524,6 +546,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .n_vocab = */ gsmpl->n_vocab,
+        /* .constraint_mask_buf = */ gsmpl->constraint_mask_buf,
         /* .rng     = */ gsmpl->rng,
     };
 }
@@ -545,6 +569,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->n_vocab    = src->n_vocab;
+    dst->constraint_mask_buf = src->constraint_mask_buf;
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 }
@@ -626,8 +652,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            // note: grammar + reasoning budget are enforced on the backend via the per-step
+            // constraint mask, so they are safe to combine with backend sampling here.
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
