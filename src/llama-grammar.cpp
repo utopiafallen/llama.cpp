@@ -1755,8 +1755,9 @@ void llama_grammar_apply_mask_impl(const struct llama_grammar & grammar, float *
         } else if (piece.empty() || piece[0] == 0) {
             mask[i] = 0.0f;
         } else {
-            candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
-            candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
+            candidates_decoded.push_back(llama_grammar_decode_utf8(piece, grammar.partial_utf8));
+            candidates_grammar.push_back({ static_cast<size_t>(i), candidates_decoded.back().first.data(), candidates_decoded.back().second, id,
+                                           llama_grammar_is_opaque(grammar, id) });
         }
     }
 
