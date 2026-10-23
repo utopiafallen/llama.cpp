@@ -1127,9 +1127,11 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface_shared = {
     /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_buffer_type_alloc_buffer_shared,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
     /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
     /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,
     /* .get_shared_compute = */ NULL,
 };
