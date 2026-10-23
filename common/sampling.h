@@ -96,6 +96,13 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// backend sampling + speculative decoding (MTP): compute the per-row constraint mask (grammar
+// + reasoning budget) from the draft tokens and upload it to the sampling chain, so the verify
+// graph samples each row with the constraint for its position. no-op unless backend sampling is
+// active, a constraint sampler is present, and the draft is non-empty. call before the verify
+// batch runs.
+void common_sampler_prepare_mtp_mask(struct common_sampler * gsmpl, const llama_tokens & draft);
+
 // helpers
 
 // access the internal list of current candidate tokens

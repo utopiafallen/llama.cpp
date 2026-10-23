@@ -3877,6 +3877,12 @@ private:
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
+
+            // backend sampling + MTP: the verify graph samples all rows at once, so upload the
+            // per-row constraint mask (grammar + reasoning budget) before the batch runs
+            if (!slot.spec_draft.empty()) {
+                common_sampler_prepare_mtp_mask(slot.smpl.get(), slot.spec_draft);
+            }
         });
 
         // process in chunks of params.n_batch

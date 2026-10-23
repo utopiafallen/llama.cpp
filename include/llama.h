@@ -1494,6 +1494,16 @@ extern "C" {
     // no-op if chain is not a llama_sampler_chain.
     LLAMA_API void llama_sampler_chain_set_constraint_mask(struct llama_sampler * chain, const float * mask, int n);
 
+    // number of sampling rows per sequence (n_outputs_max_per_seq); 0 before backend_init
+    LLAMA_API int32_t llama_sampler_chain_n_outputs_max_per_seq(const struct llama_sampler * chain);
+
+    // set the per-row token constraint mask (speculative decoding). mask is a [n_rows, n]
+    // row-major 0/1 buffer; row r's verify logits are masked by mask[r]. use this instead of
+    // llama_sampler_chain_set_constraint_mask() when the verify graph has multiple rows (MTP),
+    // so each row gets the constraint for its position (grammar state after the draft tokens).
+    // no-op if chain is not a llama_sampler_chain.
+    LLAMA_API void llama_sampler_chain_set_constraint_mask_rows(struct llama_sampler * chain, const float * mask, int n_rows, int n);
+
     // available samplers:
 
     LLAMA_API struct llama_sampler * llama_sampler_init_greedy(void);
