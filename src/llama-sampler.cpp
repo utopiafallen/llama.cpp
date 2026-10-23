@@ -740,6 +740,7 @@ static bool llama_sampler_chain_backend_init(
     GGML_ASSERT(chain->is_init == false && "llama_sampler_chain_backend_init() called twice");
 
     chain->is_init = true;
+    chain->n_outputs_max_per_seq = n_outputs_max_per_seq;
 
     bool res = true;
     bool backend_prefix = true;
@@ -800,14 +801,15 @@ static void llama_sampler_chain_backend_apply(
 
     // per-step token constraint (grammar / reasoning budget): apply to the logits before
     // sampling. mask is a 0/1 F32 input; log(1) = 0 (keep), log(0) = -INF (discard).
-    // the buffer is set (size n_vocab) by llama_sampler_chain_set_constraint_mask before
-    // the graph is built; the tensor size matches the logits size (n_vocab).
+    // the buffer is set (one row per sub-chain) by llama_sampler_chain_set_constraint_mask
+    // before the graph is built; the tensor size matches the logits size (n_vocab). one
+    // mask tensor is created per sub-chain (row), so speculative decoding gets a per-row mask.
     if (!chain->constraint_mask_buf.empty()) {
         struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
         struct ggml_tensor * mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, logits->ne[0]);
         ggml_set_input(mask);
-        ggml_set_name(mask, "constraint_mask");
-        chain->constraint_mask = mask;
+        ggml_format_name(mask, "constraint_mask_%zu", chain->constraint_mask_tensors.size());
+        chain->constraint_mask_tensors.push_back(mask);
 
         data->logits = ggml_add(ctx, logits, ggml_log(ctx, mask));
         ggml_set_name(data->logits, "constraint_logits");
@@ -828,10 +830,16 @@ static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
     // upload the per-step token constraint mask (set by llama_sampler_chain_set_constraint_mask)
-    if (chain->constraint_mask) {
-        const int n = chain->constraint_mask->ne[0];
-        GGML_ASSERT((int) chain->constraint_mask_buf.size() == n && "constraint mask buffer size mismatch");
-        ggml_backend_tensor_set(chain->constraint_mask, chain->constraint_mask_buf.data(), 0, (size_t) n * sizeof(float));
+    // one row per sub-chain; a buffer with fewer rows than tensors is broadcast (last row repeated)
+    if (!chain->constraint_mask_tensors.empty()) {
+        const int n_vocab = chain->constraint_mask_tensors[0]->ne[0];
+        const int n_buf_rows = (int) (chain->constraint_mask_buf.size() / n_vocab);
+        GGML_ASSERT(n_buf_rows >= 1 && "constraint mask buffer is empty");
+        for (size_t i = 0; i < chain->constraint_mask_tensors.size(); ++i) {
+            const int row = std::min((int) i, n_buf_rows - 1);
+            ggml_backend_tensor_set(chain->constraint_mask_tensors[i],
+                    chain->constraint_mask_buf.data() + (size_t) row * n_vocab, 0, (size_t) n_vocab * sizeof(float));
+        }
     }
 
     for (auto & smpl : chain->samplers) {
@@ -847,6 +855,9 @@ static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
 
 static void llama_sampler_chain_backend_reset(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
+
+    // the mask tensors belong to the current sampling graph
+    chain->constraint_mask_tensors.clear();
 
     for (auto & entry : chain->samplers) {
         if (!entry.is_backend) {
@@ -899,7 +910,8 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
-            /* .constraint_mask      = */ nullptr,
+            /* .n_outputs_max_per_seq = */ 0,
+            /* .constraint_mask_tensors = */ {},
             /* .constraint_mask_buf  = */ {},
             /* .t_sample_us          = */ 0,
             /* .n_sample             = */ 0,
@@ -1057,6 +1069,33 @@ void llama_sampler_chain_set_constraint_mask(struct llama_sampler * chain, const
     }
 
     p->constraint_mask_buf.assign(mask, mask + n);
+}
+
+// number of sampling rows per sequence (n_outputs_max_per_seq); 0 before backend_init
+int32_t llama_sampler_chain_n_outputs_max_per_seq(const struct llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return 0;
+    }
+
+    const auto * p = (const llama_sampler_chain *) chain->ctx;
+
+    return p->n_outputs_max_per_seq;
+}
+
+// per-row constraint mask (speculative decoding): mask is a [n_rows, n] row-major buffer;
+// row r's verify logits are masked by mask[r]. backend_set_input fills one mask tensor per row.
+void llama_sampler_chain_set_constraint_mask_rows(struct llama_sampler * chain, const float * mask, int n_rows, int n) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return;
+    }
+
+    auto * p = (llama_sampler_chain *) chain->ctx;
+    if (mask == nullptr || n_rows <= 0 || n <= 0) {
+        p->constraint_mask_buf.clear();
+        return;
+    }
+
+    p->constraint_mask_buf.assign(mask, mask + (size_t) n_rows * n);
 }
 
 //

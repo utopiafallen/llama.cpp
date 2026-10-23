@@ -575,6 +575,111 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->t_total_us = src->t_total_us;
 }
 
+// advance the grammar + reasoning-budget state by one token, replicating the
+// grammar/rbudget part of common_sampler_accept (no chain accept, no mask update).
+// works on clone samplers so the caller's live state is not touched. returns false when
+// the grammar rejects the token: the constraint is now unsatisfiable, so no row after this
+// has a valid token. the grammar accept would abort on a rejected token, so the mask is
+// checked first.
+static bool common_sampler_advance_constraint(
+        const common_params_sampling & params,
+        struct llama_sampler * grmr,
+        struct llama_sampler * rbudget,
+        llama_token            token,
+        int                    n_vocab) {
+    // mirror grammar_should_apply for the clones
+    auto grammar_should_apply = [&](struct llama_sampler * g, struct llama_sampler * r) {
+        if (!g) {
+            return false;
+        }
+        if (!r) {
+            return true;
+        }
+        if (params.grammar_lazy) {
+            const auto state = common_reasoning_budget_get_state(r);
+            return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
+        }
+        return true;
+    };
+
+    const auto accept_grammar = grammar_should_apply(grmr, rbudget);
+    if (rbudget) {
+        llama_sampler_accept(rbudget, token);
+
+        // if done, replay the end sequence which may contain a grammar trigger
+        const bool is_done = common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_DONE;
+        if (grmr && !accept_grammar && is_done) {
+            const llama_tokens * end_seq = common_reasoning_budget_get_end_match(rbudget);
+            if (end_seq) {
+                for (const llama_token end_token : *end_seq) {
+                    llama_sampler_accept(grmr, end_token);
+                }
+            }
+        }
+    }
+
+    if (grmr && accept_grammar) {
+        std::vector<float> mask(n_vocab, 1.0f);
+        llama_sampler_apply_constraint_mask(grmr, mask.data(), n_vocab);
+        if (mask[token] == 0.0f) {
+            return false;
+        }
+        llama_sampler_accept(grmr, token);
+    }
+
+    return true;
+}
+
+// backend sampling + speculative decoding (MTP): the verify graph samples all rows at once,
+// so the per-row constraint must be in the graph before it runs. row r's mask is the
+// constraint (grammar + reasoning budget) state after the draft tokens d_0..d_{r-1}, which
+// is the state verify row r needs. the clones are advanced and freed, so the live
+// grammar/rbudget state is not mutated. call this before the verify batch runs.
+void common_sampler_prepare_mtp_mask(struct common_sampler * gsmpl, const llama_tokens & draft) {
+    if (!gsmpl) {
+        return;
+    }
+    if (!gsmpl->params.backend_sampling || gsmpl->n_vocab == 0 || (gsmpl->grmr == nullptr && gsmpl->rbudget == nullptr)) {
+        return;
+    }
+    if (draft.empty()) {
+        return;
+    }
+
+    const int n_rows  = llama_sampler_chain_n_outputs_max_per_seq(gsmpl->chain);
+    const int n_vocab = gsmpl->n_vocab;
+    if (n_rows <= 0) {
+        return;
+    }
+
+    std::vector<float> mask((size_t) n_rows * n_vocab, 1.0f);
+
+    auto * grmr    = llama_sampler_clone(gsmpl->grmr);
+    auto * rbudget = llama_sampler_clone(gsmpl->rbudget);
+
+    bool dead = false; // a draft token was rejected by the grammar: no valid tokens after
+    for (int r = 0; r < n_rows; ++r) {
+        float * row = mask.data() + (size_t) r * n_vocab;
+        if (dead) {
+            std::fill(row, row + n_vocab, 0.0f);
+            continue;
+        }
+
+        std::fill(row, row + n_vocab, 1.0f);
+        llama_sampler_apply_constraint_mask(grmr,    row, n_vocab);
+        llama_sampler_apply_constraint_mask(rbudget, row, n_vocab);
+
+        if (r < (int) draft.size()) {
+            dead = !common_sampler_advance_constraint(gsmpl->params, grmr, rbudget, draft[r], n_vocab);
+        }
+    }
+
+    llama_sampler_chain_set_constraint_mask_rows(gsmpl->chain, mask.data(), n_rows, n_vocab);
+
+    llama_sampler_free(grmr);
+    llama_sampler_free(rbudget);
+}
+
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
     // TODO: measure grammar performance
 
