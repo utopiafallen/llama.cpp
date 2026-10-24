@@ -778,11 +778,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 // their own. slab memory is only accessed on one per-device stream, which serializes
 // the owners (the analogue of the SYCL backend's single in-order queue; assumes a
 // single eval thread like the SYCL tripwire does). disable with GGML_COMPUTE_BUF_CTX_REUSE=0
+struct ggml_backend_cuda_buffer_context;
+
 struct ggml_cuda_shared_slab {
     void * base = nullptr;
     size_t capacity = 0;
     int refcount = 0;
     cudaStream_t stream = nullptr;
+    // buffer contexts aliasing the slab, re-pointed when it grows
+    std::vector<ggml_backend_cuda_buffer_context *> holders;
 };
 
 static std::mutex g_ggml_cuda_shared_slab_mutex;
@@ -805,9 +809,32 @@ cudaStream_t ggml_cuda_shared_compute_stream(int device) {
     return it->second.stream;
 }
 
-// creates the slab for the first request, aliases later requests that fit;
-// returns nullptr for a private fallback buffer. *slab_device is set to the device
-// when the request aliases the slab, -1 otherwise
+static void ggml_cuda_slab_release(int device, ggml_backend_cuda_buffer_context * holder);
+
+struct ggml_backend_cuda_buffer_context {
+    int device;
+    void * dev_ptr = nullptr;
+    std::string name;
+    // >= 0 when the buffer aliases the shared slab for this device
+    int slab_device = -1;
+
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, int slab_device = -1) :
+        device(device), dev_ptr(dev_ptr), slab_device(slab_device),
+        name(GGML_CUDA_NAME + std::to_string(device)) {
+    }
+
+    ~ggml_backend_cuda_buffer_context() {
+        if (slab_device >= 0) {
+            ggml_cuda_slab_release(slab_device, this);
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
+    }
+};
+
+// creates the slab for the first request, aliases later requests that fit, grows the
+// slab when a request exceeds it; returns nullptr for a private fallback buffer.
+// *slab_device is set to the device when the request aliases the slab, -1 otherwise
 static void * ggml_cuda_slab_acquire(int device, size_t size, int * slab_device) {
     *slab_device = -1;
 
@@ -827,9 +854,54 @@ static void * ggml_cuda_slab_acquire(int device, size_t size, int * slab_device)
                     GGML_CUDA_NAME, device, slab.refcount, size / 1024.0 / 1024.0, slab.capacity / 1024.0 / 1024.0);
             return slab.base;
         }
-        fprintf(stderr, "[SHARED-COMPUTE] %s%d slab: request %.2f MiB exceeds slab %.2f MiB, private buffer\n",
-                GGML_CUDA_NAME, device, size / 1024.0 / 1024.0, slab.capacity / 1024.0 / 1024.0);
-        return nullptr;
+        // request exceeds the slab: grow it and re-point the existing holders.
+        // free the old slab first so old + new memory never coexist. safe to free
+        // while holders point at the base: the owners are serialized on the slab
+        // stream and the eval thread reserving here runs after synchronize(), so no
+        // holder is mid-use. all holders alias the base at offset 0 and the compute
+        // buffer holds only transient graph scratch, so no data copy is needed
+        const size_t old_capacity = slab.capacity;
+        CUDA_CHECK(cudaStreamDestroy(slab.stream));
+        CUDA_CHECK(cudaFree(slab.base));
+        slab.base = nullptr;
+        slab.stream = nullptr;
+
+        void * new_base = nullptr;
+        cudaError_t err = ggml_cuda_device_malloc(&new_base, size, device);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            // restore the old slab so the holders are not left with a dangling base
+            cudaError_t err_restore = ggml_cuda_device_malloc(&slab.base, old_capacity, device);
+            if (err_restore == cudaSuccess) {
+                cudaStream_t new_stream = nullptr;
+                CUDA_CHECK(cudaStreamCreateWithFlags(&new_stream, cudaStreamNonBlocking));
+                for (auto * holder : slab.holders) {
+                    holder->dev_ptr = slab.base;
+                }
+                slab.stream = new_stream;
+                fprintf(stderr, "[SHARED-COMPUTE] %s%d slab: request %.2f MiB exceeds slab %.2f MiB, grow failed, restored old slab, private buffer\n",
+                        GGML_CUDA_NAME, device, size / 1024.0 / 1024.0, old_capacity / 1024.0 / 1024.0);
+            } else {
+                (void)cudaGetLastError();
+                GGML_LOG_ERROR("%s: growing shared slab on device %d failed and restoring %.2f MiB failed: out of memory\n",
+                               __func__, device, old_capacity / 1024.0 / 1024.0);
+            }
+            return nullptr;
+        }
+
+        cudaStream_t new_stream = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&new_stream, cudaStreamNonBlocking));
+        for (auto * holder : slab.holders) {
+            holder->dev_ptr = new_base;
+        }
+        slab.base = new_base;
+        slab.capacity = size;
+        slab.stream = new_stream;
+        slab.refcount++;
+        *slab_device = device;
+        fprintf(stderr, "[SHARED-COMPUTE] %s%d slab: grew %.2f -> %.2f MiB (refcount %d)\n",
+                GGML_CUDA_NAME, device, old_capacity / 1024.0 / 1024.0, size / 1024.0 / 1024.0, slab.refcount);
+        return slab.base;
     }
 
     ggml_cuda_shared_slab slab;
@@ -851,13 +923,27 @@ static void * ggml_cuda_slab_acquire(int device, size_t size, int * slab_device)
     return slab.base;
 }
 
-// frees the slab when the last referencing buffer is destroyed
-static void ggml_cuda_slab_release(int device) {
+// registers the holder after its buffer was created on a slab (see alloc_buffer_shared)
+static void ggml_cuda_slab_register_holder(int device, ggml_backend_cuda_buffer_context * holder) {
+    std::lock_guard<std::mutex> lock(g_ggml_cuda_shared_slab_mutex);
+
+    auto it = g_ggml_cuda_shared_slabs.find(device);
+    if (it != g_ggml_cuda_shared_slabs.end()) {
+        it->second.holders.push_back(holder);
+    }
+}
+
+// unregisters the holder and frees the slab when the last referencing buffer is destroyed
+static void ggml_cuda_slab_release(int device, ggml_backend_cuda_buffer_context * holder) {
     std::lock_guard<std::mutex> lock(g_ggml_cuda_shared_slab_mutex);
 
     auto it = g_ggml_cuda_shared_slabs.find(device);
     GGML_ASSERT(it != g_ggml_cuda_shared_slabs.end());
     ggml_cuda_shared_slab & slab = it->second;
+
+    if (holder != nullptr) {
+        slab.holders.erase(std::remove(slab.holders.begin(), slab.holders.end(), holder), slab.holders.end());
+    }
 
     if (--slab.refcount > 0) {
         return;
@@ -868,27 +954,6 @@ static void ggml_cuda_slab_release(int device) {
     CUDA_CHECK(cudaFree(slab.base));
     g_ggml_cuda_shared_slabs.erase(it);
 }
-
-struct ggml_backend_cuda_buffer_context {
-    int device;
-    void * dev_ptr = nullptr;
-    std::string name;
-    // >= 0 when the buffer aliases the shared slab for this device
-    int slab_device = -1;
-
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, int slab_device = -1) :
-        device(device), dev_ptr(dev_ptr), slab_device(slab_device),
-        name(GGML_CUDA_NAME + std::to_string(device)) {
-    }
-
-    ~ggml_backend_cuda_buffer_context() {
-        if (slab_device >= 0) {
-            ggml_cuda_slab_release(slab_device);
-        } else {
-            CUDA_CHECK(cudaFree(dev_ptr));
-        }
-    }
-};
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -1095,6 +1160,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_shared(g
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, dev_ptr, slab_device);
+
+    if (slab_device >= 0) {
+        ggml_cuda_slab_register_holder(slab_device, ctx);
+    }
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }

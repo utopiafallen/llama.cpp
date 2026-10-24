@@ -765,12 +765,16 @@ inline void free_aligned_mem_host(void * memblock) {
 // + draft) alias a single device allocation ("slab"). Safe because all work on the device is
 // ordered by its single in-order queue and everything in these buffers is transitory per graph;
 // the tripwire in ggml_backend_sycl_graph_compute asserts if that ordering is ever broken.
+struct ggml_backend_sycl_buffer_context;
+
 struct ggml_sycl_shared_slab {
     void * base = nullptr;
     size_t capacity = 0;
     int refcount = 0;
     const void * last_owner = nullptr; // sycl context id of the last dispatched graph
     const void * last_queue = nullptr; // sycl queue the owner dispatched on
+    // buffer contexts aliasing the slab, re-pointed when it grows
+    std::vector<ggml_backend_sycl_buffer_context *> holders;
 };
 
 static std::mutex g_ggml_sycl_shared_slab_mutex;
@@ -831,6 +835,7 @@ struct ggml_backend_sycl_buffer_context {
             {
                 std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
                 auto & slab = g_ggml_sycl_shared_slabs[slab_device];
+                slab.holders.erase(std::remove(slab.holders.begin(), slab.holders.end(), this), slab.holders.end());
                 if (--slab.refcount <= 0 && slab.base != nullptr) {
                     base = slab.base;
                     slab = {};
@@ -1400,6 +1405,8 @@ ggml_backend_sycl_buffer_type_alloc_buffer_shared(ggml_backend_buffer_type_t buf
     void * dev_ptr = nullptr;
     bool from_slab = false;
     bool private_alloc = false;
+    bool growing = false;
+    ggml_sycl_shared_slab old_slab;
     {
         std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
         auto & slab = g_ggml_sycl_shared_slabs[buft_ctx->device];
@@ -1422,10 +1429,54 @@ ggml_backend_sycl_buffer_type_alloc_buffer_shared(ggml_backend_buffer_type_t buf
             fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: reusing %8.2f MiB (request %8.2f MiB)\n",
                     buft_ctx->device, slab.capacity / 1048576.0, aligned_size / 1048576.0);
         } else {
-            // request exceeds the existing slab; keep this buffer private rather than grow
-            fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: request %8.2f MiB exceeds slab %8.2f MiB, allocating a private compute buffer\n",
-                    buft_ctx->device, aligned_size / 1048576.0, slab.capacity / 1048576.0);
-            private_alloc = true;
+            // request exceeds the existing slab: grow it. free the old slab first so old +
+            // new memory never coexist; the device's single in-order queue orders the free
+            // after all earlier slab work and no holder is mid-use (only the eval thread
+            // allocates compute buffers). all holders alias the base at offset 0 and the
+            // compute buffer holds only transitory graph scratch, so no data copy is needed
+            old_slab = slab;
+            slab = {};
+            growing = true;
+            fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: request %8.2f MiB exceeds slab %8.2f MiB, growing\n",
+                    buft_ctx->device, aligned_size / 1048576.0, old_slab.capacity / 1048576.0);
+        }
+    }
+    if (growing) {
+        SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(old_slab.base, *stream)));
+        old_slab.base = nullptr;
+        dev_ptr = (void *) ggml_sycl_malloc_device(aligned_size, *stream, GGML_SYCL_MEM_BUFFER);
+        if (dev_ptr == nullptr) {
+            // restore the old slab so the holders are not left with a dangling base
+            void * restored = (void *) ggml_sycl_malloc_device(old_slab.capacity, *stream, GGML_SYCL_MEM_BUFFER);
+            std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
+            auto & slab = g_ggml_sycl_shared_slabs[buft_ctx->device];
+            slab = old_slab;
+            slab.base = restored;
+            if (restored != nullptr) {
+                for (auto * holder : slab.holders) {
+                    holder->dev_ptr = restored;
+                }
+                fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: grow failed, restored old slab %8.2f MiB\n",
+                        buft_ctx->device, old_slab.capacity / 1048576.0);
+            } else {
+                GGML_LOG_ERROR("%s: growing shared slab on device %d failed and restoring %.2f MiB failed: out of memory\n",
+                               __func__, buft_ctx->device, old_slab.capacity / 1024.0 / 1024.0);
+            }
+            return nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
+            auto & slab = g_ggml_sycl_shared_slabs[buft_ctx->device];
+            slab.base = dev_ptr;
+            slab.capacity = aligned_size;
+            slab.refcount = old_slab.refcount; // this requester is counted below
+            slab.holders = old_slab.holders;
+            for (auto * holder : slab.holders) {
+                holder->dev_ptr = dev_ptr;
+            }
+            from_slab = true;
+            fprintf(stderr, "[SHARED-COMPUTE] SYCL%d slab: grew %8.2f -> %8.2f MiB (refcount %d)\n",
+                    buft_ctx->device, old_slab.capacity / 1048576.0, aligned_size / 1048576.0, slab.refcount + 1);
         }
     }
     if (private_alloc || dev_ptr == nullptr) {
@@ -1440,7 +1491,9 @@ ggml_backend_sycl_buffer_type_alloc_buffer_shared(ggml_backend_buffer_type_t buf
     if (from_slab) {
         ctx->slab_device = buft_ctx->device;
         std::lock_guard<std::mutex> lock(g_ggml_sycl_shared_slab_mutex);
-        g_ggml_sycl_shared_slabs[buft_ctx->device].refcount++;
+        auto & slab = g_ggml_sycl_shared_slabs[buft_ctx->device];
+        slab.refcount++;
+        slab.holders.push_back(ctx);
     }
     return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
 }
