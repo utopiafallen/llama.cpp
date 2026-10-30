@@ -1020,6 +1020,11 @@ static void flash_attn_tile(const char *  Q,
         // Branch without out-of-bounds checks for full chunks; the trailing partial
         // chunk (n_kv not a multiple of nbatch_fa) takes the checked iteration, so
         // the GQA-optimized variants no longer require K->ne[1] % FATTN_KQ_STRIDE == 0.
+        // Full tiles need no OOB checks, but a final partial tile (k_VKQ_max
+        // not a multiple of nbatch_fa, e.g. decode/verify steps) must have
+        // them: OOB K/V rows are real adjacent data and the OOB mask read
+        // wraps to the next query row, so unmasked garbage scores leak into
+        // the softmax.
         int k_VKQ_0 = item_ct1.get_group(1) * nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
