@@ -1017,11 +1017,22 @@ static void flash_attn_tile(const char *  Q,
                                             KQ_max_new_shared, q8_input, K_q8_soa, V_q8_soa);
         }
     } else {
-        // Branch without out-of-bounds checks.
-        for (int k_VKQ_0 = item_ct1.get_group(1) * nbatch_fa; k_VKQ_0 < k_VKQ_max;
-             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa) {
-
+        // Full tiles need no OOB checks, but a final partial tile (k_VKQ_max
+        // not a multiple of nbatch_fa, e.g. decode/verify steps) must have
+        // them: OOB K/V rows are real adjacent data and the OOB mask read
+        // wraps to the next query row, so unmasked garbage scores leak into
+        // the softmax.
+        int k_VKQ_0 = item_ct1.get_group(1) * nbatch_fa;
+        while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
+                                 oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
+                                            stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                                            KQ_max_new_shared, q8_input, K_q8_soa, V_q8_soa);
+            k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
+        }
+        if (k_VKQ_0 < k_VKQ_max) {
+            constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
                                  oob_check>(Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K2,
                                             stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
