@@ -1283,6 +1283,14 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
     if constexpr (T::has_min) {
         Ol = int8_t(1);
     }
+    // FUSED: the gate call gets its own split-mask registers so the up and gate
+    // xmx_group calls do not share Bl/Bh/Ol.
+    simd<int8_t, 512>    Blg = int8_t(0);
+    simd<int8_t, 512>    Bhg = int8_t(0);
+    simd<int8_t, 512>    Olg = int8_t(0);
+    if constexpr (FUSED && T::has_min) {
+        Olg = int8_t(1);
+    }
 
     for (int sb = lid; sb < bpr; sb += ks) {
         auto                 sc = T::load_scales(c, sb, rows);
@@ -1331,7 +1339,7 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
 
                 xmx_group<T, NC>(Cf, pd, sc, A2, d8f, Bl, Bh, Ol, g, part);
                 if constexpr (FUSED) {
-                    xmx_group<T, NC>(Cfg, pdg, scg, A2, d8f, Bl, Bh, Ol, g, part);
+                    xmx_group<T, NC>(Cfg, pdg, scg, A2, d8f, Blg, Bhg, Olg, g, part);
                 }
             }
         }
