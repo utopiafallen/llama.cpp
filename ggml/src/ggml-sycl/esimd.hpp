@@ -684,6 +684,13 @@ template <int NC> constexpr int xmx_n_split() {
     return NC <= 8 ? 32 : (NC == 16 ? 16 : 8);
 }
 
+// odd DPAS repeat counts 3, 5 and 7 compute wrong values on the B70, so odd column counts run
+// with the next even repeat count; the extra activation column is zero by the 2D block load
+// surface bounds and is never stored
+template <int NC> constexpr int xmx_nc_pad() {
+    return NC >= 3 && NC < 8 && (NC & 1) ? NC + 1 : NC;
+}
+
 inline bool xmx_supported(const void * vx, const int ncols) {
     // 2D block loads need a 64 byte aligned base
     return ncols % QK_K == 0 && (uintptr_t) vx % 64 == 0;
@@ -1103,7 +1110,7 @@ template <bool SR> using xmx_traits_q5_k = xmx_traits_q45_k<true, SR>;
 // registers per thread, the large file halves the resident threads but avoids spills in wide tiles, the fused
 // kernel keeps two sets of weights and scales and always takes it
 template <typename T, int NC, bool FUSED> constexpr int xmx_grf() {
-    return FUSED || NC >= T::nc_wide ? 256 : 128;
+    return FUSED || xmx_nc_pad<NC>() >= T::nc_wide ? 256 : 128;
 }
 
 // One DPAS of a block of RC columns: the int32 products of the weights B and the activations A, as float and scaled
@@ -1121,7 +1128,7 @@ ESIMD_INLINE simd<float, RC * NT> xmx_term(const simd<int8_t, 512> &    B,
 
 // one group of 32 of one weight set, accumulated into Cf for all the columns of the tile
 template <typename T, int NC, typename A2T, typename D8T>
-ESIMD_INLINE void xmx_group(simd<float, NC * XMX_ROWS> & Cf,
+ESIMD_INLINE void xmx_group(simd<float, xmx_nc_pad<NC>() * XMX_ROWS> & Cf,
                             const typename T::part_t &   pd,
                             typename T::scales_t &       sc,
                             A2T &                        A2,
@@ -1133,9 +1140,10 @@ ESIMD_INLINE void xmx_group(simd<float, NC * XMX_ROWS> & Cf,
                             const int                    part) {
     using namespace sycl::ext::intel::esimd;
 
+    constexpr int  NCP   = xmx_nc_pad<NC>();
     constexpr int  NT    = XMX_ROWS;
-    constexpr int  RC    = NC < 8 ? NC : 8;
-    constexpr int  NB    = NC / RC;
+    constexpr int  RC    = NCP < 8 ? NCP : 8;
+    constexpr int  NB    = NCP / RC;
     constexpr bool split = !T::has_min && !T::plain && !T::min16;  // two scales per group of 32
     constexpr bool pair  = (RC * 32) % 64 == 0;                    // a block of RC rows fills whole registers
 
@@ -1242,14 +1250,15 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
                               const int    ks) {
     using namespace sycl::ext::intel::esimd;
 
+    constexpr int  NCP   = xmx_nc_pad<NC>();
     constexpr int  NT    = XMX_ROWS;
-    constexpr int  RC    = NC < 8 ? NC : 8;
-    constexpr int  NB    = NC / RC;
+    constexpr int  RC    = NCP < 8 ? NCP : 8;
+    constexpr int  NB    = NCP / RC;
     constexpr int  N_ACC = FUSED ? 2 : 1;
     constexpr bool pair  = (RC * 32) % 64 == 0;  // a block of RC rows fills whole registers
 
     if constexpr (KS > 1) {
-        slm_init<N_ACC * KS * NC * NT * sizeof(float)>();
+        slm_init<N_ACC * KS * NCP * NT * sizeof(float)>();
     }
 
     const int  bpr  = ncols / QK_K;
@@ -1270,8 +1279,8 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
     const unsigned   yh  = ncv - 1;
     const unsigned   yp  = stride_y_bytes - 1;
 
-    simd<float, NC * NT> Cf  = 0.0f;
-    simd<float, NC * NT> Cfg = 0.0f;  // gate, only used when fused
+    simd<float, NCP * NT> Cf  = 0.0f;
+    simd<float, NCP * NT> Cfg = 0.0f;  // gate, only used when fused
     simd<int8_t, 512>    Bl  = int8_t(0);
     simd<int8_t, 512>    Bh  = int8_t(0);
     simd<int8_t, 512>    Ol  = int8_t(0);
@@ -1332,18 +1341,18 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
                     }
                 }
 
-                xmx_group<T, NC>(Cf, pd, sc, A2, d8f, Bl, Bh, Ol, g, part);
+                xmx_group<T, NCP>(Cf, pd, sc, A2, d8f, Bl, Bh, Ol, g, part);
                 if constexpr (FUSED) {
-                    xmx_group<T, NC>(Cfg, pdg, scg, A2, d8f, Blg, Bhg, Olg, g, part);
+                    xmx_group<T, NCP>(Cfg, pdg, scg, A2, d8f, Blg, Bhg, Olg, g, part);
                 }
             }
         }
     }
 
     if constexpr (KS > 1) {
-        slm_block_store<float, NC * NT>(lid * NC * NT * sizeof(float), Cf);
+        slm_block_store<float, NCP * NT>(lid * NCP * NT * sizeof(float), Cf);
         if constexpr (FUSED) {
-            slm_block_store<float, NC * NT>((KS + lid) * NC * NT * sizeof(float), Cfg);
+            slm_block_store<float, NCP * NT>((KS + lid) * NCP * NT * sizeof(float), Cfg);
         }
         barrier();
         if (lid != 0) {
@@ -1353,15 +1362,15 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
         Cfg = 0.0f;
 #pragma unroll 4
         for (int j = 0; j < ks; ++j) {
-            Cf += slm_block_load<float, NC * NT>(j * NC * NT * sizeof(float));
+            Cf += slm_block_load<float, NCP * NT>(j * NCP * NT * sizeof(float));
             if constexpr (FUSED) {
-                Cfg += slm_block_load<float, NC * NT>((KS + j) * NC * NT * sizeof(float));
+                Cfg += slm_block_load<float, NCP * NT>((KS + j) * NCP * NT * sizeof(float));
             }
         }
     }
 
     if constexpr (FUSED) {
-        Cf *= xmx_glu_act<NC * NT>(Cfg, glu_op);
+        Cf *= xmx_glu_act<NCP * NT>(Cfg, glu_op);
     }
 
     if (row0 + NT <= nrows && ldd % 4 == 0 && (uintptr_t) dst % 16 == 0) {
