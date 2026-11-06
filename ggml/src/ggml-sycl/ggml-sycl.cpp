@@ -30,6 +30,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <emmintrin.h>
 #include <iostream>
 #include <fstream>
 #include <stdio.h>
@@ -994,6 +995,68 @@ static bool ggml_sycl_buffer_init_staging(ggml_backend_sycl_buffer_context * ctx
     return ctx->staging.data != nullptr;
 }
 
+// Swizzle between the canonical ggml q8_0 row (num_blocks packed block_q8_0, 34 B each:
+// {half d; int8 qs[32]}) and this fork's per-row SoA q8_0 KV layout (set_rows_sycl_q8_0_soa):
+// the same bytes grouped into (num_blocks/8) 272 B segments of [256 B qs][16 B scales], where
+// global block b lives in segment b/8 at position b%8. Slot-save state must be
+// layout-independent, so the buffer get/set swizzle on the host. num_blocks must be a multiple
+// of 8 (i.e. row_bytes a multiple of 272).
+namespace {
+constexpr size_t sycl_kv_q8_block_bytes    = 34;  // sizeof(block_q8_0)
+constexpr size_t sycl_kv_q8_seg_bytes      = 272; // 8 blocks: 256 B qs + 16 B scales
+constexpr size_t sycl_kv_q8_blocks_per_seg = 8;
+
+static void sycl_kv_q8_swizzle_row_soa_to_aos(const uint8_t * soa, uint8_t * aos, size_t num_blocks) {
+    for (size_t seg = 0; seg < num_blocks / sycl_kv_q8_blocks_per_seg; ++seg) {
+        const uint8_t * s = soa + seg * sycl_kv_q8_seg_bytes;
+        for (size_t bb = 0; bb < sycl_kv_q8_blocks_per_seg; ++bb) {
+            uint8_t * a = aos + (seg * sycl_kv_q8_blocks_per_seg + bb) * sycl_kv_q8_block_bytes;
+            _mm_storeu_si128((__m128i *) (a + 2),       _mm_loadu_si128((const __m128i *) (s + bb * 32)));
+            _mm_storeu_si128((__m128i *) (a + 2 + 16),  _mm_loadu_si128((const __m128i *) (s + bb * 32 + 16)));
+            *(uint16_t *) a = *(const uint16_t *) (s + 256 + 2 * bb);
+        }
+    }
+}
+
+static void sycl_kv_q8_swizzle_row_aos_to_soa(const uint8_t * aos, uint8_t * soa, size_t num_blocks) {
+    for (size_t seg = 0; seg < num_blocks / sycl_kv_q8_blocks_per_seg; ++seg) {
+        uint8_t * s = soa + seg * sycl_kv_q8_seg_bytes;
+        for (size_t bb = 0; bb < sycl_kv_q8_blocks_per_seg; ++bb) {
+            const uint8_t * a = aos + (seg * sycl_kv_q8_blocks_per_seg + bb) * sycl_kv_q8_block_bytes;
+            _mm_storeu_si128((__m128i *) (s + bb * 32),       _mm_loadu_si128((const __m128i *) (a + 2)));
+            _mm_storeu_si128((__m128i *) (s + bb * 32 + 16),  _mm_loadu_si128((const __m128i *) (a + 2 + 16)));
+            *(uint16_t *) (s + 256 + 2 * bb) = *(const uint16_t *) a;
+        }
+    }
+}
+
+static void sycl_kv_q8_swizzle(const uint8_t * src, uint8_t * dst, size_t n_rows, size_t row_bytes, bool src_is_soa) {
+    const size_t num_blocks = row_bytes / sycl_kv_q8_block_bytes;
+    for (size_t r = 0; r < n_rows; ++r) {
+        if (src_is_soa) {
+            sycl_kv_q8_swizzle_row_soa_to_aos(src, dst, num_blocks);
+        } else {
+            sycl_kv_q8_swizzle_row_aos_to_soa(src, dst, num_blocks);
+        }
+        src += row_bytes;
+        dst += row_bytes;
+    }
+}
+
+// Per-row SoA q8_0 KV. Q8_0 weights also set reorder (qw layout), so additionally require a
+// 3D cache_k*/cache_v* root before treating the bytes as per-row KV SoA. A transposed V
+// (v_trans, FA off; see llama-graph.cpp) stores cells on the fast axis and is not per-row SoA,
+// so require the standard layout (nb[1] <= nb[2], the graph's own v_trans definition).
+static bool sycl_kv_is_q8_0_soa(const ggml_tensor * t) {
+    if (!ggml_sycl_is_q8_0_soa(t)) {
+        return false;
+    }
+    const ggml_tensor * root = ggml_sycl_root_tensor(t);
+    return root->ne[2] > 0 && root->nb[1] <= root->nb[2] &&
+           (strncmp(root->name, "cache_k", 7) == 0 || strncmp(root->name, "cache_v", 7) == 0);
+}
+} // namespace
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -1004,6 +1067,14 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
 
+    // SoA q8_0 KV: the state layer hands us canonical AoS bytes; swizzle to the in-memory
+    // per-row SoA layout on the way in (inverse of get_tensor).
+    const bool   kv_soa = sycl_kv_is_q8_0_soa(tensor);
+    const size_t kv_row = kv_soa ? ggml_row_size(tensor->type, ggml_sycl_root_tensor(tensor)->ne[0]) : 0;
+    if (kv_soa) {
+        GGML_ASSERT(kv_row % sycl_kv_q8_seg_bytes == 0 && offset % kv_row == 0 && size % kv_row == 0);
+    }
+
     // copy through pinned memory so the device never reads mmap()ed pages directly
     // chunks pipeline on the in-order compute queue, so no drain per tensor is needed
     if (ggml_sycl_buffer_init_staging(ctx)) {
@@ -1011,15 +1082,21 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         char *       dst       = (char *) tensor->data + offset;
         const char * src       = (const char *) data;
         size_t       remaining = size;
+        // SoA swizzle is per-row, so chunk to a multiple of the row when swizzling
+        const size_t stage_chunk = kv_soa ? (ctx->staging_slot_size / kv_row) * kv_row : ctx->staging_slot_size;
         while (remaining > 0) {
-            const size_t chunk = std::min(remaining, ctx->staging_slot_size);
+            const size_t chunk = std::min(remaining, stage_chunk);
             const int    slot  = ctx->staging.next;
             ctx->staging.next = (ctx->staging.next + 1) % (int) ctx->staging.submitted.size();
             if (ctx->staging.submitted[slot]) {
                 ctx->staging.events[slot].wait_and_throw();
             }
             void * stage = (char *) ctx->staging.data + slot * ctx->staging_slot_size;
-            memcpy(stage, src, chunk);
+            if (kv_soa) {
+                sycl_kv_q8_swizzle((const uint8_t *) src, (uint8_t *) stage, chunk / kv_row, kv_row, /*src_is_soa=*/false);
+            } else {
+                memcpy(stage, src, chunk);
+            }
             ctx->staging.events[slot] = stream->memcpy(dst, stage, chunk);
             ctx->staging.submitted[slot] = true;
             src       += chunk;
@@ -1035,11 +1112,21 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
     // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
     char * host_buf = (char *) malloc(size);
-    memcpy(host_buf, data, size);
+    if (kv_soa) {
+        sycl_kv_q8_swizzle((const uint8_t *) data, (uint8_t *) host_buf, size / kv_row, kv_row, /*src_is_soa=*/false);
+    } else {
+        memcpy(host_buf, data, size);
+    }
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
     free(host_buf);
 #else
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+    if (kv_soa) {
+        std::vector<uint8_t> kv_tmp(size);
+        sycl_kv_q8_swizzle((const uint8_t *) data, kv_tmp.data(), size / kv_row, kv_row, /*src_is_soa=*/false);
+        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, kv_tmp.data(), size).wait()));
+    } else {
+        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+    }
 #endif
 }
 catch (sycl::exception const &exc) {
@@ -1102,6 +1189,18 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
+
+    // SoA q8_0 KV: hand the state layer canonical AoS bytes (inverse of set_tensor).
+    if (sycl_kv_is_q8_0_soa(tensor)) {
+        const size_t row = ggml_row_size(tensor->type, ggml_sycl_root_tensor(tensor)->ne[0]);
+        GGML_ASSERT(row % sycl_kv_q8_seg_bytes == 0 && offset % row == 0 && size % row == 0);
+        std::vector<uint8_t> tmp(size);
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            stream.memcpy(tmp.data(), (const char *)tensor->data + offset, size)
+                .wait()));
+        sycl_kv_q8_swizzle(tmp.data(), (uint8_t *) data, size / row, row, /*src_is_soa=*/true);
+        return;
+    }
 
     SYCL_CHECK(CHECK_TRY_ERROR(
         stream.memcpy(data, (const char *)tensor->data + offset, size)
