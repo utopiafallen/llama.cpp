@@ -261,6 +261,7 @@ enum mkl_fa_kv_desc_mode {
     MKL_FA_KV_MODE_F16_INTERLEAVED = 1,
     MKL_FA_KV_MODE_QUANT_CONTIG    = 2,
     MKL_FA_KV_MODE_QUANT_NC        = 3,
+    MKL_FA_KV_MODE_Q8_SOA          = 4,
 };
 
 struct mkl_fa_kv_desc {
@@ -274,6 +275,8 @@ struct mkl_fa_kv_desc {
     int64_t              ts   = 0;      // type size (mode 3 base offset)
     int64_t              s01  = 0;      // nc row stride in blocks (mode 3)
     int64_t              s02  = 0;      // nc head stride in blocks (mode 3)
+    int64_t              row_ne  = 0;   // SoA row element count, root ne[0] (mode 4)
+    int64_t              row_off = 0;   // SoA view offset from the root, in rows (mode 4)
 };
 
 static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) {
@@ -285,6 +288,19 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
     d.nb2  = (int64_t)T->nb[2];
     d.nb3  = (int64_t)T->nb[3];
     d.ts   = (int64_t)ggml_type_size(T->type);
+
+    if (ggml_sycl_is_q8_0_soa(T)) {
+        // Per-head SoA rows cannot be sliced by the AoS to_fp16: dequant per head segment.
+        const ggml_tensor * root = ggml_sycl_root_tensor(T);
+        d.mode    = MKL_FA_KV_MODE_Q8_SOA;
+        d.data    = (const char *) root->data;
+        d.row_ne  = root->ne[0];
+        const int64_t row_stride = root->ne[0] + 2 * (root->ne[0] / QK8_0);
+        const int64_t off = (const char *)T->data - (const char *)root->data;
+        GGML_ASSERT(off % row_stride == 0);
+        d.row_off = off / row_stride;
+        return d;
+    }
 
     if (T->type == GGML_TYPE_F16) {
         // MLA's V cache is a 512-wide view of 576-wide K rows. Treat any
@@ -299,6 +315,32 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) 
         d.s02 = d.nb2 / d.ts;
     }
     return d;
+}
+
+// Dequant one KV-head chunk from the per-head SoA Q8_0 rows into dense
+// [this_chunk x D] f16. View position p sits on physical row row_base + p;
+// head segments are hd_bytes apart, each [D int8 qs][D/32 half scales].
+static void mkl_fa_dequant_q8_soa(
+    dpct::queue_ptr stream, const char * kv, sycl::half * out,
+    int64_t row_base, int ikvh, int chunk_start, int this_chunk,
+    int64_t D, int64_t row_ne) {
+    const int64_t blk = D / QK8_0;                   // blocks per head
+    const int64_t hd  = QK8_0 * blk + 2 * blk;       // segment bytes
+    const int64_t row_stride = row_ne + 2 * (row_ne / QK8_0);
+    stream->parallel_for(sycl::range<2>((size_t)this_chunk, (size_t)blk),
+        [=](sycl::item<2> it) {
+            const int64_t r = it.get_id(0);
+            const int64_t b = it.get_id(1);
+            const char * seg = kv
+                + (row_base + (int64_t)chunk_start + r) * row_stride
+                + (int64_t)ikvh * hd;
+            const sycl::half sc = *(const sycl::half *) (seg + QK8_0 * blk + 2 * b);
+            const int8_t * qs = (const int8_t *) (seg + b * QK8_0);
+            sycl::half * dst = out + r * D + b * QK8_0;
+            for (int e = 0; e < QK8_0; e++) {
+                dst[e] = (sycl::half) ((float) qs[e] * (float) sc);
+            }
+        });
 }
 
 // Dequant one KV-head chunk into a dense [this_chunk x D] fp16 buffer.
@@ -334,6 +376,13 @@ static void mkl_fa_dequant_chunk(
                 + (int64_t)chunk_start * d.nb1 + (int64_t)ib * d.nb3;
             to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(d.type, dst_ctx);
             to_fp16(base, out, (int64_t)this_chunk * D, stream);
+            break;
+        }
+        case MKL_FA_KV_MODE_Q8_SOA: {
+            const int64_t row_stride = d.row_ne + 2 * (d.row_ne / QK8_0);
+            mkl_fa_dequant_q8_soa(stream, d.data, out,
+                d.row_off + (int64_t)ib * d.nb3 / row_stride,
+                ikvh, chunk_start, this_chunk, d.D, d.row_ne);
             break;
         }
         default: {  // MKL_FA_KV_MODE_QUANT_NC
@@ -425,7 +474,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     if (do_print) {
         GGML_LOG_INFO("[MKL-FA] #%d D=%d DV=%d n_q=%d n_kv=%d "
                 "n_qh=%d n_kvh=%d gqa=%d batch=%d K=%s V=%s "
-                "chunk=%d buf=%.1fMB%s%s\n",
+                "chunk=%d buf=%.1fMB%s%s%s\n",
                 mkl_call_count, DKQ, DV, n_queries, n_kv,
                 n_q_heads, n_kv_heads, gqa_ratio, n_batch,
                 ggml_type_name(K->type), ggml_type_name(V->type),
@@ -433,7 +482,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 (double)((int64_t)n_query_rows * chunk_size * sizeof(float))
                     / (1024.0 * 1024.0),
                 k_early_interleaved ? " K_ILV" : "",
-                v_early_interleaved ? " V_ILV" : "");
+                v_early_interleaved ? " V_ILV" : "",
+                ggml_sycl_is_q8_0_soa(K) ? " SOA" : "");
         GGML_LOG_INFO("[MKL-FA] #%d Q-nb1=%lld Q-nb2=%lld "
                 "q_rs=%lld q_hs=%lld dst_rs=%lld dst_hs=%lld\n",
                 mkl_call_count,
@@ -669,10 +719,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
           + (int64_t)chunk_size * DKQ * sizeof(sycl::half)         // K_chunk_f16
           + v_chunk_elems * (int64_t)sizeof(sycl::half)            // V_chunk_f16
         ) / (1024.0 * 1024.0);
-        GGML_LOG_INFO("[MKL-FA] #%d n_kv=%d n_q=%d q_tile=%d time_us: "
+        GGML_LOG_INFO("[MKL-FA] #%d n_kv=%d n_q=%d q_tile=%d K-mode=%d V-mode=%d time_us: "
                 "dequant=%lld GEMM_KQ=%lld softmax=%lld GEMM_VKQ=%lld "
                 "buf_mb=%.1f\n",
                 mkl_call_count, n_kv, n_queries, q_tile_rows,
+                (int) K_desc.mode, (int) V_desc.mode,
                 (long long)dequant_time_us,
                 (long long)gemm_kq_time_us,
                 (long long)softmax_time_us,

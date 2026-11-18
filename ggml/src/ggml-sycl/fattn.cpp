@@ -180,10 +180,6 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             }
         }
         if (kv_strides_ok) {
-            // MKL dequants q8 KV as AoS blocks; SoA KV must take the ONEDNN/TILE path.
-            kv_strides_ok = !(K->type == GGML_TYPE_Q8_0 && ggml_sycl_is_q8_0_soa(K));
-        }
-        if (kv_strides_ok) {
             return BEST_FATTN_KERNEL_MKL;
         }
     }
