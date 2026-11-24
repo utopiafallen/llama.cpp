@@ -3347,6 +3347,45 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_DELETE:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    const std::string filename = task.slot_action.filename;
+                    const std::string filepath = task.slot_action.filepath;
+
+                    // Clear the slot's in-memory KV cache (if the slot is
+                    // valid); defer while it is busy, like the other slot actions.
+                    size_t n_erased = 0;
+                    bool slot_valid = false;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot != nullptr) {
+                        slot_valid = true;
+                        if (slot->is_processing()) {
+                            // if requested slot is unavailable, we defer this task for processing later
+                            SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                        n_erased = slot->prompt.tokens.size();
+                        slot->prompt_clear();
+                    }
+
+                    // Remove the on-disk cache file (best-effort: a missing file is fine).
+                    std::error_code ec;
+                    const bool deleted = std::filesystem::remove(filepath, ec);
+                    if (ec) {
+                        SRV_WRN("slot delete: could not remove %s: %s\n", filepath.c_str(), ec.message().c_str());
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_delete>();
+                    res->id         = task.id;
+                    res->id_slot    = id_slot;
+                    res->filename   = filename;
+                    res->n_erased   = n_erased;
+                    res->deleted    = deleted;
+                    res->slot_valid = slot_valid;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -5885,6 +5924,9 @@ void server_routes::init_routes() {
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
         }
+        if (action == "delete") {
+            return handle_slots_delete(req, id_slot);
+        }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -6768,6 +6810,43 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_delete(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string filename = request_data.at("filename");
+    if (!fs_validate_filename(filename)) {
+        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    std::string filepath = params.slot_save_path + filename;
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_DELETE);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_delete*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

@@ -1705,6 +1705,19 @@ json server_task_result_slot_erase::to_json() {
 }
 
 //
+// server_task_result_slot_delete
+//
+json server_task_result_slot_delete::to_json() {
+    return json {
+        { "id_slot",    id_slot },
+        { "filename",   filename },
+        { "n_erased",   n_erased },
+        { "deleted",    deleted },
+        { "slot_valid", slot_valid },
+    };
+}
+
+//
 // server_task_result_get_lora
 //
 

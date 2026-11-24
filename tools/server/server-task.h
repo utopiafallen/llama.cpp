@@ -29,6 +29,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_DELETE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
@@ -193,7 +194,7 @@ struct server_task {
 
     server_task_type type;
 
-    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
+    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE, SERVER_TASK_TYPE_SLOT_DELETE
     struct slot_action {
         int id_slot;
         std::string filename;
@@ -657,6 +658,15 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_delete : server_task_result {
+    std::string filename;
+    size_t n_erased;  // in-memory tokens cleared (0 if the slot was invalid)
+    bool deleted;     // the on-disk cache file was removed (false if it did not exist)
+    bool slot_valid;  // the slot id was valid (false -> only the file was removed)
 
     virtual json to_json() override;
 };
