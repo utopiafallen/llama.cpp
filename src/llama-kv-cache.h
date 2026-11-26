@@ -12,6 +12,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+struct llama_file;
 
 //
 // llama_kv_cache
@@ -152,6 +153,48 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    //
+    // differential slot save (seq state v5, see llama-context.cpp)
+    //
+
+    struct llama_kv_cache * diff_kv_cache() override { return this; }
+
+    // per-layer KV layout as serialized by state_write_data
+    struct save_layout {
+        uint32_t capacity  = 0;   // KV cell capacity (0 = unsupported)
+        uint32_t n_stream  = 0;
+        uint32_t n_seq_max = 0;
+        bool     has_ext   = false;
+        bool     v_trans   = false;
+        uint32_t meta_size = 0;   // fixed per-cell meta slot size in the v5 file
+        std::vector<std::pair<uint32_t, uint32_t>> ranges; // [first, last) valid cells, cell order
+        struct layer {
+            int32_t  k_type = 0;
+            uint64_t k_row  = 0;  // serialized row size, bytes
+            bool     has_v  = false;
+            int32_t  v_type = 0;
+            uint64_t v_row  = 0;  // serialized per-cell V size, bytes
+            uint32_t v_el   = 0;  // V element size (transposed layout)
+            uint32_t n_embd_v_gqa = 0;
+        };
+        std::vector<layer> layers;
+    };
+
+    // layout + valid-cell ranges for the differential save of seq_id; false = unsupported
+    bool kv_save_layout(llama_seq_id seq_id, save_layout & out) const;
+
+    // load a v5 (capacity layout) seq state from an already-opened file; the caller
+    // has read the header (C, n, file_size, hash) + tokens and updated *hash over
+    // [tokens][n_stream][cell_count]; on success returns the number of valid cells
+    // restored and appends the compact meta + data bytes to *hash; 0 on failure
+    uint32_t state_load_v5(
+            struct llama_file &  file,
+            llama_seq_id         dest_seq_id,
+            uint32_t             C,
+            uint32_t             read_count,
+            uint32_t             cell_count,
+            uint64_t *           hash);
 
     //
     // llama_kv_cache specific API
@@ -376,6 +419,12 @@ private:
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+
+    // [first, last) ranges of the non-empty, unmasked cells of seq_id within stream strm
+    cell_ranges_t cell_ranges_for_seq(uint32_t strm, llama_seq_id seq_id) const;
+
+    // fill the per-layer layout (row sizes, has_v) for the differential save
+    void fill_save_layout_layer(uint32_t il, save_layout::layer & ll) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);

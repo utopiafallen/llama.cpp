@@ -36,3 +36,13 @@ public:
 
     void read_string(std::string & str);
 };
+
+// FNV-1a 64 over a byte range; used by the differential slot save format (v5)
+static inline uint64_t seq_diff_fnv1a(uint64_t h, const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}

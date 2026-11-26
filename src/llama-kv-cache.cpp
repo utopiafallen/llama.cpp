@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -2349,6 +2350,47 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+llama_kv_cache::cell_ranges_t llama_kv_cache::cell_ranges_for_seq(uint32_t strm, llama_seq_id seq_id) const {
+    cell_ranges_t cr { strm, {} };
+
+    const auto & cells = v_cells[strm];
+
+    // Count the number of cells with the specified seq_id
+    // Find all the ranges of cells with this seq id (or all, when -1)
+    uint32_t cell_range_begin = cells.size();
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        bool add_cell = true;
+
+        add_cell = add_cell && !cells.is_empty(i);
+        add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+
+        // check the cell is not SWA-masked
+        if (add_cell && seq_id != -1) {
+            const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+
+            add_cell = !is_masked;
+        }
+
+        if (add_cell) {
+            if (cell_range_begin == cells.size()) {
+                cell_range_begin = i;
+            }
+        } else {
+            if (cell_range_begin != cells.size()) {
+                cr.data.emplace_back(cell_range_begin, i);
+                cell_range_begin = cells.size();
+            }
+        }
+    }
+
+    if (cell_range_begin != cells.size()) {
+        cr.data.emplace_back(cell_range_begin, cells.size());
+    }
+
+    return cr;
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2362,52 +2404,13 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        cell_ranges_t cr { s, {} };
+        const cell_ranges_t cr = cell_ranges_for_seq(s, seq_id);
 
         uint32_t cell_count = 0;
 
-        const auto & cells = v_cells[s];
-
-        // Count the number of cells with the specified seq_id
-        // Find all the ranges of cells with this seq id (or all, when -1)
-        uint32_t cell_range_begin = cells.size();
-
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            bool add_cell = true;
-
-            add_cell = add_cell && !cells.is_empty(i);
-            add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
-
-            // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
-
-                add_cell = !is_masked;
-            }
-
-            if (add_cell) {
-                ++cell_count;
-                if (cell_range_begin == cells.size()) {
-                    cell_range_begin = i;
-                }
-            } else {
-                if (cell_range_begin != cells.size()) {
-                    cr.data.emplace_back(cell_range_begin, i);
-                    cell_range_begin = cells.size();
-                }
-            }
-        }
-
-        if (cell_range_begin != cells.size()) {
-            cr.data.emplace_back(cell_range_begin, cells.size());
-        }
-
-        // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
-        uint32_t cell_count_check = 0;
         for (const auto & range : cr.data) {
-            cell_count_check += range.second - range.first;
+            cell_count += range.second - range.first;
         }
-        GGML_ASSERT(cell_count == cell_count_check);
 
         io.write(&cell_count, sizeof(cell_count));
 
@@ -2419,6 +2422,421 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }
+}
+
+// ---------------------------------------------------------------------------
+// differential slot save (seq state v5)
+// ---------------------------------------------------------------------------
+
+// fills the save-layout entry for the layer at vector position idx; the
+// model layer index (layer.il) may differ from idx when the cache was built
+// with a layer filter (hybrid memory)
+void llama_kv_cache::fill_save_layout_layer(uint32_t idx, save_layout::layer & ll) const {
+    const auto & layer = layers[idx];
+    const uint32_t il = layer.il;
+
+    auto * k = layer.k_stream[0];
+    ll.k_type = (int32_t) k->type;
+    ll.k_row  = ggml_row_size(k->type, hparams.n_embd_k_gqa(il));
+
+    auto * v = layer.v_stream[0];
+    if (v) {
+        ll.has_v = true;
+        ll.v_type = (int32_t) v->type;
+        const uint32_t nv = hparams.n_embd_v_gqa(il);
+        ll.v_row  = v_trans ? (uint64_t) nv * ggml_type_size(v->type) : ggml_row_size(v->type, nv);
+        ll.v_el   = ggml_type_size(v->type);
+        ll.n_embd_v_gqa = nv;
+    }
+}
+
+bool llama_kv_cache::kv_save_layout(llama_seq_id seq_id, save_layout & out) const {
+    // the differential format is defined for unshared single-stream caches
+    if (other || n_stream != 1 || v_cells.empty()) {
+        return false;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    const cell_ranges_t cr = cell_ranges_for_seq(strm, seq_id);
+
+    out = save_layout{};
+    out.capacity = v_cells[0].size();
+    out.n_stream = n_stream;
+    out.v_trans  = v_trans;
+    out.n_seq_max = n_seq_max;
+    out.has_ext  = has_cell_ext();
+    out.meta_size = (uint32_t) (sizeof(llama_pos) + sizeof(uint32_t)
+        + (out.has_ext ? sizeof(llama_kv_cell_ext) : 0)
+        + (size_t) out.n_seq_max * sizeof(llama_seq_id));
+    out.ranges.assign(cr.data.begin(), cr.data.end());
+
+    for (uint32_t idx = 0; idx < (uint32_t) layers.size(); ++idx) {
+        save_layout::layer ll;
+        fill_save_layout_layer(idx, ll);
+        out.layers.push_back(ll);
+    }
+
+    return true;
+}
+
+// Serves the v4-style data stream (descriptor + per-layer type/row headers +
+// per-run row data) from a v5 capacity-layout file: the row of cell i sits at
+// row offset i, so a run of cells is served from the file positions of the
+// source ranges covering it. Every served byte is fed into the running hash.
+struct llama_io_read_v5view : public llama_io_read_i {
+    struct llama_file & f;
+    uint32_t            C;
+    uint32_t            meta_size;
+    bool                v_trans;
+    const std::vector<llama_kv_cache::save_layout::layer> & layers;
+    const std::vector<std::pair<uint32_t, uint32_t>> & ranges; // source ranges (valid cells)
+    uint64_t *          hash;
+
+    enum class ph_t { DESC, K, V, END };
+    ph_t     ph = ph_t::DESC;
+    uint32_t L = 0;      // current K-section layer
+    uint32_t vL = 0;     // current V-section layer
+    uint32_t range_idx = 0;
+    uint32_t cur_cell = 0;
+    uint32_t v_j = 0;    // current element row (transposed V)
+
+    uint64_t field_off = 0;
+    uint64_t field_rem = 0;
+
+    static constexpr size_t CHUNK = 16 * 1024 * 1024;
+
+    llama_io_read_v5view(
+            struct llama_file & f_,
+            uint32_t            C_,
+            uint32_t            meta_size_,
+            bool                v_trans_,
+            const std::vector<llama_kv_cache::save_layout::layer> & layers_,
+            const std::vector<std::pair<uint32_t, uint32_t>> & ranges_,
+            uint64_t *          hash_)
+        : f(f_), C(C_), meta_size(meta_size_), v_trans(v_trans_),
+          layers(layers_), ranges(ranges_), hash(hash_) {
+        field_off = desc_base();
+        field_rem = 16;
+    }
+
+    uint64_t desc_base() const { return 44 + 4*C + (uint64_t) C * meta_size; }
+    uint64_t k_base()    const { return desc_base() + 16; }
+    uint64_t v_base() const {
+        uint64_t off = k_base();
+        for (const auto & l : layers) {
+            off += 12 + (uint64_t) C * l.k_row;
+        }
+        return off;
+    }
+    uint64_t k_layer_off(uint32_t idx) const {
+        uint64_t off = k_base();
+        for (uint32_t l = 0; l < idx; ++l) {
+            off += 12 + (uint64_t) C * layers[l].k_row;
+        }
+        return off;
+    }
+    uint64_t v_layer_off(uint32_t idx) const {
+        uint64_t off = v_base();
+        for (uint32_t l = 0; l < idx; ++l) {
+            if (layers[l].has_v) {
+                off += 12 + (uint64_t) C * layers[l].v_row;
+            }
+        }
+        return off;
+    }
+    uint32_t next_v_idx(uint32_t from) const {
+        for (uint32_t l = from; l < (uint32_t) layers.size(); ++l) {
+            if (layers[l].has_v) {
+                return l;
+            }
+        }
+        return (uint32_t) layers.size();
+    }
+    uint64_t data_file_pos(uint32_t cell) const {
+        if (ph == ph_t::K) {
+            return k_layer_off(L) + 12 + (uint64_t) cell * layers[L].k_row;
+        }
+        if (ph == ph_t::V) {
+            if (v_trans) {
+                return v_layer_off(vL) + 12 + ((uint64_t) cell + (uint64_t) v_j * C) * layers[vL].v_el;
+            }
+            return v_layer_off(vL) + 12 + (uint64_t) cell * layers[vL].v_row;
+        }
+        throw std::runtime_error("seq load v5: data read in unexpected state");
+    }
+    void reset_cursor() {
+        range_idx = 0;
+        cur_cell  = ranges.empty() ? 0 : ranges[0].first;
+        v_j       = 0;
+    }
+
+    void read(void * dst, size_t size) override {
+        size_t got = 0;
+        while (got < size) {
+            if (field_rem == 0) {
+                next_field();
+            }
+            if (ph == ph_t::END) {
+                throw std::runtime_error("seq load v5: unexpected trailing read");
+            }
+            const size_t take = std::min<size_t>(size - got, (size_t) field_rem);
+            f.seek((size_t) field_off, SEEK_SET);
+            f.read_raw((uint8_t *) dst + got, take);
+            if (hash) {
+                *hash = seq_diff_fnv1a(*hash, (const uint8_t *) dst + got, take);
+            }
+            field_off += take;
+            field_rem -= take;
+            got += take;
+        }
+    }
+
+    // a field was just fully consumed; position the next one (verifying that
+    // the data phase in between was fully consumed)
+    void next_field() {
+        switch (ph) {
+        case ph_t::DESC: {
+            ph = ph_t::K;
+            L = 0;
+            reset_cursor();
+            field_off = k_layer_off(0);
+            field_rem = 12;
+            break;
+        }
+        case ph_t::K: {
+            if (range_idx != ranges.size()) {
+                throw std::runtime_error("seq load v5: incomplete K data phase");
+            }
+            ++L;
+            if (L < (uint32_t) layers.size()) {
+                reset_cursor();
+                field_off = k_layer_off(L);
+                field_rem = 12;
+                break;
+            }
+            vL = next_v_idx(0);
+            if (vL < (uint32_t) layers.size()) {
+                ph = ph_t::V;
+                reset_cursor();
+                field_off = v_layer_off(vL);
+                field_rem = 12;
+            } else {
+                ph = ph_t::END;
+                field_rem = 0;
+            }
+            break;
+        }
+        case ph_t::V: {
+            const bool vdone = v_trans
+                ? (range_idx == ranges.size() && v_j == layers[vL].n_embd_v_gqa)
+                : (range_idx == ranges.size());
+            if (!vdone) {
+                throw std::runtime_error("seq load v5: incomplete V data phase");
+            }
+            vL = next_v_idx(vL + 1);
+            if (vL < (uint32_t) layers.size()) {
+                reset_cursor();
+                field_off = v_layer_off(vL);
+                field_rem = 12;
+            } else {
+                ph = ph_t::END;
+                field_rem = 0;
+            }
+            break;
+        }
+        default:
+            throw std::runtime_error("seq load v5: unexpected field read");
+        }
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (ph != ph_t::K && ph != ph_t::V) {
+            throw std::runtime_error("seq load v5: unexpected tensor read");
+        }
+        if (size == 0) {
+            return;
+        }
+        size_t done = 0;
+        std::vector<uint8_t> buf;
+        while (done < size) {
+            if (range_idx >= ranges.size()) {
+                throw std::runtime_error("seq load v5: ran out of source ranges");
+            }
+            const auto & r = ranges[range_idx];
+            const uint64_t row = (ph == ph_t::K) ? layers[L].k_row
+                                 : (v_trans ? layers[vL].v_el : layers[vL].v_row);
+            const uint64_t avail = (uint64_t) (r.second - cur_cell) * row;
+            size_t take = (size_t) std::min<uint64_t>(size - done, avail);
+            if (row <= CHUNK && take > CHUNK) {
+                take = (size_t) (CHUNK / row) * row;
+            }
+            const uint64_t pos = data_file_pos(cur_cell);
+            if (buf.size() < take) {
+                buf.resize(take);
+            }
+            f.seek((size_t) pos, SEEK_SET);
+            f.read_raw(buf.data(), take);
+            if (hash) {
+                *hash = seq_diff_fnv1a(*hash, buf.data(), take);
+            }
+            ggml_backend_tensor_set(tensor, buf.data(), offset + done, take);
+            cur_cell += (uint32_t) (take / row);
+            done += take;
+            if (cur_cell == r.second) {
+                ++range_idx;
+                if (range_idx < ranges.size()) {
+                    cur_cell = ranges[range_idx].first;
+                }
+            }
+        }
+        if (ph == ph_t::V && v_trans && range_idx == ranges.size()) {
+            // this element row (j) is complete; advance to the next one
+            ++v_j;
+            if (v_j < layers[vL].n_embd_v_gqa) {
+                range_idx = 0;
+                cur_cell  = ranges.empty() ? 0 : ranges[0].first;
+            }
+        }
+    }
+
+    size_t n_bytes() override {
+        return 0;
+    }
+};
+
+// minimal read io over an in-memory buffer (compact meta stream)
+struct kv_io_read_mem : public llama_io_read_i {
+    const uint8_t * ptr;
+    size_t          rem;
+
+    kv_io_read_mem(const uint8_t * p, size_t len) : ptr(p), rem(len) {}
+
+    void read(void * dst, size_t size) override {
+        if (size > rem) {
+            throw std::runtime_error("kv_io_read_mem: unexpected end of buffer");
+        }
+        memcpy(dst, ptr, size);
+        ptr  += size;
+        rem  -= size;
+    }
+
+    void read_tensor(ggml_tensor *, size_t, size_t) override {
+        throw std::runtime_error("kv_io_read_mem: tensor reads not supported");
+    }
+
+    size_t n_bytes() override {
+        return 0;
+    }
+};
+
+uint32_t llama_kv_cache::state_load_v5(
+        struct llama_file & file,
+        llama_seq_id        dest_seq_id,
+        uint32_t            C,
+        uint32_t            read_count,
+        uint32_t            cell_count,
+        uint64_t *          hash) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return 0;
+    }
+
+    if (dest_seq_id < 0 || (size_t) dest_seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const uint32_t strm = seq_to_stream[dest_seq_id];
+
+    const uint32_t meta_size = (uint32_t) (sizeof(llama_pos) + sizeof(uint32_t)
+        + (has_cell_ext() ? sizeof(llama_kv_cell_ext) : 0)
+        + (size_t) n_seq_max * sizeof(llama_seq_id));
+
+    if (read_count > v_cells[strm].size()) {
+        return 0;
+    }
+
+    // read the fixed meta slots for [0, read_count)
+    std::vector<uint8_t> slots((size_t) read_count * meta_size);
+    file.seek(44 + 4*C, SEEK_SET);
+    file.read_raw(slots.data(), slots.size());
+
+    // rebuild the compact meta stream + the source ranges
+    std::vector<uint8_t> compact;
+    std::vector<std::pair<uint32_t, uint32_t>> src_ranges;
+    uint32_t valid_count = 0;
+
+    for (uint32_t i = 0; i < read_count; ++i) {
+        const uint8_t * p = slots.data() + (size_t) i * meta_size;
+        uint32_t n_seq_id = 0;
+        memcpy(&n_seq_id, p + 4, 4);
+        if (n_seq_id == 0) {
+            continue;
+        }
+        if (n_seq_id > n_seq_max) {
+            return 0;
+        }
+        const size_t rec_size = 8 + (has_cell_ext() ? sizeof(llama_kv_cell_ext) : 0)
+                              + (size_t) n_seq_id * sizeof(llama_seq_id);
+        if (rec_size > meta_size) {
+            return 0;
+        }
+        compact.insert(compact.end(), p, p + rec_size);
+        ++valid_count;
+        if (!src_ranges.empty() && src_ranges.back().second == i) {
+            src_ranges.back().second = i + 1;
+        } else {
+            src_ranges.emplace_back(i, i + 1);
+        }
+    }
+
+    if (hash) {
+        *hash = seq_diff_fnv1a(*hash, compact.data(), compact.size());
+    }
+
+    if (valid_count == 0) {
+        return 0;
+    }
+
+    if (read_count == cell_count && valid_count != cell_count) {
+        // full read: the valid cell count must match the file header
+        // (a partial read restores only the overlap, the hash is not verified)
+        return 0;
+    }
+
+    slot_info sinfo;
+
+    {
+        kv_io_read_mem meta_io(compact.data(), compact.size());
+        if (!state_read_meta(meta_io, strm, valid_count, sinfo, dest_seq_id, nullptr)) {
+            return 0;
+        }
+    }
+
+    // runtime per-layer layout (must match the file; verified by the caller)
+    std::vector<save_layout::layer> lay_layers;
+    for (uint32_t idx = 0; idx < (uint32_t) layers.size(); ++idx) {
+        save_layout::layer ll;
+        fill_save_layout_layer(idx, ll);
+        lay_layers.push_back(ll);
+    }
+
+    {
+        llama_io_read_v5view view(file, C, meta_size, v_trans, lay_layers, src_ranges, hash);
+        try {
+            if (!state_read_data(view, strm, valid_count, sinfo)) {
+                state_clear(dest_seq_id, strm, sinfo);
+                return 0;
+            }
+        } catch (const std::exception &) {
+            state_clear(dest_seq_id, strm, sinfo);
+            return 0;
+        }
+    }
+
+    return valid_count;
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
