@@ -844,6 +844,145 @@ struct case_comp_padding : ctx_test {
     }
 };
 
+// differential slot save (seq state v5): the file is preallocated to the KV
+// capacity; re-saves rewrite only the changed 16 MiB chunks in place
+// - an unchanged re-save is a full no-op (zero bytes written)
+// - an append re-save writes only the new tail (far less than the file size)
+// - erase + file load restores a byte-identical state
+// - a corrupted data byte is rejected by the used-hash check
+struct case_state_diff_save : ctx_test {
+    const char * name() const override { return "diff_save"; }
+
+    const char * description() const override {
+        return "the differential file save no-ops unchanged saves, writes only appends, roundtrips and rejects corruption";
+    }
+
+    case_result run(model_run & mr) const override {
+        auto ctx = mr.ctx();
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        const llama_memory_t mem = llama_get_memory(ctx.get());
+        if (!mem) {
+            return case_result::fail();
+        }
+
+        const size_t n_all  = mr.tokens.size();
+        const size_t n_half = n_all / 2;
+        if (n_half < 8) {
+            TLOG_INF("%s: not enough tokens to test\n", __func__);
+            return case_result::pass();
+        }
+
+        // the cases share a working directory, so the state file is named after the model
+        const std::string path = "state-diff-save." + mr.name + ".tmp.bin";
+        std::remove(path.c_str());
+
+        auto file_size = [&]() -> uint64_t {
+            FILE * f = ggml_fopen(path.c_str(), "rb");
+            if (!f) {
+                return 0;
+            }
+            fseeko(f, 0, SEEK_END);
+            const long long sz = ftello(f);
+            std::fclose(f);
+            return (uint64_t) sz;
+        };
+
+        // 1. decode the first half, then a fresh capacity-sized save
+        if (!decode_tokens(ctx.get(), llama_tokens(mr.tokens.begin(), mr.tokens.begin() + n_half), 0)) {
+            return case_result::fail();
+        }
+        llama_seq_save_stats stats;
+        if (!llama_state_seq_save_file_diff(ctx.get(), path.c_str(), 0, mr.tokens.data(), n_half, &stats)) {
+            TLOG_INF("%s: memory does not support the differential save format\n", __func__);
+            std::remove(path.c_str());
+            return case_result::pass();
+        }
+        const uint64_t size_fresh = file_size();
+        CTX_REQUIRE(size_fresh > 0 && stats.n_bytes_total == size_fresh, "fresh save: file size != reported KV section size");
+        CTX_REQUIRE(stats.n_bytes_written > 0 && stats.n_bytes_written <= size_fresh, "fresh save: expected writes");
+        TLOG_INF("%s: fresh save: capacity %u, used %u, %zu / %zu bytes written\n",
+                 __func__, stats.n_capacity, stats.n_used, stats.n_bytes_written, stats.n_bytes_total);
+
+        // 2. unchanged re-save: a full no-op
+        llama_seq_save_stats stats2;
+        if (!llama_state_seq_save_file_diff(ctx.get(), path.c_str(), 0, mr.tokens.data(), n_half, &stats2)) {
+            return case_result::fail();
+        }
+        CTX_REQUIRE(stats2.is_diff == 1, "re-save of an existing v5 file should diff in place");
+        CTX_REQUIRE(stats2.n_bytes_written == 0, "an unchanged re-save must not write a single byte");
+        TLOG_INF("%s: unchanged re-save: %zu bytes written\n", __func__, stats2.n_bytes_written);
+
+        // 3. append a tail: only the new cells (plus meta / hash) may be written
+        if (!decode_seq(ctx.get(), mr.tokens, n_half, n_all, 0, true)) {
+            return case_result::fail();
+        }
+        llama_seq_save_stats stats3;
+        if (!llama_state_seq_save_file_diff(ctx.get(), path.c_str(), 0, mr.tokens.data(), n_all, &stats3)) {
+            return case_result::fail();
+        }
+        CTX_REQUIRE(stats3.is_diff == 1 && stats3.n_used == n_all, "append re-save should diff in place at the new used count");
+        CTX_REQUIRE(stats3.n_bytes_total == size_fresh, "an append must not change the file size");
+        CTX_REQUIRE(stats3.n_bytes_written > 0 && stats3.n_bytes_written < size_fresh / 4,
+                    "an append must write only a small tail of the file");
+        TLOG_INF("%s: append re-save: %zu / %zu bytes written\n", __func__, stats3.n_bytes_written, stats3.n_bytes_total);
+
+        // 4. erase + load from the v5 file: the state must be byte-identical
+        std::vector<uint8_t> blob_a;
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, blob_a)) {
+            return case_result::fail();
+        }
+        if (!seq_rm(ctx.get(), 0)) {
+            return case_result::fail();
+        }
+        {
+            llama_tokens tokens_out(n_all);
+            size_t n_token_count = 0;
+            const size_t nread = llama_state_seq_load_file(ctx.get(), path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count);
+            CTX_REQUIRE(nread > 0, "loading the v5 file failed");
+            CTX_REQUIRE(nread > 0 && n_token_count == n_all, "the loaded token count must match");
+            CTX_REQUIRE(nread > 0 && std::equal(tokens_out.begin(), tokens_out.end(), mr.tokens.begin()), "the loaded tokens must match");
+        }
+        std::vector<uint8_t> blob_b;
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, blob_b)) {
+            return case_result::fail();
+        }
+        CTX_REQUIRE(blobs_equal(blob_a, blob_b), "the state restored from the v5 file is not byte-identical");
+
+        // 5. a corrupted data byte must be rejected by the used-hash check
+        std::vector<uint8_t> data;
+        {
+            std::ifstream f(path, std::ios::binary);
+            data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        // flip a byte in the first meta slot (always valid, always inside the
+        // hashed region - gap bytes past the used count are intentionally
+        // unhashed, so they must not be used for the corruption test)
+        const size_t pos = 44 + 4 * (size_t) stats3.n_capacity;
+        if (pos < data.size()) {
+            data[pos] ^= 0x01;
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            f.write((const char *) data.data(), (std::streamsize) data.size());
+        }
+        if (!seq_rm(ctx.get(), 0)) {
+            return case_result::fail();
+        }
+        {
+            llama_tokens tokens_out(n_all);
+            size_t n_token_count = 0;
+            const size_t nread = llama_state_seq_load_file(ctx.get(), path.c_str(), 0, tokens_out.data(), tokens_out.size(), &n_token_count);
+            CTX_REQUIRE(nread == 0, "restoring a corrupted v5 file must fail");
+        }
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 0) == -1, "a failed v5 restore must leave the sequence empty");
+
+        std::remove(path.c_str());
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_kv_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -859,6 +998,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_restore_failure>());
     cases.push_back(std::make_unique<case_state_rotation>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
+    cases.push_back(std::make_unique<case_state_diff_save>());
     cases.push_back(std::make_unique<case_noalloc>());
     cases.push_back(std::make_unique<case_comp_padding>());
 
