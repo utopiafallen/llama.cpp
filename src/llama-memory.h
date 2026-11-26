@@ -15,6 +15,9 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+struct llama_kv_cache;
+struct llama_memory_recurrent;
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -156,6 +159,19 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // differential slot save (seq state v5, see llama-context.cpp)
+    //
+
+    // non-null only for memory types that support the differential (capacity
+    // layout) slot save format; callers fall back to the regular save otherwise
+    virtual struct llama_kv_cache * diff_kv_cache() { return nullptr; }
+
+    // the recurrent part of a hybrid memory (nullptr when the memory has none
+    // or does not support the differential format); the v5 slot file then
+    // carries the recurrent section defined by llama_memory_recurrent::save_layout_recr
+    virtual struct llama_memory_recurrent * diff_recurrent() { return nullptr; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

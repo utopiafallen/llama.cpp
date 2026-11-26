@@ -77,6 +77,11 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // differential slot save (seq state v5): the attention cache plus the
+    // recurrent part, when it is storable in the differential format
+    struct llama_kv_cache * diff_kv_cache() override;
+    struct llama_memory_recurrent * diff_recurrent() override;
+
     //
     // llama_memory_hybrid specific API
     //

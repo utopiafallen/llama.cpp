@@ -216,6 +216,14 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }
 
+struct llama_kv_cache * llama_memory_hybrid::diff_kv_cache() {
+    return mem_attn.get();
+}
+
+struct llama_memory_recurrent * llama_memory_hybrid::diff_recurrent() {
+    return mem_recr.get();
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :

@@ -68,6 +68,64 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    //
+    // differential slot save (seq state v5, see llama-context.cpp)
+    //
+    // layout of the capacity-sized recurrent section of a v5 slot file:
+    //   [u32 cell_count][C x (i64 pos, u32 n_seq_id=0)][u32 s_trans][u32 n_layer]
+    //   per layer with r: [i32 r_type][u64 r_row][C rows of r_row bytes]
+    //   per layer with p: [u64 p_row][C rows of p_row bytes]
+    //   per layer with s: [i32 s_type][u64 s_row][C rows of s_row bytes]
+    // cell i sits at row offset i, so a used [0, n) prefix maps to fixed file
+    // offsets exactly like the attention K/V rows; the rest of the section is
+    // pre-allocated (sparse) and left untouched until a cell becomes valid
+    struct save_layout_recr {
+        struct layer {
+            bool      has_r = false;
+            ggml_type r_type = GGML_TYPE_F32;
+            uint64_t  r_row  = 0;
+            bool      has_p  = false;
+            uint64_t  p_row  = 0;
+            bool      has_s  = false;
+            ggml_type s_type = GGML_TYPE_F32;
+            uint64_t  s_row  = 0;
+        };
+
+        uint32_t              n_layer = 0; // total model layers (nulls kept, like the v4 stream)
+        std::vector<layer>    layers;
+        // one meta record per stored cell: (i32 pos, u32 n_seq_id); n_seq_id is
+        // 0 and rs_replay is off in the storable case, so the record is 8 bytes
+        uint32_t              meta_size = 8;
+
+        // fixed section size (one logical row per layer): the recurrent cache
+        // holds a single rolling state per sequence, not one per position, so
+        // the section does not scale with the capacity
+        uint64_t size() const {
+            uint64_t res = 4 + meta_size + 8; // cell_count, meta, desc (s_trans, n_layer)
+            for (const auto & l : layers) {
+                if (l.has_r) { res += 12 + l.r_row + (l.has_p ? 8 + l.p_row : 0); }
+                if (l.has_s) { res += 12 + l.s_row; }
+            }
+            return res;
+        }
+    };
+
+    // fill the recurrent section layout; false when the state is not
+    // storable in the differential format (v1: rs_replay snapshots,
+    // rollback planes, empty cache)
+    bool recr_save_layout(uint32_t C, save_layout_recr & out) const;
+
+    // number of cells holding this sequence's recurrent state; the
+    // differential format stores exactly one (the rolling tail)
+    uint32_t recr_cell_count(llama_seq_id seq_id) const;
+
+    // differential (v5) load of the recurrent section at recr_base; the
+    // section is the v4 seq stream verbatim (ccnt, meta, desc, rows) and is
+    // fed to state_read(); returns the restored cell count (0 on failure)
+    // and extends *hash over the section bytes
+    uint32_t state_load_v5(struct llama_file & file, llama_seq_id seq_id,
+                           uint64_t * hash, uint64_t recr_base);
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -131,6 +189,9 @@ public:
     std::vector<ggml_tensor *> spv_l;
     std::vector<ggml_tensor *> spgb_l;
 
+    // true if no layers - can happen if the layer filter removes all layers
+    bool is_empty() const;
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
@@ -139,9 +200,6 @@ private:
 
     // ggml contexts for the RS cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
-
-    // true if no layers - can happen if the layer filter removes all layers
-    bool is_empty() const;
 
     size_t total_size() const;
 

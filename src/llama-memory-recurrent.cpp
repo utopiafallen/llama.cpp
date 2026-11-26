@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-mmap.h"
 #include "llama-batch.h"
 #include "llama-model.h"
 
@@ -843,6 +844,55 @@ size_t llama_memory_recurrent::size_p_bytes() const {
     return size_p_bytes;
 }
 
+bool llama_memory_recurrent::recr_save_layout(uint32_t C, save_layout_recr & out) const {
+    // the differential format stores one logical row per cell at a fixed
+    // offset; rollback snapshot planes (n_rs_seq) and the rs_replay pending
+    // rows are not supported yet - fall back to the legacy format
+    if (rs_replay || n_rs_seq != 0 || size == 0) {
+        return false;
+    }
+    if (is_empty()) {
+        return false;
+    }
+
+    const int32_t n_layer = hparams.n_layer();
+
+    out = save_layout_recr{};
+    out.n_layer = (uint32_t) n_layer;
+    out.layers.reserve(n_layer);
+    for (int32_t il = 0; il < n_layer; ++il) {
+        save_layout_recr::layer ll;
+        if (r_l[il] != nullptr) {
+            ll.has_r = true;
+            ll.r_type = r_l[il]->type;
+            ll.r_row  = r_l[il]->nb[1];
+        }
+        // the stream writes the PLE row inside the R loop, so P exists only under R
+        if (r_l[il] != nullptr && p_l[il] != nullptr) {
+            ll.has_p = true;
+            ll.p_row = p_l[il]->nb[1];
+        }
+        if (s_l[il] != nullptr) {
+            ll.has_s = true;
+            ll.s_type = s_l[il]->type;
+            ll.s_row  = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+        }
+        out.layers.push_back(ll);
+    }
+
+    return true;
+}
+
+uint32_t llama_memory_recurrent::recr_cell_count(llama_seq_id seq_id) const {
+    uint32_t res = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].has_seq_id(seq_id)) {
+            ++res;
+        }
+    }
+    return res;
+}
+
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
@@ -1395,6 +1445,94 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
             ggml_backend_tensor_memset(p_l[il], 0, cell_head * p_size_row, cell_count * p_size_row);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// differential (v5) load of the recurrent section
+// ---------------------------------------------------------------------------
+
+// Serves the legacy recurrent state stream (cell count, meta records, desc,
+// R/P/S headers and rows) from the fixed-offset v5 file layout.
+//
+// Hash discipline: bytes are hashed in stream order; for a full restore this
+// reproduces the save-time hash exactly. For a partial (overlap) restore only
+// the restored prefix is hashed and the caller discards the hash.
+// sequential read over the recurrent section at recr_base, extending *hash
+// over the bytes read - the section is the v4 seq stream verbatim, so the
+// existing state_read() consumes it unchanged
+struct llama_io_read_recr_v5 : public llama_io_read_i {
+    struct llama_file *  f;
+    uint64_t *           hash;
+    size_t               size_read = 0;
+    std::vector<uint8_t> temp_buffer;
+
+    llama_io_read_recr_v5(struct llama_file * file, uint64_t * h) : f(file), hash(h) {}
+
+    void read(void * dst, size_t size) override {
+        f->read_raw(dst, size);
+        if (hash) {
+            *hash = seq_diff_fnv1a(*hash, dst, size);
+        }
+        size_read += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        // state_read_data() pulls the rows through read_tensor: fetch the bytes
+        // from the file (hashing them, matching the writer) and stage them into
+        // the tensor
+        temp_buffer.resize(size);
+        read(temp_buffer.data(), size);
+        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+    }
+
+    size_t n_bytes() override {
+        return size_read;
+    }
+};
+
+uint32_t llama_memory_recurrent::state_load_v5(
+        struct llama_file & file, llama_seq_id seq_id,
+        uint64_t *          hash, uint64_t recr_base) {
+    save_layout_recr lay;
+    if (!recr_save_layout(size, lay)) {
+        return 0;
+    }
+    if (recr_base + lay.size() > (uint64_t) file.size()) {
+        return 0;
+    }
+
+    file.seek(recr_base, SEEK_SET);
+    llama_io_read_recr_v5 view(&file, hash);
+
+    // the section opens with the cell count; a seq save streams exactly the
+    // cells holding this seq (one rolling tail cell in the storable case)
+    uint32_t cell_count = 0;
+    view.read(&cell_count, sizeof(cell_count));
+    if (cell_count > size) {
+        LLAMA_LOG_ERROR("%s: corrupt recurrent cell count %u\n", __func__, cell_count);
+        return 0;
+    }
+
+    // mirrors state_read() from the meta on; on failure the restored cells
+    // are cleared and the exception propagates to the caller (cache miss)
+    const bool meta_read = state_read_meta(view, cell_count, seq_id);
+    const uint32_t cell_head = head;
+    bool res = meta_read;
+    try {
+        res = res && state_read_data(view, cell_count);
+    } catch (...) {
+        res = false;
+    }
+    if (!res) {
+        state_clear(seq_id, cell_head, meta_read ? cell_count : 0);
+        throw std::runtime_error("recr v5 load: failed to restore recurrent state");
+    }
+
+    if (n_rs_seq != 0) {
+        set_rs_idx(seq_id, 0);
+    }
+
+    return cell_count;
 }
 
 //
