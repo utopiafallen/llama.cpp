@@ -3219,12 +3219,27 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
+
+                    // differential save: only the changed bytes are written in
+                    // place (the file is preallocated to the KV capacity), so
+                    // n_bytes reports the bytes actually written, not the size;
+                    // fall back to the full v4 rewrite if the diff save is not
+                    // applicable (unsupported memory class, IO error)
+                    llama_seq_save_stats stats;
+                    const bool ok_save = llama_state_seq_save_file_diff(
                         ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
+                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token), &stats);
+                    size_t nwrite;
+                    if (ok_save) {
+                        nwrite = stats.n_bytes_written;
+                    } else {
+                        nwrite = llama_state_seq_save_file(
+                            ctx_tgt, filepath.c_str(), slot->id,
+                            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                        if (nwrite == 0) {
+                            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                            break;
+                        }
                     }
 
                     size_t nwrite_ckpt = 0;
