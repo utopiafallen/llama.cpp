@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_file;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -198,11 +199,40 @@ struct llama_context {
                 size_t   n_token_capacity,
                 size_t * n_token_count_out);
 
+    // v5 (differential) variant of state_seq_load_file; the file header
+    // (magic + version) has already been consumed by the caller
+    size_t state_seq_load_file_diff(
+            llama_file &   file,
+          llama_seq_id     seq_id,
+           llama_token *   tokens_out,
+                size_t     n_token_capacity,
+                size_t *   n_token_count_out);
+
+    // default slot save: differential format (v5) when the memory supports it,
+    // otherwise (or when the diff save fails) the legacy v4 full rewrite
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,
      const llama_token * tokens,
                 size_t   n_token_count);
+
+    // the legacy (v4) seq state serializer - a full rewrite on every save
+    size_t state_seq_save_file_v4(
+          llama_seq_id   seq_id,
+            const char * filepath,
+     const llama_token * tokens,
+                size_t   n_token_count);
+
+    // differential slot save (seq state v5): rewrites only the changed 16 MiB
+    // chunks of the capacity-preallocated file, in place. false when the
+    // memory does not support the format or the IO fails (the caller can fall
+    // back to state_seq_save_file / state_seq_save_file_v4)
+    bool state_seq_save_file_diff(
+          llama_seq_id   seq_id,
+            const char * filepath,
+     const llama_token * tokens,
+                size_t   n_token_count,
+    llama_seq_save_stats * stats);
 
     //
     // perf

@@ -48,6 +48,11 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 4
 
+// differential slot save format: every section is preallocated (sparse) to the
+// KV capacity so offsets are stable; re-saves rewrite only the changed 16 MiB
+// chunks in place. the used count in the header bounds the read.
+#define LLAMA_STATE_SEQ_VERSION_DIFF 5
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -913,6 +918,28 @@ extern "C" {
                     llama_seq_id   seq_id,
                const llama_token * tokens,
                           size_t   n_token_count);
+
+    // Differential slot save (seq state v5). The file is preallocated (sparse)
+    // to the KV capacity and re-saves rewrite only the changed 16 MiB chunks
+    // in place. Returns true on success (see llama_seq_save_stats for how many
+    // bytes were actually written), false when the memory does not support the
+    // format and the caller should fall back to llama_state_seq_save_file.
+    typedef struct llama_seq_save_stats {
+        size_t   n_bytes_total;   // KV section size (capacity layout)
+        size_t   n_bytes_written; // bytes actually written to disk (0 on no-op)
+        uint32_t n_capacity;      // KV capacity the file is sized to
+        uint32_t n_used;          // valid token count
+        uint64_t used_hash;       // FNV-1a64 over the valid stream
+        int      is_diff;         // 1 = diffed against an existing v5 file
+    } llama_seq_save_stats;
+
+    LLAMA_API bool llama_state_seq_save_file_diff(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+              llama_seq_save_stats * stats);
 
     // If tokens_out is NULL, only the token count is reported through n_token_count_out and no state is loaded
     LLAMA_API size_t llama_state_seq_load_file(

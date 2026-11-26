@@ -6,7 +6,9 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -3466,6 +3468,562 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// ---------------------------------------------------------------------------
+// differential slot save (seq state v5)
+// ---------------------------------------------------------------------------
+//
+// file layout (all little-endian); every section is sized by the capacity C,
+// so every offset is independent of the used token count n:
+//   off  size  field
+//   0    4     magic (LLAMA_STATE_SEQ_MAGIC)
+//   4    4     version (LLAMA_STATE_SEQ_VERSION_DIFF)
+//   8    8     KV section size (file_size)
+//   16   8     used_hash (FNV-1a64 over the valid stream; written last)
+//   24   4     capacity C
+//   28   4     used n
+//   32   4     n_stream
+//   36   4     cell_count (valid cells)
+//   40   4     meta_size (fixed per-cell meta slot)
+//   44   4*C   tokens (valid prefix [0, n))
+//   ...  C*ms  meta slots (slot i is valid iff its n_seq_id != 0)
+//   ...  16    descriptor: v_trans, n_layer, n_rot_k, n_rot_v
+//   ...  ...   per layer: [4B k_type][8B k_row][C x k_row]
+//   ...  ...   per layer: [4B v_type][8B v_row][C x v_row]
+//
+// The serializer emits the regular (v4-style) stream with the valid cells
+// only; llama_io_write_diff maps each byte to its fixed file position and
+// diffs chunk_size (16 MiB) blocks against the existing file, writing only
+// the changed ones in place. The unused tail [n, C) is never emitted and
+// never touched: it stays a sparse hole (or stale data no load will read,
+// since reads are bounded by min(n, C_runtime)).
+//
+// Meta slots: the serializer emits a compact stream of variable-length
+// records (one per valid cell, in cell order). The diff writer buffers it,
+// expands it into the fixed [0, n) slot region - valid cells get their
+// record, every other slot is all zeros - and diffs that region. The zero
+// slots matter: a cell that was valid in an earlier save but became invalid
+// (context compaction, shrink) must read back as invalid, so its slot is
+// rewritten to zero. Slots in [n, C) are never rewritten.
+class llama_io_write_diff : public llama_io_write_i {
+public:
+    struct layout {
+        uint32_t C;
+        uint32_t n_used;    // KV cell count (the seq's valid cells)
+        uint32_t n_tokens;  // token-section length: the full server_tokens blob
+        uint32_t meta_size;
+        bool     has_ext;
+        uint32_t n_seq_max;
+        std::vector<std::pair<uint32_t, uint32_t>> ranges; // [first, last) valid cells, cell order
+        std::vector<llama_kv_cache::save_layout::layer> layers;
+        bool v_trans;
+        const llama_memory_recurrent::save_layout_recr * recr = nullptr; // null: no recurrent section
+    };
+
+    llama_io_write_diff(
+            struct llama_file & dst,
+            struct llama_file * old,
+            const layout &      lay,
+            size_t              chunk_size)
+        : dst(dst)
+        , old(old)
+        , lay(lay)
+        , chunk_size(chunk_size)
+        , old_size(old ? old->size() : 0)
+        , hash(0xcbf29ce484222325ULL)
+        , buf(new uint8_t[chunk_size])
+        , oldbuf(new uint8_t[chunk_size]) {
+        meta_base = 44 + 4 * (uint64_t) lay.C;
+        desc_base = meta_base + (uint64_t) lay.C * lay.meta_size;
+        k_base    = desc_base + 16;
+        v_base    = k_base;
+        for (const auto & l : lay.layers) {
+            v_base += 12 + (uint64_t) lay.C * l.k_row;
+        }
+        recr_base = v_base;
+        for (const auto & l : lay.layers) {
+            if (l.has_v) {
+                recr_base += 12 + (uint64_t) lay.C * l.v_row;
+            }
+        }
+
+        for (const auto & r : lay.ranges) {
+            n_valid += r.second - r.first;
+        }
+
+        if (lay.n_tokens == 0) {
+            s = sec::NSTREAM;
+            reg_off = 32;
+            reg_total = 4;
+            reg_recv = 0;
+        } else {
+            s = sec::TOKENS;
+            reg_off = 44;
+            reg_total = 4 * (uint64_t) lay.n_tokens;
+            reg_recv = 0;
+        }
+    }
+
+    ~llama_io_write_diff() {
+        delete[] buf;
+        delete[] oldbuf;
+    }
+
+    llama_io_write_diff(const llama_io_write_diff &) = delete;
+    llama_io_write_diff & operator=(const llama_io_write_diff &) = delete;
+
+    void write(const void * src, size_t size) override {
+        const uint8_t * p = (const uint8_t *) src;
+        hash = seq_diff_fnv1a(hash, p, size);
+        n_bytes_valid += size;
+
+        while (size > 0) {
+            if (s == sec::META) {
+                if (meta_feed(p, size)) {
+                    // the whole meta section was consumed
+                    break;
+                }
+                continue;
+            }
+            if (s == sec::END) {
+                throw std::runtime_error("seq save diff: unexpected trailing bytes");
+            }
+            if (reg_recv >= reg_total) {
+                advance();
+                flush_chunk();
+                continue;
+            }
+            if (buf_used == chunk_size) {
+                flush_chunk();
+                continue;
+            }
+            const size_t space = chunk_size - buf_used;
+            if (buf_used == 0) {
+                buf_off = reg_off + reg_recv;
+            }
+            const size_t take = std::min({size, space, (size_t) (reg_total - reg_recv)});
+            memcpy(buf + buf_used, p, take);
+            buf_used += take;
+            reg_recv += take;
+            p += take;
+            size -= take;
+        }
+        if (size > 0) {
+            throw std::runtime_error("seq save diff: unconsumed stream bytes");
+        }
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size == 0) {
+            return;
+        }
+        temp_buffer.resize(size);
+        ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, size);
+        write(temp_buffer.data(), temp_buffer.size());
+    }
+
+    size_t n_bytes() override {
+        return n_bytes_valid;
+    }
+
+    // flush the final chunk (if any) and verify the stream completed;
+    // returns the used_hash
+    uint64_t finalize() {
+        if (s == sec::META) {
+            throw std::runtime_error("seq save diff: incomplete meta stream");
+        }
+        if (reg_total > 0 && reg_recv >= reg_total) {
+            advance();
+            flush_chunk();
+        }
+        if (s != sec::END) {
+            throw std::runtime_error("seq save diff: incomplete state stream");
+        }
+        return hash;
+    }
+
+    size_t n_bytes_written = 0;
+
+private:
+    enum class sec { TOKENS, NSTREAM, CCOUNT, META, DESC, KH, KD, VH, VD, RCR, END };
+
+    struct llama_file & dst;
+    struct llama_file * old;   // existing file to diff against, or nullptr
+    const layout & lay;
+    size_t chunk_size;
+    size_t old_size;
+
+    uint64_t meta_base;
+    uint64_t desc_base;
+    uint64_t k_base;
+    uint64_t v_base;
+    uint64_t recr_base;
+
+    uint64_t hash;
+    size_t   n_bytes_valid = 0;
+
+    uint8_t * buf;       // new-bytes chunk buffer
+    uint8_t * oldbuf;    // old-bytes compare buffer
+    size_t   buf_used = 0;
+    uint64_t buf_off  = 0; // file offset where buf[0] lands
+
+    sec      s;
+    uint64_t reg_off   = 0; // file offset of the current region
+    uint64_t reg_total = 0; // region length in bytes
+    uint64_t reg_recv  = 0; // region bytes absorbed so far
+
+    // meta section: the compact stream is buffered record-by-record into the
+    // fixed slot region (valid cells + zero slots), which is diff-written
+    // when the section completes
+    uint64_t n_valid = 0;
+    std::vector<uint8_t>  meta_region; // [0, n) slots, zero-filled
+    std::vector<uint32_t> valid_cells; // k-th valid cell index, cell order
+    std::vector<uint8_t>  rec_stage;
+    size_t  meta_rec_idx = 0; // next record to place, 0..n_valid
+
+    // diff data[0..size) against the old file at file_off, in chunks
+    void diff_write_region(const void * data, size_t size, uint64_t file_off) {
+        const uint8_t * d = (const uint8_t *) data;
+        size_t done = 0;
+        while (done < size) {
+            const size_t take = std::min(chunk_size, size - done);
+            memcpy(buf, d + done, take);
+            buf_used = take;
+            buf_off  = file_off + done;
+            flush_chunk();
+            done += take;
+        }
+    }
+
+    // feed bytes into the meta record parser; returns true when the section
+    // is complete (the region was diff-written and s points at the next one)
+    bool meta_feed(const uint8_t * p, size_t & size) {
+        for (;;) {
+            if (meta_rec_idx == n_valid) {
+                diff_write_region(meta_region.data(), meta_region.size(), meta_base);
+                meta_region.clear();
+                s = sec::DESC;
+                reg_off   = desc_base;
+                reg_total = 16;
+                reg_recv  = 0;
+                return true;
+            }
+            // record length is known after the 8-byte header (pos, n_seq_id)
+            size_t need;
+            if (rec_stage.size() < 8) {
+                need = 8 - rec_stage.size();
+            } else {
+                need = rec_len - rec_stage.size();
+            }
+            const size_t take = std::min(size, need);
+            rec_stage.insert(rec_stage.end(), p, p + take);
+            p += take;
+            size -= take;
+
+            if (rec_stage.size() == 8 && rec_len == 0) {
+                uint32_t n_seq_id = 0;
+                memcpy(&n_seq_id, rec_stage.data() + 4, 4);
+                if (n_seq_id == 0 || n_seq_id > lay.n_seq_max) {
+                    throw std::runtime_error("seq save diff: bad meta record");
+                }
+                rec_len = 8 + (lay.has_ext ? sizeof(llama_kv_cell_ext) : 0) + (uint64_t) n_seq_id * 4;
+                if (rec_len > lay.meta_size) {
+                    throw std::runtime_error("seq save diff: meta record overflow");
+                }
+            }
+            if (rec_len > 0 && rec_stage.size() == rec_len) {
+                GGML_ASSERT(meta_rec_idx < valid_cells.size());
+                const uint32_t cell = valid_cells[meta_rec_idx];
+                memcpy(meta_region.data() + (size_t) cell * lay.meta_size, rec_stage.data(), rec_len);
+                rec_stage.clear();
+                rec_len = 0;
+                ++meta_rec_idx;
+                continue;
+            }
+            if (size == 0) {
+                return false; // resume on the next write()
+            }
+        }
+    }
+
+    uint64_t rec_len = 0;
+
+    // diff buf[0..buf_used) against the old file at buf_off; write if changed
+    void flush_chunk() {
+        if (buf_used == 0) {
+            return;
+        }
+        // compare against the old file contents; old bytes past the old file
+        // size (or when there is no old file) are treated as zeros, so the
+        // buffer is pre-zeroed and only the overlap is read
+        memset(oldbuf, 0, buf_used);
+        if (old != nullptr && buf_off < old_size) {
+            const size_t n_overlap = std::min(buf_used, old_size - buf_off);
+            old->seek(buf_off, SEEK_SET);
+            old->read_raw(oldbuf, n_overlap);
+        }
+        if (memcmp(oldbuf, buf, buf_used) != 0) {
+            dst.seek(buf_off, SEEK_SET);
+            dst.write_raw(buf, buf_used);
+            n_bytes_written += buf_used;
+        }
+        buf_used = 0;
+    }
+
+    void set_kd_region() {
+        const auto & r = lay.ranges[range_idx];
+        reg_off = k_layer_off(k_layer) + 12 + (uint64_t) r.first * k_row;
+        reg_total = (uint64_t) (r.second - r.first) * k_row;
+        reg_recv = 0;
+    }
+    void set_vd_region() {
+        const auto & r = lay.ranges[range_idx];
+        if (lay.v_trans) {
+            reg_off = v_layer_off(v_layer) + 12 + ((uint64_t) r.first + (uint64_t) v_j * lay.C) * v_el;
+            reg_total = (uint64_t) (r.second - r.first) * v_el;
+        } else {
+            reg_off = v_layer_off(v_layer) + 12 + (uint64_t) r.first * v_row;
+            reg_total = (uint64_t) (r.second - r.first) * v_row;
+        }
+        reg_recv = 0;
+    }
+    void finish_v_layer() {
+        v_layer = next_v_idx(v_layer + 1);
+        if (v_layer < (uint32_t) lay.layers.size()) {
+            s = sec::VH;
+            reg_off = v_layer_off(v_layer);
+            reg_total = 12;
+            reg_recv = 0;
+            v_j = 0;
+            range_idx = 0;
+        } else if (lay.recr) {
+            s = sec::RCR;
+            reg_off   = recr_base;
+            reg_total = lay.recr->size();
+            reg_recv  = 0;
+        } else {
+            s = sec::END;
+            reg_total = 0;
+        }
+    }
+
+    // the current region was fully consumed; set up the next one
+    void advance() {
+        switch (s) {
+        case sec::TOKENS:
+            s = sec::NSTREAM;
+            reg_off = 32;
+            reg_total = 4;
+            reg_recv = 0;
+            break;
+        case sec::NSTREAM:
+            s = sec::CCOUNT;
+            reg_off = 36;
+            reg_total = 4;
+            reg_recv = 0;
+            break;
+        case sec::CCOUNT: {
+            uint32_t cell_count = 0;
+            memcpy(&cell_count, buf, 4);
+            if (cell_count != (uint32_t) n_valid) {
+                throw std::runtime_error("seq save diff: cell_count mismatch");
+            }
+            if (n_valid == 0) {
+                if (lay.recr) {
+                    s = sec::RCR;
+                    reg_off   = recr_base;
+                    reg_total = lay.recr->size();
+                    reg_recv  = 0;
+                    break;
+                }
+                s = sec::END;
+                reg_total = 0;
+                break;
+            }
+            meta_region.assign((size_t) lay.n_used * lay.meta_size, 0);
+            valid_cells.clear();
+            valid_cells.reserve((size_t) n_valid);
+            for (const auto & r : lay.ranges) {
+                for (uint32_t i = r.first; i < r.second; ++i) {
+                    valid_cells.push_back(i);
+                }
+            }
+            rec_stage.clear();
+            rec_len = 0;
+            meta_rec_idx = 0;
+            s = sec::META;
+            reg_total = 0;
+            reg_recv = 0;
+            break;
+        }
+        case sec::DESC: {
+            uint32_t vt = 0, nl = 0, nrk = 0, nrv = 0;
+            memcpy(&vt, buf, 4);
+            memcpy(&nl, buf + 4, 4);
+            memcpy(&nrk, buf + 8, 4);
+            memcpy(&nrv, buf + 12, 4);
+            if (nl != (uint32_t) lay.layers.size()) {
+                throw std::runtime_error("seq save diff: n_layer mismatch");
+            }
+            if ((vt != 0) != lay.v_trans) {
+                throw std::runtime_error("seq save diff: v_trans mismatch");
+            }
+            k_layer = 0;
+            range_idx = 0;
+            s = sec::KH;
+            reg_off = k_layer_off(0);
+            reg_total = 12;
+            reg_recv = 0;
+            break;
+        }
+        case sec::KH: {
+            uint32_t kt = 0;
+            uint64_t kr = 0;
+            memcpy(&kt, buf, 4);
+            memcpy(&kr, buf + 4, 8);
+            const auto & ll = lay.layers[k_layer];
+            if ((uint32_t) ll.k_type != kt || ll.k_row != kr) {
+                throw std::runtime_error("seq save diff: k type/row mismatch");
+            }
+            k_row = kr;
+            range_idx = 0;
+            s = sec::KD;
+            set_kd_region();
+            break;
+        }
+        case sec::KD: {
+            ++range_idx;
+            if (range_idx < (uint32_t) lay.ranges.size()) {
+                set_kd_region();
+                break;
+            }
+            ++k_layer;
+            if (k_layer < (uint32_t) lay.layers.size()) {
+                s = sec::KH;
+                reg_off = k_layer_off(k_layer);
+                reg_total = 12;
+                reg_recv = 0;
+                break;
+            }
+            v_layer = next_v_idx(0);
+            if (v_layer < (uint32_t) lay.layers.size()) {
+                s = sec::VH;
+                reg_off = v_layer_off(v_layer);
+                reg_total = 12;
+                reg_recv = 0;
+                v_j = 0;
+                range_idx = 0;
+            } else if (lay.recr) {
+                s = sec::RCR;
+                reg_off   = recr_base;
+                reg_total = lay.recr->size();
+                reg_recv  = 0;
+            } else {
+                s = sec::END;
+                reg_total = 0;
+            }
+            break;
+        }
+        case sec::VH: {
+            uint32_t vt = 0;
+            uint32_t a = 0;
+            uint32_t b = 0;
+            uint64_t vr = 0;
+            const auto & ll = lay.layers[v_layer];
+            if (!lay.v_trans) {
+                memcpy(&vt, buf, 4);
+                memcpy(&vr, buf + 4, 8);
+                if ((uint32_t) ll.v_type != vt || ll.v_row != vr) {
+                    throw std::runtime_error("seq save diff: v type/row mismatch");
+                }
+                v_row = vr;
+            } else {
+                memcpy(&vt, buf, 4);
+                memcpy(&a, buf + 4, 4);
+                memcpy(&b, buf + 8, 4);
+                if ((uint32_t) ll.v_type != vt || ll.v_el != a || ll.n_embd_v_gqa != b) {
+                    throw std::runtime_error("seq save diff: v transposed layout mismatch");
+                }
+                v_el = a;
+            }
+            range_idx = 0;
+            v_j = 0;
+            s = sec::VD;
+            set_vd_region();
+            break;
+        }
+        case sec::VD: {
+            if (lay.v_trans) {
+                ++range_idx;
+                if (range_idx < (uint32_t) lay.ranges.size()) {
+                    set_vd_region();
+                    break;
+                }
+                range_idx = 0;
+                ++v_j;
+                if (v_j < lay.layers[v_layer].n_embd_v_gqa) {
+                    set_vd_region();
+                    break;
+                }
+                finish_v_layer();
+            } else {
+                ++range_idx;
+                if (range_idx < (uint32_t) lay.ranges.size()) {
+                    set_vd_region();
+                    break;
+                }
+                finish_v_layer();
+            }
+            break;
+        }
+        case sec::RCR:
+            // the recurrent section is a verbatim v4 stream pass-through;
+            // when fully consumed the save is done
+            s = sec::END;
+            reg_total = 0;
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    uint64_t k_layer_off(uint32_t idx) const {
+        uint64_t off = k_base;
+        for (uint32_t l = 0; l < idx; ++l) {
+            off += 12 + (uint64_t) lay.C * lay.layers[l].k_row;
+        }
+        return off;
+    }
+    uint64_t v_layer_off(uint32_t idx) const {
+        uint64_t off = v_base;
+        for (uint32_t l = 0; l < idx; ++l) {
+            if (lay.layers[l].has_v) {
+                off += 12 + (uint64_t) lay.C * lay.layers[l].v_row;
+            }
+        }
+        return off;
+    }
+    uint32_t next_v_idx(uint32_t from) const {
+        for (uint32_t l = from; l < (uint32_t) lay.layers.size(); ++l) {
+            if (lay.layers[l].has_v) {
+                return l;
+            }
+        }
+        return (uint32_t) lay.layers.size();
+    }
+
+    // stream cursors
+    uint32_t k_layer = 0;
+    uint32_t v_layer = 0;
+    uint32_t range_idx = 0;
+    uint32_t v_j = 0;   // element row (transposed V)
+    uint64_t k_row = 0;
+    uint64_t v_row = 0;
+    uint32_t v_el  = 0;
+
+    std::vector<uint8_t> temp_buffer;
+};
+
 class llama_io_read_file : public llama_io_read_i {
 public:
     llama_io_read_file(llama_file * f) : file(f) {}
@@ -3977,14 +4535,23 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     llama_file file(filepath, "rb");
 
     // version checks
+    uint32_t version = 0;
     {
-        const uint32_t magic   = file.read_u32();
-        const uint32_t version = file.read_u32();
+        const uint32_t magic = file.read_u32();
+        version = file.read_u32();
 
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
-            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
+        if (magic != LLAMA_STATE_SEQ_MAGIC) {
+            LLAMA_LOG_ERROR("%s: unknown magic for sequence state file: %08x\n", __func__, magic);
             return 0;
         }
+        if (version != LLAMA_STATE_SEQ_VERSION && version != LLAMA_STATE_SEQ_VERSION_DIFF) {
+            LLAMA_LOG_ERROR("%s: unknown version for sequence state file: %u\n", __func__, version);
+            return 0;
+        }
+    }
+
+    if (version == LLAMA_STATE_SEQ_VERSION_DIFF) {
+        return state_seq_load_file_diff(file, seq_id, tokens_out, n_token_capacity, n_token_count_out);
     }
 
     // load the prompt
@@ -4027,7 +4594,164 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     return file.tell();
 }
 
-size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+// load the differential (v5) seq state: capacity-preallocated layout, reads
+// bounded by min(used, runtime capacity); verifies the trailing used_hash
+size_t llama_context::state_seq_load_file_diff(
+        llama_file &   file,
+        llama_seq_id   seq_id,
+        llama_token *  tokens_out,
+        size_t         n_token_capacity,
+        size_t *       n_token_count_out) {
+    uint64_t file_size = 0;
+    uint64_t used_hash = 0;
+    uint32_t C = 0;
+    uint32_t n = 0;
+    file.read_raw(&file_size, 8);
+    file.read_raw(&used_hash, 8);
+    file.read_raw(&C, 4);
+    file.read_raw(&n, 4);
+
+    if (file.size() < file_size) {
+        LLAMA_LOG_ERROR("%s: file truncated: size %zu < kv section size %llu\n",
+                __func__, file.size(), (unsigned long long) file_size);
+        return 0;
+    }
+
+    auto * kvc = memory->diff_kv_cache();
+    if (!kvc) {
+        LLAMA_LOG_ERROR("%s: memory does not support the differential seq state format\n", __func__);
+        return 0;
+    }
+
+    llama_kv_cache::save_layout lay_rt;
+    if (!kvc->kv_save_layout(seq_id, lay_rt) || lay_rt.capacity == 0) {
+        LLAMA_LOG_ERROR("%s: memory does not support the differential seq state format\n", __func__);
+        return 0;
+    }
+
+    // the overlap rule: restore the cells that fit the runtime capacity
+    const uint32_t C_rt = lay_rt.capacity;
+
+    if (tokens_out == nullptr) {
+        *n_token_count_out = n;
+        return file_size;
+    }
+
+    if (n > n_token_capacity) {
+        LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n", __func__, n, n_token_capacity);
+        return 0;
+    }
+
+    file.seek(32, SEEK_SET);
+    uint32_t n_stream_f = 0;
+    uint32_t cell_count = 0;
+    uint32_t meta_size_f = 0;
+    file.read_raw(&n_stream_f, 4);
+    file.read_raw(&cell_count, 4);
+    file.read_raw(&meta_size_f, 4);
+
+    file.seek(44, SEEK_SET);
+    file.read_raw(tokens_out, sizeof(llama_token) * n);
+    *n_token_count_out = n;
+
+    if (n_stream_f != 1) {
+        LLAMA_LOG_ERROR("%s: unsupported n_stream in differential seq state file: %u\n", __func__, n_stream_f);
+        return 0;
+    }
+
+    if (meta_size_f != lay_rt.meta_size) {
+        LLAMA_LOG_ERROR("%s: meta size mismatch (model change?): file %u != runtime %u\n", __func__, meta_size_f, lay_rt.meta_size);
+        return 0;
+    }
+
+    // verify the whole layout: expected kv section size must match the file
+    uint64_t expect = 44 + 4*C + (uint64_t) C * meta_size_f + 16;
+    for (const auto & l : lay_rt.layers) {
+        expect += 12 + (uint64_t) C * l.k_row;
+        if (l.has_v) {
+            expect += 12 + (uint64_t) C * l.v_row;
+        }
+    }
+
+    // the recurrent section (hybrid memory): present in the file whenever the
+    // runtime memory has a storable recurrent part
+    auto * recrm = memory->diff_recurrent();
+    const llama_memory_recurrent::save_layout_recr * recr_lay_rt = nullptr;
+    llama_memory_recurrent::save_layout_recr recr_lay_rt_st;
+    if (recrm) {
+        if (recrm->recr_save_layout(C, recr_lay_rt_st)) {
+            recr_lay_rt = &recr_lay_rt_st;
+            expect += recr_lay_rt_st.size();
+        } else if (!recrm->is_empty()) {
+            LLAMA_LOG_ERROR("%s: the runtime recurrent state cannot be stored in the differential format - no matching file can exist\n", __func__);
+            return 0;
+        }
+    }
+
+    if (expect != file_size) {
+        LLAMA_LOG_ERROR("%s: layout mismatch (model change?): expected kv section size %llu != file %llu\n",
+                __func__, (unsigned long long) expect, (unsigned long long) file_size);
+        return 0;
+    }
+
+    // running hash over the canonical valid stream:
+    // [tokens][n_stream][cell_count][compact meta][data ...]
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    hash = seq_diff_fnv1a(hash, tokens_out, sizeof(llama_token) * n);
+    {
+        const uint32_t hdr[2] = { n_stream_f, cell_count };
+        hash = seq_diff_fnv1a(hash, hdr, sizeof(hdr));
+    }
+
+    // the overlap rule: restore the cells that fit the runtime capacity
+    const uint32_t read_count = std::min<uint32_t>(cell_count, C_rt);
+
+    const uint32_t valid = cell_count == 0 ? 0 :
+        kvc->state_load_v5(file, seq_id, C, read_count, cell_count, &hash);
+    if (cell_count > 0 && valid == 0) {
+        LLAMA_LOG_ERROR("%s: no valid cells in differential seq state file\n", __func__);
+        return 0;
+    }
+
+    // the recurrent section follows the attention section in the file
+    if (recr_lay_rt) {
+        const uint64_t recr_base = expect - recr_lay_rt->size();
+        bool recr_ok = true;
+        try {
+            recrm->state_load_v5(file, seq_id, &hash, recr_base);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+            recr_ok = false;
+        }
+        if (!recr_ok) {
+            // the recurrent part failed - discard the restored attention cells
+            memory->seq_rm(seq_id, -1, -1);
+            LLAMA_LOG_ERROR("%s: failed to restore the recurrent section\n", __func__);
+            return 0;
+        }
+    }
+
+    // the hash covers the whole canonical stream; it can only be checked
+    // when every saved cell was restored (an overlap-only load is partial)
+    if (read_count == cell_count) {
+        if (hash != used_hash) {
+            // the file is a partially written (crashed) save: discard the
+            // restored cells and treat it as a cache miss
+            memory->seq_rm(seq_id, -1, -1);
+            LLAMA_LOG_ERROR("%s: used_hash mismatch (0x%016llx != 0x%016llx) - corrupt or partially written file\n",
+                    __func__, (unsigned long long) hash, (unsigned long long) used_hash);
+            return 0;
+        }
+    } else {
+        LLAMA_LOG_WARN("%s: restoring overlap only: %u of %u cells (runtime capacity %u < saved %u); hash not verified\n",
+                __func__, valid, cell_count, C_rt, cell_count);
+    }
+
+    return file_size;
+}
+
+// the legacy (v4) seq state serializer - a full rewrite on every save
+size_t llama_context::state_seq_save_file_v4(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
@@ -4045,6 +4769,203 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
 
     return res;
+}
+
+// the default slot save: prefer the differential format (v5) whenever the
+// memory supports it, so the file format on disk never alternates between
+// v4 and v5 for the same slot; the v4 serializer remains the fallback for
+// memory classes without a diff-compatible KV layout (and v4 files stay
+// readable as legacy)
+size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    if (memory->diff_kv_cache() != nullptr) {
+        llama_seq_save_stats stats;
+        if (state_seq_save_file_diff(seq_id, filepath, tokens, n_token_count, &stats)) {
+            return stats.n_bytes_total;
+        }
+        // the diff save failed (IO error, layout problem) - fall back
+    }
+    return state_seq_save_file_v4(seq_id, filepath, tokens, n_token_count);
+}
+
+#define LLAMA_SEQ_SAVE_DIFF_CHUNK_SIZE (16 * 1024 * 1024)
+
+bool llama_context::state_seq_save_file_diff(
+        llama_seq_id          seq_id,
+        const char *          filepath,
+        const llama_token *   tokens,
+        size_t                n_token_count,
+        llama_seq_save_stats * stats) {
+    auto * kvc = memory->diff_kv_cache();
+    if (!kvc) {
+        return false;
+    }
+
+    llama_kv_cache::save_layout lay;
+    if (!kvc->kv_save_layout(seq_id, lay)) {
+        return false;
+    }
+
+    const uint32_t C = lay.capacity;
+    // the sequence's valid cells are the authoritative save count: the caller
+    // may pass a longer token list (draft / checkpoint tokens past the KV
+    // capacity), whose tail has no KV state and is carried by the
+    // checkpoint/draft appendices instead
+    uint32_t n_valid = 0;
+    for (const auto & r : lay.ranges) {
+        n_valid += r.second - r.first;
+    }
+    if (n_token_count < n_valid) {
+        LLAMA_LOG_ERROR("%s: n_tokens %zu is below the seq's valid cell count %u - cannot save\n",
+                __func__, n_token_count, n_valid);
+        return false;
+    }
+    // n = the token-section length: the full server_tokens blob the caller
+    // passed (prompt tokens + trailing server state). It is written verbatim
+    // so the restore can deserialize the whole blob; it may exceed the KV cell
+    // count (draft / checkpoint tokens and the server state have no KV cells),
+    // which is why it must not be clamped to n_valid
+    const uint32_t n = n_token_count;
+
+    // the recurrent part of a hybrid memory: the file carries a recurrent
+    // section whenever the runtime memory has one that is storable in the
+    // v5 format (an empty recurrent part stores nothing)
+    const llama_memory_recurrent::save_layout_recr * recr_lay = nullptr;
+    llama_memory_recurrent::save_layout_recr recr_lay_st;
+    auto * recrm = memory->diff_recurrent();
+    if (recrm) {
+        if (!recrm->recr_save_layout(C, recr_lay_st)) {
+            if (!recrm->is_empty()) {
+                // the recurrent state cannot be expressed in the v5 format
+                // (rollback snapshots / rs_replay) - fall back to the legacy save
+                LLAMA_LOG_WARN("%s: recurrent state not storable in the differential format - falling back to the legacy format\n", __func__);
+                return false;
+            }
+        } else {
+            const uint32_t recr_ccnt = recrm->recr_cell_count(seq_id);
+            if (recr_ccnt != 1) {
+                // the differential format stores exactly one rolling tail
+                // cell per sequence; 0 (released / empty) or >1 (shared
+                // state) falls back to the legacy save
+                LLAMA_LOG_WARN("%s: recurrent cell count %u for seq %d != 1 - falling back to the legacy format\n",
+                        __func__, recr_ccnt, (int) seq_id);
+                return false;
+            } else {
+                recr_lay = &recr_lay_st;
+            }
+        }
+    }
+
+    // expected KV section size; doubling as the layout identity for diff
+    // eligibility (any model change moves the layout -> full rewrite)
+    uint64_t file_size = 44 + 4*C + (uint64_t) C * lay.meta_size + 16;
+    for (const auto & l : lay.layers) {
+        file_size += 12 + (uint64_t) C * l.k_row;
+        if (l.has_v) {
+            file_size += 12 + (uint64_t) C * l.v_row;
+        }
+    }
+    if (recr_lay) {
+        file_size += recr_lay->size();
+    }
+
+    // probe the existing file for a diff-eligible v5 header
+    bool can_diff = false;
+    uint64_t old_file_size = 0;
+    uint64_t old_hash = 0;
+    uint32_t old_C = 0;
+    uint32_t old_n = 0;
+    {
+        FILE * fp = fopen(filepath, "rb");
+        if (fp) {
+            uint32_t magic = 0;
+            uint32_t version = 0;
+            if (fread(&magic, 4, 1, fp) == 1 && fread(&version, 4, 1, fp) == 1 &&
+                magic == LLAMA_STATE_SEQ_MAGIC && version == LLAMA_STATE_SEQ_VERSION_DIFF) {
+                uint64_t fs = 0;
+                uint64_t h = 0;
+                uint32_t c = 0;
+                uint32_t nu = 0;
+                if (fread(&fs, 8, 1, fp) == 1 && fread(&h, 8, 1, fp) == 1 &&
+                    fread(&c, 4, 1, fp) == 1 && fread(&nu, 4, 1, fp) == 1) {
+                    old_file_size = fs;
+                    old_hash = h;
+                    old_C = c;
+                    old_n = nu;
+                    can_diff = (c == C) && (fs == file_size);
+                }
+            }
+            fclose(fp);
+        }
+    }
+
+    std::unique_ptr<struct llama_file> file;
+    try {
+        file = std::make_unique<struct llama_file>(filepath, can_diff ? "r+b" : "wb");
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: cannot open '%s': %s\n", __func__, filepath, e.what());
+        return false;
+    }
+    if (!file->resize((size_t) file_size)) {
+        LLAMA_LOG_ERROR("%s: cannot resize '%s' to %llu bytes\n", __func__, filepath, (unsigned long long) file_size);
+        return false;
+    }
+
+    std::unique_ptr<struct llama_file> of;
+    if (can_diff) {
+        of = std::make_unique<struct llama_file>(filepath, "rb");
+    }
+
+    llama_io_write_diff::layout iolay;
+    iolay.C = C;
+    iolay.n_used = n_valid;
+    iolay.n_tokens = n;
+    iolay.meta_size = lay.meta_size;
+    iolay.has_ext = lay.has_ext;
+    iolay.n_seq_max = lay.n_seq_max;
+    iolay.ranges = lay.ranges;
+    iolay.layers = lay.layers;
+    iolay.v_trans = lay.v_trans;
+    iolay.recr = recr_lay;
+
+    llama_io_write_diff io(*file, of.get(), iolay, LLAMA_SEQ_SAVE_DIFF_CHUNK_SIZE);
+    io.write(tokens, sizeof(llama_token) * n);
+    state_seq_write_data(io, seq_id, 0);
+    const uint64_t used_hash = io.finalize();
+    const size_t n_written = io.n_bytes_written;
+
+    // no-op fast path: the file is already consistent (same n, same hash,
+    // nothing changed) -> don't even rewrite the header
+    const bool is_noop = can_diff && n_written == 0 && old_n == n && old_hash == used_hash;
+
+    if (!is_noop) {
+        file->seek(0, SEEK_SET);
+        file->write_u32(LLAMA_STATE_SEQ_MAGIC);
+        file->write_u32(LLAMA_STATE_SEQ_VERSION_DIFF);
+        file->write_raw(&file_size, 8);
+        file->seek(24, SEEK_SET);
+        file->write_raw(&C, 4);
+        file->write_raw(&n, 4);
+        // the meta slot size is a layout constant: only a fresh file needs
+        // it (a diff-eligible file has the same layout, hence the same value)
+        if (!can_diff) {
+            file->seek(40, SEEK_SET);
+            file->write_raw(&lay.meta_size, 4);
+        }
+        // written last: the file is only consistent once this lands
+        file->seek(16, SEEK_SET);
+        file->write_raw(&used_hash, 8);
+    }
+
+    if (stats) {
+        stats->n_bytes_total   = (size_t) file_size;
+        stats->n_bytes_written = n_written;
+        stats->n_capacity      = C;
+        stats->n_used          = n;
+        stats->used_hash       = used_hash;
+        stats->is_diff         = can_diff;
+    }
+
+    return true;
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -5048,6 +5969,27 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+bool llama_state_seq_save_file_diff(
+        llama_context *        ctx,
+             const char *      filepath,
+             llama_seq_id      seq_id,
+          const llama_token *  tokens,
+                  size_t       n_token_count,
+        llama_seq_save_stats *  stats) {
+    ctx->synchronize();
+
+    if (stats) {
+        std::memset(stats, 0, sizeof(*stats));
+    }
+
+    try {
+        return ctx->state_seq_save_file_diff(seq_id, filepath, tokens, n_token_count, stats);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving differential sequence state file: %s\n", __func__, err.what());
+        return false;
     }
 }
 
