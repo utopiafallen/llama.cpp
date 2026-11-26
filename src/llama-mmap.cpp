@@ -650,6 +650,21 @@ llama_file::~llama_file() = default;
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
+bool llama_file::resize(const size_t size) {
+    if (pimpl->fp == nullptr) {
+        return false;
+    }
+#if defined(_WIN32)
+    const bool ok = _chsize_s(_fileno(pimpl->fp), (int64_t) size) == 0;
+#else
+    const bool ok = ::ftruncate(fileno(pimpl->fp), (off_t) size) == 0;
+#endif
+    if (ok) {
+        pimpl->size = size;
+    }
+    return ok;
+}
+
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 

@@ -26,6 +26,10 @@ struct llama_file {
     size_t tell() const;
     size_t size() const;
 
+    // extend or shrink the file to `size` bytes; the extended region is sparse
+    // (no blocks are written); returns false on failure
+    bool resize(size_t size);
+
     int file_id() const; // fileno overload
 
     void seek(size_t offset, int whence) const;
