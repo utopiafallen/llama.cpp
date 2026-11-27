@@ -3401,6 +3401,29 @@ private:
                     res->slot_valid = slot_valid;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_CACHE_HIT:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    // How much of the outgoing request is already cached in this
+                    // slot: the longest common prefix of the request tokens and the
+                    // slot's cached prompt tokens (the same match the scheduler uses
+                    // to pick a slot for a request). Read-only and serialized on the
+                    // queue thread, so no defer is needed.
+                    auto res = std::make_unique<server_task_result_slot_cache_hit>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->n_match  = slot->prompt.tokens.get_common_prefix(task.tokens);
+                    res->n_total  = task.tokens.size();
+                    res->n_cached = slot->prompt.tokens.size();
+                    SRV_DBG("slot %d: cache-hit check: %zu/%zu request tokens already cached (%zu cached)\n",
+                            id_slot, res->n_match, res->n_total, res->n_cached);
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -5942,6 +5965,9 @@ void server_routes::init_routes() {
         if (action == "delete") {
             return handle_slots_delete(req, id_slot);
         }
+        if (action == "cache-hit") {
+            return handle_slots_cache_hit(req, id_slot);
+        }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -6862,6 +6888,59 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_delete(const s
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_delete*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_cache_hit(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    std::vector<raw_buffer> files;
+    json body = json::parse(req.body);
+
+    // Render the outgoing request exactly the way a chat completion would, so the
+    // token stream matches what the real request will produce (the match estimate is
+    // only meaningful if it renders identically to the request bevin is about to send).
+    common_chat_session session; // dummy, unused
+    json body_parsed = oaicompat_chat_params_parse(
+            ctx_server.vocab,
+            body,
+            meta->chat_params,
+            files,
+            session);
+    json prompt = body_parsed.at("prompt");
+
+    server_tokens request_tokens;
+    if (ctx_server.mctx != nullptr) {
+        if (!prompt.is_string()) {
+            throw std::runtime_error("for mtmd, input prompt must be a string.");
+        }
+        request_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true);
+    } else {
+        request_tokens = server_tokens(tokenize_mixed(ctx_server.vocab, prompt, true, true), false);
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_CACHE_HIT);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.tokens = std::move(request_tokens);
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_cache_hit*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

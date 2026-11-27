@@ -30,6 +30,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_SLOT_DELETE,
+    SERVER_TASK_TYPE_SLOT_CACHE_HIT,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
@@ -194,7 +195,7 @@ struct server_task {
 
     server_task_type type;
 
-    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE, SERVER_TASK_TYPE_SLOT_DELETE
+    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE, SERVER_TASK_TYPE_SLOT_DELETE, SERVER_TASK_TYPE_SLOT_CACHE_HIT
     struct slot_action {
         int id_slot;
         std::string filename;
@@ -652,6 +653,18 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_tokens;
     size_t n_bytes;
     double t_ms;
+
+    virtual json to_json() override;
+};
+
+// used by SERVER_TASK_TYPE_SLOT_CACHE_HIT: how much of the outgoing request is
+// already present in the slot's current KV cache (the longest common prefix of
+// the request tokens and the slot's cached prompt tokens, via the same
+// server_tokens::get_common_prefix the slot scheduler uses to match requests).
+struct server_task_result_slot_cache_hit : server_task_result {
+    size_t n_match;  // leading request tokens already cached in the slot
+    size_t n_total;  // total request tokens
+    size_t n_cached; // the slot's current cached prompt length
 
     virtual json to_json() override;
 };

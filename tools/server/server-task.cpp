@@ -1695,6 +1695,20 @@ json server_task_result_slot_save_load::to_json() {
 }
 
 //
+// server_task_result_slot_cache_hit
+//
+json server_task_result_slot_cache_hit::to_json() {
+    const double ratio = n_total > 0 ? (double) n_match / (double) n_total : 0.0;
+    return json {
+        { "id_slot",     id_slot },
+        { "n_match",     n_match },
+        { "n_total",     n_total },
+        { "n_cached",    n_cached },
+        { "ratio",       ratio },
+    };
+}
+
+//
 // server_task_result_slot_erase
 //
 json server_task_result_slot_erase::to_json() {
